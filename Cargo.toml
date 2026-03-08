@@ -1,0 +1,23 @@
+[workspace]
+members = [".", "examples/pyo3_sample"]
+resolver = "2"
+
+[package]
+name = "rylai-stub-gen"
+version = "0.1.0"
+edition = "2024"
+description = "Generate Python .pyi stub files from pyo3-annotated Rust source code"
+
+[[bin]]
+name = "rylai"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = "1"
+quote = "1"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
