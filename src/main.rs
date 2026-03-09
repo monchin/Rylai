@@ -17,7 +17,9 @@ struct Cli {
     #[arg(default_value = ".")]
     crate_root: PathBuf,
 
-    /// Output .pyi file path (default: <crate_root>/<crate_name>.pyi)
+    /// Output directory for generated .pyi files (default: crate root).
+    /// Created automatically if it does not exist.
+    /// Each top-level #[pymodule] produces one <module_name>.pyi inside this directory.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -38,24 +40,51 @@ fn main() -> Result<()> {
     // Collect all pyo3 items from the crate
     let items = collector::collect_crate(&cli.crate_root, &config)?;
 
-    // Determine output path
-    let output_path = cli.output.unwrap_or_else(|| {
-        // Try to infer crate name from Cargo.toml, fallback to directory name
-        let name = infer_crate_name(&cli.crate_root).unwrap_or_else(|| "stub".to_string());
-        cli.crate_root.join(format!("{name}.pyi"))
-    });
+    // Resolve output directory, create it if necessary
+    let out_dir = cli.output.unwrap_or_else(|| cli.crate_root.clone());
+    std::fs::create_dir_all(&out_dir)?;
 
-    // Generate .pyi content
-    let stub = generator::generate(&items, &config)?;
-
-    std::fs::write(&output_path, stub)?;
-    println!("Generated: {}", output_path.display());
+    if items.is_empty() {
+        // No pymodules found: write an empty stub using the best-guess name
+        let name = infer_module_name_from_pyproject(&cli.crate_root)
+            .or_else(|| infer_module_name_from_cargo(&cli.crate_root))
+            .unwrap_or_else(|| "stub".to_string());
+        let path = out_dir.join(format!("{name}.pyi"));
+        let stub = generator::generate(&items, &config)?;
+        std::fs::write(&path, stub)?;
+        println!("Generated: {}", path.display());
+    } else {
+        // One .pyi file per top-level #[pymodule]; name comes from the AST
+        for module in &items {
+            let path = out_dir.join(format!("{}.pyi", module.name));
+            let stub = generator::generate(std::slice::from_ref(module), &config)?;
+            std::fs::write(&path, stub)?;
+            println!("Generated: {}", path.display());
+        }
+    }
 
     Ok(())
 }
 
-fn infer_crate_name(crate_root: &std::path::Path) -> Option<String> {
-    let cargo_toml = std::fs::read_to_string(crate_root.join("Cargo.toml")).ok()?;
-    let doc: toml::Value = cargo_toml.parse().ok()?;
-    doc.get("package")?.get("name")?.as_str().map(|s| s.replace('-', "_"))
+/// Read `pyproject.toml` and return `tool.maturin.module-name` if present.
+/// This is the canonical Python module name set by maturin builds.
+fn infer_module_name_from_pyproject(crate_root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(crate_root.join("pyproject.toml")).ok()?;
+    let doc: toml::Value = text.parse().ok()?;
+    doc.get("tool")?
+        .get("maturin")?
+        .get("module-name")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Read `Cargo.toml` and return `package.name` with `-` replaced by `_`.
+/// Used only as a last resort; Cargo names are Rust identifiers, not Python ones.
+fn infer_module_name_from_cargo(crate_root: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(crate_root.join("Cargo.toml")).ok()?;
+    let doc: toml::Value = text.parse().ok()?;
+    doc.get("package")?
+        .get("name")?
+        .as_str()
+        .map(|s| s.replace('-', "_"))
 }
