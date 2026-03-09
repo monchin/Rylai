@@ -40,6 +40,8 @@ fn my_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 Detection strategy: find `ItemFn` annotated with `#[pymodule]`, parse `ExprMethodCall` nodes in the body for `add_function` / `add_class` calls, extract symbol names from `wrap_pyfunction!` macro args.
 
+**Style B limitation**: For `add_class::<T>()`, the stub currently uses the **Rust type name** `T` as the class name. A `#[pyclass(name = "...")]` on the struct is not visible in this path, so the Python-side name override is not applied. **Planned**: in a future change, resolve the struct/enum by type name and use its `#[pyclass(name)]` when present so the stub matches the Python API. Until then, use Style A if you need the renamed class name in the stub.
+
 ---
 
 ## Stub Generation Rules

@@ -10,4 +10,11 @@ mod pyo3_sample {
     fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
         Ok((a + b).to_string())
     }
+
+    /// Renamed via #[pyo3(name = "...")]
+    #[pyfunction]
+    #[pyo3(name = "add")]
+    fn rust_add(a: i64, b: i64) -> i64 {
+        a + b
+    }
 }

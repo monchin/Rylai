@@ -8,10 +8,18 @@ pub fn map_type(ty: &Type, use_union_syntax: bool) -> TypeMapping {
         Type::Reference(r) => map_type(&r.elem, use_union_syntax),
         Type::Tuple(t) if t.elems.is_empty() => TypeMapping::known("None"),
         Type::Tuple(t) => {
-            let mapped: Vec<TypeMapping> = t.elems.iter().map(|e| map_type(e, use_union_syntax)).collect();
+            let mapped: Vec<TypeMapping> = t
+                .elems
+                .iter()
+                .map(|e| map_type(e, use_union_syntax))
+                .collect();
             let py = format!(
                 "tuple[{}]",
-                mapped.iter().map(|m| m.py_type.as_str()).collect::<Vec<_>>().join(", ")
+                mapped
+                    .iter()
+                    .map(|m| m.py_type.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             TypeMapping {
                 py_type: py,
@@ -68,8 +76,8 @@ fn map_type_path(tp: &TypePath, use_union_syntax: bool) -> TypeMapping {
 
     // ── Primitive scalars ────────────────────────────────────────────────────
     match full.as_str() {
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-        | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => return TypeMapping::known("int"),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => return TypeMapping::known("int"),
 
         "f32" | "f64" => return TypeMapping::known("float"),
 
@@ -158,8 +166,8 @@ fn map_type_path(tp: &TypePath, use_union_syntax: bool) -> TypeMapping {
         }
 
         // PyAny / Py<T> / Bound<T> / PyObject → Any
-        "PyAny" | "PyObject" | "PyDict" | "PyList" | "PyTuple" | "PySet"
-        | "PyBytes" | "PyByteArray" | "PyString" => {
+        "PyAny" | "PyObject" | "PyDict" | "PyList" | "PyTuple" | "PySet" | "PyBytes"
+        | "PyByteArray" | "PyString" => {
             return TypeMapping {
                 py_type: "Any".to_string(),
                 needs_any: true,

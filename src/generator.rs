@@ -3,7 +3,7 @@ use crate::collector::{
 };
 use crate::config::{Config, FallbackStrategy};
 use crate::type_map::{self, TypeMapping};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -31,8 +31,12 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
     if ctx.needs_any || ctx.needs_optional {
         out.push_str("from typing import");
         let mut parts = Vec::new();
-        if ctx.needs_any { parts.push("Any"); }
-        if ctx.needs_optional { parts.push("Optional"); }
+        if ctx.needs_any {
+            parts.push("Any");
+        }
+        if ctx.needs_optional {
+            parts.push("Optional");
+        }
         out.push_str(&format!(" {}\n\n", parts.join(", ")));
     }
 
@@ -68,8 +72,12 @@ impl<'a> GenCtx<'a> {
     }
 
     fn absorb_mapping(&mut self, m: &TypeMapping, location: &str) -> Result<()> {
-        if m.needs_any { self.needs_any = true; }
-        if m.needs_optional { self.needs_optional = true; }
+        if m.needs_any {
+            self.needs_any = true;
+        }
+        if m.needs_optional {
+            self.needs_optional = true;
+        }
         if m.is_unknown {
             match self.config.fallback.strategy {
                 FallbackStrategy::Any => {
@@ -100,8 +108,7 @@ impl<'a> GenCtx<'a> {
         for item in &module.items {
             // Check for manual override
             let override_stub = self.config.overrides.iter().find(|o| {
-                o.item.ends_with(&format!("::{}", item_name(item)))
-                    || o.item == item_name(item)
+                o.item.ends_with(&format!("::{}", item_name(item))) || o.item == item_name(item)
             });
             if let Some(ov) = override_stub {
                 out.push_str(&format!("{pad}{}\n\n", ov.stub));
@@ -132,8 +139,8 @@ impl<'a> GenCtx<'a> {
         let ret = self.resolve_type(&f.return_type, &format!("{}::return", f.name))?;
 
         let params_str = if let Some(sig) = &f.signature_override {
-            // User provided #[pyo3(signature = (...))] — use it verbatim after mapping types
-            format!("self, {sig}")
+            // #[pyo3(signature = (...))] — inner content only, no surrounding parens
+            sig.clone()
         } else {
             self.gen_params(&f.params, &f.name, false)?
         };
@@ -208,9 +215,13 @@ impl<'a> GenCtx<'a> {
                     .map(|p| self.resolve_type(&p.ty, &location))
                     .transpose()?
                     .unwrap_or_else(|| "Any".to_string());
-                if val_type == "Any" { self.needs_any = true; }
+                if val_type == "Any" {
+                    self.needs_any = true;
+                }
                 out.push_str(&format!("{pad}@{prop}.setter\n"));
-                out.push_str(&format!("{pad}def {prop}(self, value: {val_type}) -> None:\n"));
+                out.push_str(&format!(
+                    "{pad}def {prop}(self, value: {val_type}) -> None:\n"
+                ));
             }
             MethodKind::Instance => {
                 let params = self.gen_params(&m.params, &location, true)?;

@@ -1,7 +1,7 @@
-mod config;
 mod collector;
-mod type_map;
+mod config;
 mod generator;
+mod type_map;
 
 use anyhow::Result;
 use clap::Parser;

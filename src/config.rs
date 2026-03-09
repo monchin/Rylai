@@ -10,6 +10,7 @@ pub struct Config {
     pub type_map: HashMap<String, String>,
 
     #[serde(default)]
+    #[allow(dead_code)] // Phase 5: cfg(feature) gating
     pub features: FeaturesConfig,
 
     #[serde(default)]
@@ -25,8 +26,9 @@ pub struct Config {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct FeaturesConfig {
-    /// cfg features considered active during parsing
+    /// cfg features considered active during parsing (Phase 5)
     #[serde(default)]
+    #[allow(dead_code)]
     pub enabled: Vec<String>,
 }
 
@@ -117,7 +119,10 @@ impl Config {
             .split('.')
             .filter_map(|s| s.parse().ok())
             .collect();
-        (parts.first().copied().unwrap_or(3), parts.get(1).copied().unwrap_or(10))
+        (
+            parts.first().copied().unwrap_or(3),
+            parts.get(1).copied().unwrap_or(10),
+        )
     }
 
     /// Whether to use `X | None` (py ≥ 3.10) or `Optional[X]`.

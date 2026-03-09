@@ -10,11 +10,13 @@ pub struct PyModule {
     pub name: String,
     pub doc: Vec<String>,
     pub items: Vec<PyItem>,
-    /// Source file for diagnostics
+    /// Source file for diagnostics (reserved for future use)
+    #[allow(dead_code)]
     pub source_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PyItem {
     Function(PyFunction),
     Class(PyClass),
@@ -29,6 +31,8 @@ pub struct PyFunction {
     pub signature_override: Option<String>,
     pub params: Vec<PyParam>,
     pub return_type: PyType,
+    /// Source file for diagnostics (reserved for future use)
+    #[allow(dead_code)]
     pub source_file: PathBuf,
 }
 
@@ -43,8 +47,10 @@ pub struct PyParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamKind {
     Regular,
-    Args,   // *args
-    Kwargs, // **kwargs
+    #[allow(dead_code)]
+    Args, // *args (reserved for Phase 3+)
+    #[allow(dead_code)]
+    Kwargs, // **kwargs (reserved for Phase 3+)
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +58,8 @@ pub struct PyClass {
     pub name: String,
     pub doc: Vec<String>,
     pub methods: Vec<PyMethod>,
+    /// Source file for diagnostics (reserved for future use)
+    #[allow(dead_code)]
     pub source_file: PathBuf,
 }
 
@@ -69,7 +77,7 @@ pub enum MethodKind {
     Instance,
     Static,
     Class,
-    New,        // #[new] → __init__
+    New,            // #[new] → __init__
     Getter(String), // #[getter] → @property
     Setter(String), // #[setter]
 }

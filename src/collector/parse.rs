@@ -2,18 +2,13 @@ use super::model::*;
 use crate::config::Config;
 use std::path::Path;
 use syn::{
-    Attribute, Expr, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta,
-    Pat, ReturnType, Signature, Type,
+    Attribute, Expr, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta, Pat, ReturnType, Signature, Type,
 };
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Extract all `#[pymodule]` items from a parsed file.
-pub fn extract_modules_from_file(
-    file: &syn::File,
-    path: &Path,
-    config: &Config,
-) -> Vec<PyModule> {
+pub fn extract_modules_from_file(file: &syn::File, path: &Path, config: &Config) -> Vec<PyModule> {
     // First pass: collect all #[pymethods] impl blocks keyed by struct name,
     // so we can attach them to PyClass items found later.
     let impl_map = collect_impl_blocks(&file.items, path, config);
@@ -30,7 +25,8 @@ pub fn extract_modules_from_file(
             }
             // Style B: #[pymodule] fn foo(m: &Bound<PyModule>) -> PyResult<()> { ... }
             Item::Fn(f) if has_attr(&f.attrs, "pymodule") => {
-                if let Some(module) = parse_fn_style_module(f, &file.items, path, config, &impl_map) {
+                if let Some(module) = parse_fn_style_module(f, &file.items, path, config, &impl_map)
+                {
                     result.push(module);
                 }
             }
@@ -77,23 +73,13 @@ fn collect_items_from_list(
                 }
             }
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                let class = parse_pyclass_struct(
-                    &s.ident.to_string(),
-                    &s.attrs,
-                    path,
-                    impl_map,
-                    config,
-                );
+                let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
+                let class = parse_pyclass_struct(&name, &s.attrs, path, impl_map, config);
                 result.push(PyItem::Class(class));
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                let class = parse_pyclass_struct(
-                    &e.ident.to_string(),
-                    &e.attrs,
-                    path,
-                    impl_map,
-                    config,
-                );
+                let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
+                let class = parse_pyclass_struct(&name, &e.attrs, path, impl_map, config);
                 result.push(PyItem::Class(class));
             }
             // Nested submodule
@@ -175,15 +161,20 @@ fn collect_add_calls_from_expr(
                 "add_function" => {
                     // m.add_function(wrap_pyfunction!(foo, m)?)
                     // Try to extract function name from the macro argument
-                    if let Some(fn_name) = extract_wrap_pyfunction_name(mc.args.first()) {
-                        if let Some(func) = find_pyfunction_by_name(&fn_name, file_items, path, config) {
-                            out.push(PyItem::Function(func));
-                        }
+                    if let Some(fn_name) = extract_wrap_pyfunction_name(mc.args.first())
+                        && let Some(func) =
+                            find_pyfunction_by_name(&fn_name, file_items, path, config)
+                    {
+                        out.push(PyItem::Function(func));
                     }
                 }
                 "add_class" => {
                     // m.add_class::<MyType>()
-                    if let Some(type_name) = extract_turbofish_type_name(&mc.method, &mc.turbofish) {
+                    // Style B: we only have the Rust type name here; #[pyclass(name = "...")] on the
+                    // struct is not visible. Future: look up the struct by type name and use its
+                    // pyclass name if present.
+                    if let Some(type_name) = extract_turbofish_type_name(&mc.method, &mc.turbofish)
+                    {
                         let class = parse_pyclass_struct(&type_name, &[], path, impl_map, config);
                         out.push(PyItem::Class(class));
                     }
@@ -238,10 +229,11 @@ fn find_pyfunction_by_name(
     config: &Config,
 ) -> Option<PyFunction> {
     for item in file_items {
-        if let Item::Fn(f) = item {
-            if f.sig.ident == name && has_attr(&f.attrs, "pyfunction") {
-                return parse_pyfunction(f, path, config);
-            }
+        if let Item::Fn(f) = item
+            && f.sig.ident == name
+            && has_attr(&f.attrs, "pyfunction")
+        {
+            return parse_pyfunction(f, path, config);
         }
     }
     None
@@ -250,7 +242,8 @@ fn find_pyfunction_by_name(
 // ── #[pyfunction] parsing ────────────────────────────────────────────────────
 
 pub fn parse_pyfunction(f: &ItemFn, path: &Path, config: &Config) -> Option<PyFunction> {
-    let name = f.sig.ident.to_string();
+    // #[pyo3(name = "foo")] overrides the Rust function name
+    let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| f.sig.ident.to_string());
     let doc = extract_doc(&f.attrs);
     let signature_override = extract_pyo3_signature(&f.attrs);
     let params = parse_params(&f.sig, config);
@@ -344,7 +337,8 @@ fn parse_pymethod(item: &ImplItem, config: &Config) -> Option<PyMethod> {
         return None;
     }
 
-    let name = m.sig.ident.to_string();
+    // #[pyo3(name = "foo")] overrides the Rust method name
+    let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| m.sig.ident.to_string());
     let doc = extract_doc(&m.attrs);
     let params = parse_params(&m.sig, config);
     let return_type = parse_return_type(&m.sig.output, config);
@@ -424,11 +418,11 @@ fn collect_impl_blocks(items: &[Item], _path: &Path, _config: &Config) -> ImplMa
                 continue;
             }
             // Get the struct/enum name from `impl MyType { ... }`
-            if let Type::Path(tp) = imp.self_ty.as_ref() {
-                if let Some(seg) = tp.path.segments.last() {
-                    let name = seg.ident.to_string();
-                    map.entry(name).or_default().extend(imp.items.clone());
-                }
+            if let Type::Path(tp) = imp.self_ty.as_ref()
+                && let Some(seg) = tp.path.segments.last()
+            {
+                let name = seg.ident.to_string();
+                map.entry(name).or_default().extend(imp.items.clone());
             }
         }
     }
@@ -443,7 +437,12 @@ pub fn has_attr(attrs: &[Attribute], name: &str) -> bool {
 
 fn has_any_pyo3_method_attr(attrs: &[Attribute]) -> bool {
     const METHOD_ATTRS: &[&str] = &[
-        "pyo3", "new", "getter", "setter", "staticmethod", "classmethod",
+        "pyo3",
+        "new",
+        "getter",
+        "setter",
+        "staticmethod",
+        "classmethod",
         "pyfunction", // sometimes used directly
     ];
     METHOD_ATTRS.iter().any(|name| has_attr(attrs, name))
@@ -464,20 +463,22 @@ pub fn extract_doc(attrs: &[Attribute]) -> Vec<String> {
             if !a.path().is_ident("doc") {
                 return None;
             }
-            if let Meta::NameValue(nv) = &a.meta {
-                if let Expr::Lit(lit) = &nv.value {
-                    if let syn::Lit::Str(s) = &lit.lit {
-                        // syn includes a leading space: `" Some text"` → strip it
-                        return Some(s.value().trim_start_matches(' ').to_string());
-                    }
-                }
+            if let Meta::NameValue(nv) = &a.meta
+                && let Expr::Lit(lit) = &nv.value
+                && let syn::Lit::Str(s) = &lit.lit
+            {
+                // syn includes a leading space: `" Some text"` → strip it
+                return Some(s.value().trim_start_matches(' ').to_string());
             }
             None
         })
         .collect()
 }
 
-/// Extract `#[pyo3(signature = (...))]` as a raw string.
+/// Extract `#[pyo3(signature = (...))]` as a raw string of the parameter list
+/// **without** the surrounding parentheses, e.g. `page=None, clip=None, **kwargs`.
+/// Only a single outer pair of parentheses is stripped; nested parens are preserved.
+/// Malformed or multi-line values may yield unexpected results.
 fn extract_pyo3_signature(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs {
         if !attr.path().is_ident("pyo3") {
@@ -489,7 +490,46 @@ fn extract_pyo3_signature(attrs: &[Attribute]) -> Option<String> {
             if let Some(start) = tokens.find("signature") {
                 let rest = &tokens[start..];
                 if let Some(eq_pos) = rest.find('=') {
-                    return Some(rest[eq_pos + 1..].trim().to_string());
+                    let value = rest[eq_pos + 1..].trim();
+                    // Strip the outer parentheses that pyo3 requires
+                    let inner = if value.starts_with('(') && value.ends_with(')') {
+                        &value[1..value.len() - 1]
+                    } else {
+                        value
+                    };
+                    return Some(inner.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract `#[pyo3(name = "foo")]` or `#[pyclass(name = "Foo")]` rename.
+/// Returns the override name if present, otherwise None.
+/// The name is expected to be a simple identifier; escaped quotes inside the string are not handled.
+pub fn extract_pyo3_name(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        // Handles both `#[pyo3(name = "foo")]` and `#[pyclass(name = "Foo")]`
+        if !attr.path().is_ident("pyo3") && !attr.path().is_ident("pyclass") {
+            continue;
+        }
+        if let Meta::List(ml) = &attr.meta {
+            let tokens = ml.tokens.to_string();
+            // Look for `name = "..."` — find the opening quote after `name =`
+            if let Some(name_pos) = tokens.find("name") {
+                let after_name = tokens[name_pos + 4..].trim_start();
+                if let Some(after_eq) = after_name.strip_prefix('=') {
+                    let after_eq = after_eq.trim_start();
+                    if let Some(inner) = after_eq.strip_prefix('"') {
+                        // Extract content between the first pair of quotes
+                        if let Some(end) = inner.find('"') {
+                            let name = &inner[..end];
+                            if !name.is_empty() {
+                                return Some(name.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -502,18 +542,18 @@ fn extract_pyo3_signature(attrs: &[Attribute]) -> Option<String> {
 fn is_pyo3_injected_param(ty: &Type) -> bool {
     let Type::Reference(r) = ty else {
         // Python<'_> (by value) is also injected
-        if let Type::Path(tp) = ty {
-            if let Some(seg) = tp.path.segments.last() {
-                return matches!(seg.ident.to_string().as_str(), "Python");
-            }
+        if let Type::Path(tp) = ty
+            && let Some(seg) = tp.path.segments.last()
+        {
+            return matches!(seg.ident.to_string().as_str(), "Python");
         }
         return false;
     };
-    if let Type::Path(tp) = r.elem.as_ref() {
-        if let Some(seg) = tp.path.segments.last() {
-            let name = seg.ident.to_string();
-            return matches!(name.as_str(), "Python" | "PyModule" | "Bound" | "Borrowed");
-        }
+    if let Type::Path(tp) = r.elem.as_ref()
+        && let Some(seg) = tp.path.segments.last()
+    {
+        let name = seg.ident.to_string();
+        return matches!(name.as_str(), "Python" | "PyModule" | "Bound" | "Borrowed");
     }
     false
 }
@@ -539,5 +579,188 @@ fn type_to_key(ty: &Type) -> String {
             .join("::"),
         Type::Reference(r) => type_to_key(&r.elem),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::path::Path;
+
+    fn dummy_path() -> &'static Path {
+        Path::new("test.rs")
+    }
+
+    // ── extract_pyo3_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn pyo3_name_from_pyo3_attr() {
+        // #[pyo3(name = "foo")]
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(name = "foo")]
+            fn rust_foo() -> i32 { 0 }
+        };
+        assert_eq!(extract_pyo3_name(&item.attrs), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn pyo3_name_from_pyclass_attr() {
+        // #[pyclass(name = "MyClass")]
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(name = "MyClass")]
+            struct RustStruct {}
+        };
+        assert_eq!(extract_pyo3_name(&item.attrs), Some("MyClass".to_string()));
+    }
+
+    #[test]
+    fn pyo3_name_absent_returns_none() {
+        // No name override → None
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            fn plain_fn() -> i32 { 0 }
+        };
+        assert_eq!(extract_pyo3_name(&item.attrs), None);
+    }
+
+    // ── parse_pyfunction respects #[pyo3(name = "...")] ─────────────────────
+
+    #[test]
+    fn pyfunction_uses_pyo3_name() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(name = "find_all_cells_bboxes")]
+            fn py_find_all_cells_bboxes(a: usize) -> usize { a }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        assert_eq!(func.name, "find_all_cells_bboxes");
+    }
+
+    #[test]
+    fn pyfunction_without_rename_uses_rust_name() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            fn sum_as_string(a: usize, b: usize) -> String { String::new() }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        assert_eq!(func.name, "sum_as_string");
+    }
+
+    // ── pyclass name extraction ──────────────────────────────────────────────
+
+    #[test]
+    fn pyclass_struct_uses_pyclass_name_attr() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(name = "Point")]
+            struct RustPoint { x: f64, y: f64 }
+        };
+        let impl_map = ImplMap::default();
+        let config = Config::default();
+        let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
+        let class = parse_pyclass_struct(&name, &item.attrs, dummy_path(), &impl_map, &config);
+        assert_eq!(class.name, "Point");
+    }
+
+    #[test]
+    fn pyclass_struct_without_rename_uses_rust_ident() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass]
+            struct MyType {}
+        };
+        let impl_map = ImplMap::default();
+        let config = Config::default();
+        let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
+        let class = parse_pyclass_struct(&name, &item.attrs, dummy_path(), &impl_map, &config);
+        assert_eq!(class.name, "MyType");
+    }
+
+    // ── pyo3(signature) extraction still works alongside name ────────────────
+
+    #[test]
+    fn pyfunction_pyo3_name_and_signature_coexist() {
+        // Single #[pyo3(name = "foo", signature = (a, b=0))]
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(name = "foo", signature = (a, b=0))]
+            fn rust_foo(a: i64, b: i64) -> i64 { a + b }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        assert_eq!(func.name, "foo");
+        assert!(func.signature_override.is_some());
+    }
+
+    // ── signature_override strips outer parens ───────────────────────────────
+
+    #[test]
+    fn signature_override_strips_outer_parens() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(signature = (page=None, clip=None, **kwargs))]
+            fn py_find(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let sig = func.signature_override.unwrap();
+        // Must NOT start with '(' or end with ')'
+        assert!(
+            !sig.starts_with('('),
+            "signature should not start with '(', got: {sig}"
+        );
+        assert!(
+            !sig.ends_with(')'),
+            "signature should not end with ')', got: {sig}"
+        );
+        // Must contain the parameters
+        assert!(
+            sig.contains("page"),
+            "signature should contain 'page', got: {sig}"
+        );
+        assert!(
+            sig.contains("kwargs"),
+            "signature should contain 'kwargs', got: {sig}"
+        );
+    }
+
+    #[test]
+    fn signature_override_separate_attr_strips_outer_parens() {
+        // Two separate attributes: #[pyo3(name = "...")] + #[pyo3(signature = (...))]
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(name = "find_all_cells_bboxes", signature = (page=None, clip=None, tf_settings=None, **kwargs))]
+            fn py_find_all_cells_bboxes(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        assert_eq!(func.name, "find_all_cells_bboxes");
+        let sig = func.signature_override.unwrap();
+        assert!(!sig.starts_with('('), "got: {sig}");
+        assert!(!sig.ends_with(')'), "got: {sig}");
+    }
+
+    /// Only the single outer pair of parentheses is stripped; nested parens are preserved.
+    #[test]
+    fn signature_override_nested_parens_strips_only_outer() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(signature = (a, (b, c)))]
+            fn f(a: i64, b: i64, c: i64) -> i64 { 0 }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let sig = func.signature_override.unwrap();
+        // We strip only the single outer pair; result may still end with ')' if nested
+        assert!(
+            !sig.starts_with('('),
+            "outer open paren should be stripped: {sig}"
+        );
+        assert!(
+            sig.contains('b') && sig.contains('c'),
+            "inner content (b, c) should be preserved: {sig}"
+        );
     }
 }

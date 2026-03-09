@@ -35,6 +35,23 @@ rylai path/to/my_crate --output path/to/out/
 rylai --config path/to/rylai.toml
 ```
 
+### For developers (this repo)
+
+You don’t need to install the binary. Use **`cargo run`** and pass arguments after `--`:
+
+```bash
+# Generate stubs for the example crate (writes into examples/pyo3_sample/)
+cargo run -- examples/pyo3_sample
+
+# Same as above, with explicit output directory
+cargo run -- examples/pyo3_sample --output examples/pyo3_sample
+
+# Show help
+cargo run -- --help
+```
+
+Anything after `--` is forwarded to the `rylai` binary.
+
 ### Example
 
 Given this Rust source (`src/lib.rs`):
