@@ -18,19 +18,28 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
         crate_root.to_path_buf()
     };
 
-    let mut modules: Vec<PyModule> = Vec::new();
-
+    // Collect all .rs paths and parsed files (two passes: first build pyclass name map, then extract modules).
+    // All parsed ASTs are held in memory; for very large crates consider streaming or lazy parsing in the future.
+    let mut files: Vec<(std::path::PathBuf, syn::File)> = Vec::new();
     for entry in WalkDir::new(&root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
     {
-        let path = entry.path();
-        let source = std::fs::read_to_string(path)?;
+        let path = entry.path().to_path_buf();
+        let source = std::fs::read_to_string(&path)?;
         let file = syn::parse_file(&source)
             .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+        files.push((path, file));
+    }
 
-        let file_modules = parse::extract_modules_from_file(&file, path, config);
+    // First pass: build Rust type name -> Python name for #[pyclass(name = "...")]
+    let pyclass_name_map = parse::build_pyclass_name_map(&files);
+
+    let mut modules: Vec<PyModule> = Vec::new();
+    for (path, file) in files {
+        let file_modules =
+            parse::extract_modules_from_file(&file, &path, config, &pyclass_name_map);
         modules.extend(file_modules);
     }
 

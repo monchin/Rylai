@@ -1,5 +1,6 @@
 use super::model::*;
 use crate::config::Config;
+use std::collections::HashMap;
 use std::path::Path;
 use syn::{
     Attribute, Expr, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta, Pat, ReturnType, Signature, Type,
@@ -7,8 +8,40 @@ use syn::{
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/// Build a map: Rust type name (struct/enum ident) -> Python name from `#[pyclass(name = "...")]`.
+/// Used so that when we see `m.add_class::<PyPdfDocument>()` we can emit `class PdfDocument`.
+/// If the same Rust type name appears in multiple files, the last occurrence wins.
+pub fn build_pyclass_name_map(
+    files: &[(std::path::PathBuf, syn::File)],
+) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (_path, file) in files {
+        for item in &file.items {
+            match item {
+                Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
+                    if let Some(python_name) = extract_pyo3_name(&s.attrs) {
+                        map.insert(s.ident.to_string(), python_name);
+                    }
+                }
+                Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
+                    if let Some(python_name) = extract_pyo3_name(&e.attrs) {
+                        map.insert(e.ident.to_string(), python_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
 /// Extract all `#[pymodule]` items from a parsed file.
-pub fn extract_modules_from_file(file: &syn::File, path: &Path, config: &Config) -> Vec<PyModule> {
+pub fn extract_modules_from_file(
+    file: &syn::File,
+    path: &Path,
+    config: &Config,
+    pyclass_name_map: &HashMap<String, String>,
+) -> Vec<PyModule> {
     // First pass: collect all #[pymethods] impl blocks keyed by struct name,
     // so we can attach them to PyClass items found later.
     let impl_map = collect_impl_blocks(&file.items, path, config);
@@ -25,7 +58,8 @@ pub fn extract_modules_from_file(file: &syn::File, path: &Path, config: &Config)
             }
             // Style B: #[pymodule] fn foo(m: &Bound<PyModule>) -> PyResult<()> { ... }
             Item::Fn(f) if has_attr(&f.attrs, "pymodule") => {
-                if let Some(module) = parse_fn_style_module(f, &file.items, path, config, &impl_map)
+                if let Some(module) =
+                    parse_fn_style_module(f, &file.items, path, config, &impl_map, pyclass_name_map)
                 {
                     result.push(module);
                 }
@@ -74,12 +108,16 @@ fn collect_items_from_list(
             }
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
                 let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
-                let class = parse_pyclass_struct(&name, &s.attrs, path, impl_map, config);
+                let rust_name = s.ident.to_string();
+                let class =
+                    parse_pyclass_struct(&name, &rust_name, &s.attrs, path, impl_map, config);
                 result.push(PyItem::Class(class));
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
                 let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
-                let class = parse_pyclass_struct(&name, &e.attrs, path, impl_map, config);
+                let rust_name = e.ident.to_string();
+                let class =
+                    parse_pyclass_struct(&name, &rust_name, &e.attrs, path, impl_map, config);
                 result.push(PyItem::Class(class));
             }
             // Nested submodule
@@ -102,6 +140,7 @@ fn parse_fn_style_module(
     path: &Path,
     config: &Config,
     impl_map: &ImplMap,
+    pyclass_name_map: &HashMap<String, String>,
 ) -> Option<PyModule> {
     let name = f.sig.ident.to_string();
     let doc = extract_doc(&f.attrs);
@@ -110,7 +149,15 @@ fn parse_fn_style_module(
 
     // Walk the function body looking for m.add_function(...) / m.add_class::<T>()
     for stmt in &f.block.stmts {
-        collect_add_calls_from_stmt(stmt, file_items, path, config, impl_map, &mut py_items);
+        collect_add_calls_from_stmt(
+            stmt,
+            file_items,
+            path,
+            config,
+            impl_map,
+            pyclass_name_map,
+            &mut py_items,
+        );
     }
 
     Some(PyModule {
@@ -127,19 +174,36 @@ fn collect_add_calls_from_stmt(
     path: &Path,
     config: &Config,
     impl_map: &ImplMap,
+    pyclass_name_map: &HashMap<String, String>,
     out: &mut Vec<PyItem>,
 ) {
     let expr = match stmt {
         syn::Stmt::Expr(e, _) => e,
         syn::Stmt::Local(l) => {
             if let Some(init) = &l.init {
-                collect_add_calls_from_expr(&init.expr, file_items, path, config, impl_map, out);
+                collect_add_calls_from_expr(
+                    &init.expr,
+                    file_items,
+                    path,
+                    config,
+                    impl_map,
+                    pyclass_name_map,
+                    out,
+                );
             }
             return;
         }
         _ => return,
     };
-    collect_add_calls_from_expr(expr, file_items, path, config, impl_map, out);
+    collect_add_calls_from_expr(
+        expr,
+        file_items,
+        path,
+        config,
+        impl_map,
+        pyclass_name_map,
+        out,
+    );
 }
 
 fn collect_add_calls_from_expr(
@@ -148,19 +212,25 @@ fn collect_add_calls_from_expr(
     path: &Path,
     config: &Config,
     impl_map: &ImplMap,
+    pyclass_name_map: &HashMap<String, String>,
     out: &mut Vec<PyItem>,
 ) {
     match expr {
         // m.add_function(...)?  or  m.add_class::<T>()?
-        Expr::Try(t) => {
-            collect_add_calls_from_expr(&t.expr, file_items, path, config, impl_map, out)
-        }
+        Expr::Try(t) => collect_add_calls_from_expr(
+            &t.expr,
+            file_items,
+            path,
+            config,
+            impl_map,
+            pyclass_name_map,
+            out,
+        ),
         Expr::MethodCall(mc) => {
             let method = mc.method.to_string();
             match method.as_str() {
                 "add_function" => {
                     // m.add_function(wrap_pyfunction!(foo, m)?)
-                    // Try to extract function name from the macro argument
                     if let Some(fn_name) = extract_wrap_pyfunction_name(mc.args.first())
                         && let Some(func) =
                             find_pyfunction_by_name(&fn_name, file_items, path, config)
@@ -169,13 +239,23 @@ fn collect_add_calls_from_expr(
                     }
                 }
                 "add_class" => {
-                    // m.add_class::<MyType>()
-                    // Style B: we only have the Rust type name here; #[pyclass(name = "...")] on the
-                    // struct is not visible. Future: look up the struct by type name and use its
-                    // pyclass name if present.
+                    // m.add_class::<PyPdfDocument>() — use pyclass_name_map for #[pyclass(name = "PdfDocument")]
+                    // Style B: we don't have the struct item here, so attrs are empty and the class has no doc in the stub.
                     if let Some(type_name) = extract_turbofish_type_name(&mc.method, &mc.turbofish)
                     {
-                        let class = parse_pyclass_struct(&type_name, &[], path, impl_map, config);
+                        let rust_name = type_name.clone();
+                        let class_name = pyclass_name_map
+                            .get(&type_name)
+                            .cloned()
+                            .unwrap_or(type_name);
+                        let class = parse_pyclass_struct(
+                            &class_name,
+                            &rust_name,
+                            &[],
+                            path,
+                            impl_map,
+                            config,
+                        );
                         out.push(PyItem::Class(class));
                     }
                 }
@@ -307,8 +387,11 @@ fn parse_return_type(output: &ReturnType, config: &Config) -> PyType {
 
 // ── #[pyclass] parsing ───────────────────────────────────────────────────────
 
+/// `display_name`: name used in .pyi (Python name, from #[pyclass(name = "...")] or ident).
+/// `rust_name_for_impl`: Rust type name for looking up #[pymethods] impl block.
 fn parse_pyclass_struct(
-    name: &str,
+    display_name: &str,
+    rust_name_for_impl: &str,
     attrs: &[Attribute],
     path: &Path,
     impl_map: &ImplMap,
@@ -316,7 +399,7 @@ fn parse_pyclass_struct(
 ) -> PyClass {
     let doc = extract_doc(attrs);
     let methods = impl_map
-        .get(name)
+        .get(rust_name_for_impl)
         .cloned()
         .unwrap_or_default()
         .into_iter()
@@ -324,7 +407,7 @@ fn parse_pyclass_struct(
         .collect();
 
     PyClass {
-        name: name.to_string(),
+        name: display_name.to_string(),
         doc,
         methods,
         source_file: path.to_path_buf(),
@@ -625,6 +708,87 @@ mod tests {
         assert_eq!(extract_pyo3_name(&item.attrs), None);
     }
 
+    #[test]
+    fn pyclass_name_with_extra_attrs() {
+        // #[pyclass(name = "PdfDocument", unsendable)] — name must be extracted correctly
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(name = "PdfDocument", unsendable)]
+            pub struct PyPdfDocument { inner: i32 }
+        };
+        assert_eq!(
+            extract_pyo3_name(&item.attrs),
+            Some("PdfDocument".to_string())
+        );
+    }
+
+    // ── build_pyclass_name_map (style B: add_class uses this) ───────────────
+
+    #[test]
+    fn build_pyclass_name_map_includes_renamed_class() {
+        let file: syn::File = syn::parse_quote! {
+            #[pyclass(name = "PdfDocument", unsendable)]
+            pub struct PyPdfDocument { inner: i32 }
+        };
+        let path = std::path::PathBuf::from("lib.rs");
+        let files = vec![(path, file)];
+        let map = build_pyclass_name_map(&files);
+        assert_eq!(map.get("PyPdfDocument"), Some(&"PdfDocument".to_string()));
+    }
+
+    /// Style B: when a module uses m.add_class::<PyPdfDocument>() and the crate has
+    /// #[pyclass(name = "PdfDocument")] on that struct, the generated class name must be PdfDocument.
+    #[test]
+    fn extract_modules_from_file_style_b_uses_pyclass_name_map() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<PyPdfDocument>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let mut map = HashMap::new();
+        map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
+
+        let modules = extract_modules_from_file(&file, path, &config, &map);
+        assert_eq!(modules.len(), 1, "one pymodule");
+        let module = &modules[0];
+        assert_eq!(module.items.len(), 1, "one item (the class)");
+        match &module.items[0] {
+            PyItem::Class(c) => assert_eq!(c.name, "PdfDocument", "class name from map"),
+            other => panic!("expected PyItem::Class, got {:?}", other),
+        }
+    }
+
+    /// Style B: when the map has no entry for the type, we fall back to the Rust type name.
+    #[test]
+    fn extract_modules_from_file_style_b_fallback_to_rust_name_when_not_in_map() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<MyRustType>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let map = HashMap::new(); // empty map
+
+        let modules = extract_modules_from_file(&file, path, &config, &map);
+        assert_eq!(modules.len(), 1);
+        match &modules[0].items[0] {
+            PyItem::Class(c) => assert_eq!(c.name, "MyRustType"),
+            other => panic!("expected PyItem::Class, got {:?}", other),
+        }
+    }
+
     // ── parse_pyfunction respects #[pyo3(name = "...")] ─────────────────────
 
     #[test]
@@ -661,7 +825,15 @@ mod tests {
         let impl_map = ImplMap::default();
         let config = Config::default();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
-        let class = parse_pyclass_struct(&name, &item.attrs, dummy_path(), &impl_map, &config);
+        let rust_name = item.ident.to_string();
+        let class = parse_pyclass_struct(
+            &name,
+            &rust_name,
+            &item.attrs,
+            dummy_path(),
+            &impl_map,
+            &config,
+        );
         assert_eq!(class.name, "Point");
     }
 
@@ -674,7 +846,15 @@ mod tests {
         let impl_map = ImplMap::default();
         let config = Config::default();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
-        let class = parse_pyclass_struct(&name, &item.attrs, dummy_path(), &impl_map, &config);
+        let rust_name = item.ident.to_string();
+        let class = parse_pyclass_struct(
+            &name,
+            &rust_name,
+            &item.attrs,
+            dummy_path(),
+            &impl_map,
+            &config,
+        );
         assert_eq!(class.name, "MyType");
     }
 
