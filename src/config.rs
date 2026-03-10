@@ -100,6 +100,37 @@ pub struct OverrideEntry {
     pub stub: String,
 }
 
+/// Version-specific rendering decisions, computed once from the configured Python version
+/// and threaded through all generation code.
+///
+/// Adding a new version-specific behavior means adding a field here and deriving it in
+/// `from_version` — no changes needed elsewhere in the generation pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderPolicy {
+    /// Emit `T | None` (py ≥ 3.10) instead of `Optional[T]` (py < 3.10).
+    pub union_optional: bool,
+    /// Emit the native `Self` keyword (py ≥ 3.11, PEP 673) instead of the class name.
+    /// When `false`, class names are used as forward references and
+    /// `from __future__ import annotations` is added to the output.
+    pub native_self: bool,
+    /// Prepend `from __future__ import annotations` to the generated file.
+    /// Needed when using class names as forward references (i.e. when `!native_self`).
+    pub future_annotations: bool,
+}
+
+impl RenderPolicy {
+    pub fn from_version(major: u32, minor: u32) -> Self {
+        let v = (major, minor);
+        let native_self = v >= (3, 11);
+        Self {
+            union_optional: v >= (3, 10),
+            native_self,
+            // forward-reference class names require lazy annotation evaluation
+            future_annotations: !native_self,
+        }
+    }
+}
+
 impl Config {
     /// Load from file if it exists; return default config if the file is absent.
     pub fn load_or_default(path: &Path) -> Result<Self> {
@@ -125,8 +156,86 @@ impl Config {
         )
     }
 
-    /// Whether to use `X | None` (py ≥ 3.10) or `Optional[X]`.
-    pub fn use_union_syntax(&self) -> bool {
-        self.python_version_tuple() >= (3, 10)
+    /// Compute the rendering policy for the configured Python version.
+    pub fn render_policy(&self) -> RenderPolicy {
+        let (major, minor) = self.python_version_tuple();
+        RenderPolicy::from_version(major, minor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_policy_py39_optional_no_native_self() {
+        let p = RenderPolicy::from_version(3, 9);
+        assert!(!p.union_optional, "3.9 uses Optional[T]");
+        assert!(!p.native_self, "3.9 uses class name, not Self");
+        assert!(
+            p.future_annotations,
+            "3.9 needs future annotations for forward refs"
+        );
+    }
+
+    #[test]
+    fn render_policy_py310_union_optional_no_native_self() {
+        let p = RenderPolicy::from_version(3, 10);
+        assert!(p.union_optional, "3.10 uses T | None");
+        assert!(!p.native_self, "3.10 still uses class name");
+        assert!(p.future_annotations);
+    }
+
+    #[test]
+    fn render_policy_py311_native_self_no_future_annotations() {
+        let p = RenderPolicy::from_version(3, 11);
+        assert!(p.union_optional);
+        assert!(p.native_self, "3.11 has typing.Self (PEP 673)");
+        assert!(
+            !p.future_annotations,
+            "native Self does not require future annotations"
+        );
+    }
+
+    #[test]
+    fn render_policy_py312_same_as_py311() {
+        let p = RenderPolicy::from_version(3, 12);
+        assert!(p.union_optional);
+        assert!(p.native_self);
+        assert!(!p.future_annotations);
+    }
+
+    #[test]
+    fn config_python_version_tuple_parses_major_minor() {
+        let mut config = Config::default();
+        config.output.python_version = "3.9".to_string();
+        assert_eq!(config.python_version_tuple(), (3, 9));
+
+        config.output.python_version = "3.12.0".to_string();
+        assert_eq!(config.python_version_tuple(), (3, 12));
+    }
+
+    #[test]
+    fn config_python_version_tuple_invalid_fallback() {
+        let mut config = Config::default();
+        config.output.python_version = "invalid".to_string();
+        // Fallback: no successful parse → (3, 10) from defaults in implementation
+        let (major, minor) = config.python_version_tuple();
+        assert_eq!(major, 3);
+        assert_eq!(minor, 10);
+    }
+
+    #[test]
+    fn config_render_policy_uses_configured_version() {
+        let mut config = Config::default();
+        config.output.python_version = "3.9".to_string();
+        let p = config.render_policy();
+        assert!(!p.union_optional);
+        assert!(p.future_annotations);
+
+        config.output.python_version = "3.12".to_string();
+        let p = config.render_policy();
+        assert!(p.native_self);
+        assert!(!p.future_annotations);
     }
 }

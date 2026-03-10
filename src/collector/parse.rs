@@ -826,7 +826,7 @@ fn type_to_key(ty: &Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, RenderPolicy};
     use std::path::Path;
 
     fn dummy_path() -> &'static Path {
@@ -924,7 +924,8 @@ mod my_mod {
             PyItem::Function(f) => f,
             other => panic!("expected PyItem::Function, got {other:?}"),
         };
-        let mapping = crate::type_map::map_type(&func.return_type.rust_type, true);
+        let policy = RenderPolicy::from_version(3, 10);
+        let mapping = crate::type_map::map_type(&func.return_type.rust_type, &policy, None);
         assert_eq!(
             mapping.py_type, "list[tuple[float, float, float, float]]",
             "Vec<PyBbox> with type PyBbox = (f32, f32, f32, f32) should map to list[tuple[float, float, float, float]]"
@@ -957,7 +958,8 @@ mod my_mod {
             other => panic!("expected PyItem::Function, got {other:?}"),
         };
         assert_eq!(func.params.len(), 1);
-        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, false);
+        let policy = RenderPolicy::from_version(3, 9);
+        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, &policy, None);
         assert_eq!(
             mapping.py_type, "float",
             "Score alias (= f64) should expand to float"
@@ -1464,10 +1466,67 @@ mod my_mod {
             "&Bound<PyBytes> must not be filtered as injected"
         );
         assert_eq!(func.params[0].name, "data");
-        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, false);
+        let policy = RenderPolicy::from_version(3, 9);
+        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, &policy, None);
         assert_eq!(
             mapping.py_type, "bytes",
             "PyBytes should map to Python bytes"
+        );
+    }
+
+    /// A `#[staticmethod]` returning `PyResult<Self>` should have its return type collected
+    /// as the raw `Self` type, which the generator later resolves to the Python class name.
+    #[test]
+    fn static_method_pyresult_self_return_type_is_collected() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass(name = "PdfDocument")]
+struct PyPdfDocument {}
+
+#[pymethods]
+impl PyPdfDocument {
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        unimplemented!()
+    }
+}
+
+#[pymodule]
+fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<PyPdfDocument>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let mut pyclass_map = HashMap::new();
+        pyclass_map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
+        let type_alias_map = HashMap::new();
+        let modules =
+            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let from_bytes = class
+            .methods
+            .iter()
+            .find(|m| m.name == "from_bytes")
+            .expect("from_bytes not found");
+        // The return type should be `PyResult<Self>` in the raw Rust AST.
+        // When the generator resolves it with self_type = "PdfDocument", it should
+        // unwrap PyResult and resolve Self → PdfDocument.
+        let policy = RenderPolicy::from_version(3, 9);
+        let mapping = crate::type_map::map_type(
+            &from_bytes.return_type.rust_type,
+            &policy,
+            Some("PdfDocument"),
+        );
+        assert_eq!(
+            mapping.py_type, "PdfDocument",
+            "PyResult<Self> with class context should resolve to PdfDocument"
         );
     }
 
