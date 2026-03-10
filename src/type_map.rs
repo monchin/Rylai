@@ -234,20 +234,19 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
                 is_unknown: false,
             };
         }
+        // PyRef<'_, T> / PyRefMut<'_, T> — in return position, emit T (e.g. Self → class name or Self)
+        "PyRef" | "PyRefMut" => {
+            let type_args = generic_args(last_seg);
+            if let Some(inner) = type_args.first() {
+                return map_type(inner, policy, self_type);
+            }
+            return TypeMapping::unknown();
+        }
+
         "Py" | "Bound" | "Borrowed" => {
             // Py<T> / Bound<'_, T> — recurse into T
             // For Bound<'_, T> the lifetime is a GenericArgument::Lifetime, skip it
-            let type_args: Vec<&Type> = match &last_seg.arguments {
-                syn::PathArguments::AngleBracketed(ab) => ab
-                    .args
-                    .iter()
-                    .filter_map(|a| match a {
-                        syn::GenericArgument::Type(t) => Some(t),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => vec![],
-            };
+            let type_args = generic_args(last_seg);
             if let Some(inner) = type_args.first() {
                 return map_type(inner, policy, self_type);
             }
@@ -446,6 +445,24 @@ mod tests {
         assert_eq!(m.py_type, "Self");
         assert!(m.needs_self_import);
         assert!(!m.needs_any);
+    }
+
+    /// `PyRef<'_, Self>` (e.g. __enter__ return) with class context maps to the class name.
+    #[test]
+    fn pyref_self_with_context_maps_to_class_name() {
+        let ty = parse_ty("pyo3::PyRef<'_, Self>");
+        let m = map_type(&ty, &p(false), Some("PdfDocument"));
+        assert_eq!(m.py_type, "PdfDocument");
+        assert!(!m.needs_any);
+    }
+
+    /// `PyRef<'_, Self>` with `native_self` maps to the `Self` keyword.
+    #[test]
+    fn pyref_self_native_keyword_for_py311() {
+        let ty = parse_ty("pyo3::PyRef<'_, Self>");
+        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"));
+        assert_eq!(m.py_type, "Self");
+        assert!(m.needs_self_import);
     }
 
     /// `Option<i32>` uses `X | None` syntax when `union_optional` is true.
