@@ -416,9 +416,6 @@ fn parse_pyclass_struct(
 
 fn parse_pymethod(item: &ImplItem, config: &Config) -> Option<PyMethod> {
     let ImplItem::Fn(m) = item else { return None };
-    if !has_any_pyo3_method_attr(&m.attrs) {
-        return None;
-    }
 
     // #[pyo3(name = "foo")] overrides the Rust method name
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| m.sig.ident.to_string());
@@ -518,26 +515,6 @@ pub fn has_attr(attrs: &[Attribute], name: &str) -> bool {
     attrs.iter().any(|a| a.path().is_ident(name))
 }
 
-fn has_any_pyo3_method_attr(attrs: &[Attribute]) -> bool {
-    const METHOD_ATTRS: &[&str] = &[
-        "pyo3",
-        "new",
-        "getter",
-        "setter",
-        "staticmethod",
-        "classmethod",
-        "pyfunction", // sometimes used directly
-    ];
-    METHOD_ATTRS.iter().any(|name| has_attr(attrs, name))
-        || attrs.iter().any(|a| {
-            // Check for bare `fn` without attributes — regular instance methods in #[pymethods]
-            // are included by default, so we also want those.
-            // We'll collect all methods from #[pymethods] impl blocks regardless.
-            let _ = a;
-            false
-        })
-}
-
 /// Extract `/// doc comment` text from attributes.
 pub fn extract_doc(attrs: &[Attribute]) -> Vec<String> {
     attrs
@@ -624,11 +601,14 @@ pub fn extract_pyo3_name(attrs: &[Attribute]) -> Option<String> {
 /// `Python<'_>`, `&Bound<'_, PyModule>`, etc.
 fn is_pyo3_injected_param(ty: &Type) -> bool {
     let Type::Reference(r) = ty else {
-        // Python<'_> (by value) is also injected
         if let Type::Path(tp) = ty
             && let Some(seg) = tp.path.segments.last()
         {
-            return matches!(seg.ident.to_string().as_str(), "Python");
+            // Python<'_> by value, and pyo3 self-ref types used instead of &self / &mut self
+            return matches!(
+                seg.ident.to_string().as_str(),
+                "Python" | "PyRef" | "PyRefMut"
+            );
         }
         return false;
     };
@@ -941,6 +921,207 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         assert!(
             sig.contains('b') && sig.contains('c'),
             "inner content (b, c) should be preserved: {sig}"
+        );
+    }
+
+    // ── plain instance methods in #[pymethods] are collected ─────────────────
+
+    /// Regular methods in a #[pymethods] block (no special attribute) must be collected.
+    /// Previously only methods with #[new]/#[getter]/etc. were emitted; all others were dropped.
+    #[test]
+    fn pymethods_plain_instance_methods_are_collected() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct Counter {}
+
+#[pymethods]
+impl Counter {
+    fn count(&self) -> i32 { 0 }
+    fn reset(&mut self) {}
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Counter>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let map = HashMap::new();
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let names: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"count"), "count missing: {names:?}");
+        assert!(names.contains(&"reset"), "reset missing: {names:?}");
+    }
+
+    /// __iter__ and __next__ are plain instance methods in pyo3 (no special attribute needed).
+    /// They must appear in the collected method list.
+    #[test]
+    fn pymethods_dunder_iter_and_next_are_collected() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct PageIterator {}
+
+#[pymethods]
+impl PageIterator {
+    fn __iter__(slf: pyo3::PyRef<'_, Self>) -> pyo3::PyRef<'_, Self> { slf }
+    fn __next__(&mut self) -> Option<i32> { None }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<PageIterator>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let map = HashMap::new();
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let names: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"__iter__"), "__iter__ missing: {names:?}");
+        assert!(names.contains(&"__next__"), "__next__ missing: {names:?}");
+    }
+
+    // ── PyRef / PyRefMut self-params are excluded from stubs ─────────────────
+
+    /// `slf: PyRef<'_, Self>` is pyo3's way to write `&self`; it must not appear
+    /// as an explicit Python parameter in the generated stub.
+    #[test]
+    fn pyref_self_param_is_excluded() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct MyIter {}
+
+#[pymethods]
+impl MyIter {
+    fn __iter__(slf: pyo3::PyRef<'_, Self>) -> pyo3::PyRef<'_, Self> { slf }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<MyIter>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let map = HashMap::new();
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let iter_m = class
+            .methods
+            .iter()
+            .find(|m| m.name == "__iter__")
+            .expect("__iter__ not found");
+        let param_names: Vec<&str> = iter_m.params.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            param_names.is_empty(),
+            "PyRef<Self> should not appear as a param, got: {param_names:?}"
+        );
+    }
+
+    /// `mut slf: PyRefMut<'_, Self>` is pyo3's way to write `&mut self`; same rule.
+    #[test]
+    fn pyrefmut_self_param_is_excluded() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct MyIter {}
+
+#[pymethods]
+impl MyIter {
+    fn __next__(mut slf: pyo3::PyRefMut<'_, Self>) -> Option<i32> { None }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<MyIter>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let map = HashMap::new();
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let next_m = class
+            .methods
+            .iter()
+            .find(|m| m.name == "__next__")
+            .expect("__next__ not found");
+        let param_names: Vec<&str> = next_m.params.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            param_names.is_empty(),
+            "PyRefMut<Self> should not appear as a param, got: {param_names:?}"
+        );
+    }
+
+    /// PyRef self-param is excluded even when the method has additional real params.
+    #[test]
+    fn pyref_self_excluded_with_extra_params() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn get(slf: pyo3::PyRef<'_, Self>, index: i32) -> i32 { index }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let map = HashMap::new();
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let get_m = class
+            .methods
+            .iter()
+            .find(|m| m.name == "get")
+            .expect("get not found");
+        let param_names: Vec<&str> = get_m.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            param_names,
+            vec!["index"],
+            "only 'index' should remain, got: {param_names:?}"
         );
     }
 }
