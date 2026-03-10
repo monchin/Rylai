@@ -4,6 +4,7 @@ use crate::collector::{
 use crate::config::{Config, FallbackStrategy};
 use crate::type_map::{self, TypeMapping};
 use anyhow::{Result, bail};
+use std::collections::HashMap;
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -139,8 +140,8 @@ impl<'a> GenCtx<'a> {
         let ret = self.resolve_type(&f.return_type, &format!("{}::return", f.name))?;
 
         let params_str = if let Some(sig) = &f.signature_override {
-            // #[pyo3(signature = (...))] — inner content only, no surrounding parens
-            sig.clone()
+            // #[pyo3(signature = (...))] is present: merge signature defaults with Rust types
+            self.merge_sig_with_types(sig, &f.params, &f.name)?
         } else {
             self.gen_params(&f.params, &f.name, false)?
         };
@@ -238,6 +239,76 @@ impl<'a> GenCtx<'a> {
         Ok(())
     }
 
+    // ── Signature merge ──────────────────────────────────────────────────────
+
+    /// Combine a `#[pyo3(signature = (...))]` string with the Rust param types.
+    ///
+    /// `sig` is the inner content of the signature attribute with outer parens already
+    /// stripped, e.g. `"page=None, clip=None, tf_settings=None, **kwargs"`.
+    /// For every name found in `params` we attach the mapped Python type; entries that
+    /// have no Rust counterpart (e.g. a sentinel `/`) are emitted verbatim.
+    fn merge_sig_with_types(
+        &mut self,
+        sig: &str,
+        params: &[PyParam],
+        fn_name: &str,
+    ) -> Result<String> {
+        // Build name → PyParam lookup
+        let param_by_name: HashMap<&str, &PyParam> =
+            params.iter().map(|p| (p.name.as_str(), p)).collect();
+
+        let raw_parts = split_at_top_level_commas(sig);
+        let mut out_parts: Vec<String> = Vec::new();
+
+        for raw in raw_parts {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+
+            if let Some(name) = token.strip_prefix("**") {
+                // **kwargs — resolve type, then strip the `| None` wrapper that pyo3
+                // uses internally (callers never pass None as **kwargs)
+                let ty = if let Some(p) = param_by_name.get(name) {
+                    let full = self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?;
+                    strip_option_none(&full)
+                } else {
+                    self.needs_any = true;
+                    "Any".to_string()
+                };
+                out_parts.push(format!("**{name}: {ty}"));
+            } else if let Some(name) = token.strip_prefix('*') {
+                if name.is_empty() {
+                    // bare `*` — keyword-only argument separator, no type annotation
+                    out_parts.push("*".to_string());
+                } else {
+                    // *args
+                    let ty = if let Some(p) = param_by_name.get(name) {
+                        self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?
+                    } else {
+                        self.needs_any = true;
+                        "Any".to_string()
+                    };
+                    out_parts.push(format!("*{name}: {ty}"));
+                }
+            } else {
+                let (name, default_opt) = split_name_default(token);
+                if let Some(p) = param_by_name.get(name) {
+                    let ty = self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?;
+                    match default_opt {
+                        Some(default) => out_parts.push(format!("{name}: {ty} = {default}")),
+                        None => out_parts.push(format!("{name}: {ty}")),
+                    }
+                } else {
+                    // No Rust type available — keep the signature token as-is
+                    out_parts.push(token.to_string());
+                }
+            }
+        }
+
+        Ok(out_parts.join(", "))
+    }
+
     // ── Params ───────────────────────────────────────────────────────────────
 
     fn gen_params(
@@ -291,5 +362,344 @@ fn item_name(item: &PyItem) -> &str {
         PyItem::Function(f) => &f.name,
         PyItem::Class(c) => &c.name,
         PyItem::Module(m) => &m.name,
+    }
+}
+
+/// Split a parameter-list string at top-level commas, respecting nested brackets.
+///
+/// For example, `"a, b=(1,2), **kwargs"` yields `["a", " b=(1,2)", " **kwargs"]`.
+///
+/// Unbalanced brackets (malformed input) are tolerated: depth uses saturating_sub
+/// so the function continues and produces best-effort output rather than panicking.
+fn split_at_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Split a signature token such as `"page=None"` into `("page", Some("None"))`.
+/// Tokens without a `=` return `(token, None)`.
+/// Only the **first** `=` is used as the split point.
+fn split_name_default(token: &str) -> (&str, Option<&str>) {
+    match token.find('=') {
+        Some(pos) => (token[..pos].trim(), Some(token[pos + 1..].trim())),
+        None => (token.trim(), None),
+    }
+}
+
+/// Remove the ` | None` (or `Optional[…]`) wrapper added by the `Option<T>` mapping.
+///
+/// Used for `**kwargs` parameters: pyo3 uses `Option<&Bound<'_, PyDict>>` internally,
+/// but from Python's perspective `**kwargs` is never `None`.
+fn strip_option_none(ty: &str) -> String {
+    let t = ty.trim();
+    // "X | None" → "X"
+    if let Some(inner) = t.strip_suffix("| None") {
+        let stripped = inner.trim_end();
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+    // "Optional[X]" → "X"
+    if let Some(inner) = t
+        .strip_prefix("Optional[")
+        .and_then(|s| s.strip_suffix(']'))
+        && !inner.is_empty()
+    {
+        return inner.to_string();
+    }
+    t.to_string()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::{ParamKind, PyFunction, PyItem, PyModule, PyParam, PyType};
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    // ── Test-data builders ───────────────────────────────────────────────────
+
+    fn dummy_path() -> PathBuf {
+        PathBuf::from("test.rs")
+    }
+
+    fn make_module(items: Vec<PyItem>) -> PyModule {
+        PyModule {
+            name: "m".to_string(),
+            doc: vec![],
+            items,
+            source_file: dummy_path(),
+        }
+    }
+
+    fn make_fn(name: &str, sig: Option<&str>, params: Vec<PyParam>, ret: syn::Type) -> PyFunction {
+        PyFunction {
+            name: name.to_string(),
+            doc: vec![],
+            signature_override: sig.map(str::to_string),
+            params,
+            return_type: PyType {
+                rust_type: ret,
+                override_str: None,
+            },
+            source_file: dummy_path(),
+        }
+    }
+
+    fn make_param(name: &str, rust_type: syn::Type) -> PyParam {
+        PyParam {
+            name: name.to_string(),
+            ty: PyType {
+                rust_type,
+                override_str: None,
+            },
+            default: None,
+            kind: ParamKind::Regular,
+        }
+    }
+
+    fn stub_for(items: Vec<PyItem>) -> String {
+        let config = Config::default();
+        generate(&[make_module(items)], &config).unwrap()
+    }
+
+    // ── split_at_top_level_commas ────────────────────────────────────────────
+
+    #[test]
+    fn split_simple_list() {
+        assert_eq!(split_at_top_level_commas("a, b, c"), vec!["a", " b", " c"]);
+    }
+
+    #[test]
+    fn split_respects_nested_parens() {
+        // The comma inside (1,2) must not split the token
+        let parts = split_at_top_level_commas("a, b=(1,2), c");
+        assert_eq!(parts, vec!["a", " b=(1,2)", " c"]);
+    }
+
+    #[test]
+    fn split_single_token() {
+        assert_eq!(split_at_top_level_commas("page=None"), vec!["page=None"]);
+    }
+
+    #[test]
+    fn split_with_kwargs() {
+        let parts = split_at_top_level_commas("page=None, **kwargs");
+        assert_eq!(parts, vec!["page=None", " **kwargs"]);
+    }
+
+    #[test]
+    fn split_nested_brackets_and_braces() {
+        let parts = split_at_top_level_commas("a, b=[1,2], c={3}");
+        assert_eq!(parts, vec!["a", " b=[1,2]", " c={3}"]);
+    }
+
+    // ── split_name_default ───────────────────────────────────────────────────
+
+    #[test]
+    fn name_default_with_none() {
+        assert_eq!(split_name_default("page=None"), ("page", Some("None")));
+    }
+
+    #[test]
+    fn name_default_with_bool() {
+        assert_eq!(
+            split_name_default("extract_text=True"),
+            ("extract_text", Some("True"))
+        );
+    }
+
+    #[test]
+    fn name_default_absent() {
+        assert_eq!(split_name_default("cells"), ("cells", None));
+    }
+
+    #[test]
+    fn name_default_trims_whitespace() {
+        // Signature tokens extracted by pyo3 often have surrounding spaces
+        assert_eq!(split_name_default(" page = None "), ("page", Some("None")));
+    }
+
+    #[test]
+    fn name_default_tuple_default() {
+        // Only the first `=` is used; value may contain `=` in a nested expression
+        assert_eq!(split_name_default("clip=(1,2)"), ("clip", Some("(1,2)")));
+    }
+
+    // ── strip_option_none ────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_union_none() {
+        assert_eq!(strip_option_none("Any | None"), "Any");
+    }
+
+    #[test]
+    fn strip_optional_syntax() {
+        assert_eq!(strip_option_none("Optional[Any]"), "Any");
+    }
+
+    #[test]
+    fn strip_complex_union() {
+        assert_eq!(strip_option_none("list[int] | None"), "list[int]");
+    }
+
+    #[test]
+    fn strip_leaves_plain_type_unchanged() {
+        assert_eq!(strip_option_none("int"), "int");
+    }
+
+    #[test]
+    fn strip_leaves_any_unchanged() {
+        assert_eq!(strip_option_none("Any"), "Any");
+    }
+
+    // ── merge_sig_with_types (via generate) ──────────────────────────────────
+
+    /// Regular params with defaults get their Rust types attached.
+    #[test]
+    fn merge_attaches_type_and_preserves_default() {
+        let f = make_fn(
+            "find_cells",
+            Some("page=None, clip=None"),
+            vec![
+                make_param("page", syn::parse_quote! { Option<i32> }),
+                make_param("clip", syn::parse_quote! { Option<String> }),
+            ],
+            syn::parse_quote! { Vec<i32> },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("page: int | None = None"), "got:\n{stub}");
+        assert!(stub.contains("clip: str | None = None"), "got:\n{stub}");
+    }
+
+    /// Required params (no default in signature) get typed but no `= ...`.
+    #[test]
+    fn merge_required_param_no_default() {
+        let f = make_fn(
+            "proc",
+            Some("cells, extract_text"),
+            vec![
+                make_param("cells", syn::parse_quote! { Vec<i32> }),
+                make_param("extract_text", syn::parse_quote! { bool }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("cells: list[int]"), "got:\n{stub}");
+        assert!(stub.contains("extract_text: bool"), "got:\n{stub}");
+        // Must not gain a spurious default
+        assert!(!stub.contains("cells: list[int] ="), "got:\n{stub}");
+    }
+
+    /// `**kwargs` gets the inner type with `| None` stripped.
+    #[test]
+    fn merge_kwargs_strips_option_none() {
+        let f = make_fn(
+            "my_fn",
+            Some("page=None, **kwargs"),
+            vec![
+                make_param("page", syn::parse_quote! { Option<i32> }),
+                make_param("kwargs", syn::parse_quote! { Option<i32> }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("**kwargs: int"), "got:\n{stub}");
+        assert!(!stub.contains("**kwargs: int | None"), "got:\n{stub}");
+    }
+
+    /// A token in the signature with no matching Rust param is kept verbatim.
+    /// This covers the positional-only sentinel `/` and future unknown tokens.
+    #[test]
+    fn merge_unknown_token_kept_verbatim() {
+        let f = make_fn(
+            "my_fn",
+            Some("known=None, /"),
+            vec![make_param("known", syn::parse_quote! { Option<i32> })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("known: int | None = None, /"),
+            "positional-only '/' should be preserved with typed param, got:\n{stub}"
+        );
+    }
+
+    /// Bare `*` (keyword-only separator) is emitted as-is without type annotation.
+    /// `(a, *, b=None)` must not become `(a, *: Any, b: ...)`.
+    #[test]
+    fn merge_bare_star_keyword_only_separator() {
+        let f = make_fn(
+            "my_fn",
+            Some("a, *, b=None"),
+            vec![
+                make_param("a", syn::parse_quote! { i32 }),
+                make_param("b", syn::parse_quote! { Option<i32> }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("a: int, *, b: int | None = None"),
+            "bare '*' should be kept as separator without type, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("*:"),
+            "bare '*' must not gain a type annotation, got:\n{stub}"
+        );
+    }
+
+    /// `*args` gets the correct type from the Rust param (e.g. `Vec<i32>` → `list[int]`).
+    #[test]
+    fn merge_args_typed_in_stub() {
+        let f = make_fn(
+            "my_fn",
+            Some("a, *args"),
+            vec![
+                make_param("a", syn::parse_quote! { i32 }),
+                make_param("args", syn::parse_quote! { Vec<i32> }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("*args: list[int]"),
+            "*args should get type from Vec<i32>, got:\n{stub}"
+        );
+    }
+
+    /// When no `signature_override` is set, `gen_params` is used unchanged (regression guard).
+    #[test]
+    fn no_signature_override_uses_rust_params_directly() {
+        let f = make_fn(
+            "add",
+            None, // no override
+            vec![
+                make_param("a", syn::parse_quote! { i32 }),
+                make_param("b", syn::parse_quote! { i32 }),
+            ],
+            syn::parse_quote! { i32 },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("def add(a: int, b: int) -> int"),
+            "got:\n{stub}"
+        );
     }
 }
