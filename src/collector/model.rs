@@ -55,7 +55,12 @@ pub enum ParamKind {
 
 #[derive(Debug, Clone)]
 pub struct PyClass {
+    /// Python-visible class name (from `#[pyclass(name = "...")]` or the Rust struct name).
     pub name: String,
+    /// Rust struct/enum identifier as written in the source (e.g. `PyPageIterator`).
+    /// This is the name that appears in function return-type signatures and is needed
+    /// to look up the Python name when the two differ.
+    pub rust_name: String,
     pub doc: Vec<String>,
     pub methods: Vec<PyMethod>,
     /// Source file for diagnostics (reserved for future use)

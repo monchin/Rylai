@@ -536,6 +536,7 @@ fn parse_pyclass_struct(
 
     PyClass {
         name: display_name.to_string(),
+        rust_name: rust_name_for_impl.to_string(),
         doc,
         methods,
         source_file: path.to_path_buf(),
@@ -925,7 +926,12 @@ mod my_mod {
             other => panic!("expected PyItem::Function, got {other:?}"),
         };
         let policy = RenderPolicy::from_version(3, 10);
-        let mapping = crate::type_map::map_type(&func.return_type.rust_type, &policy, None);
+        let mapping = crate::type_map::map_type(
+            &func.return_type.rust_type,
+            &policy,
+            None,
+            &Default::default(),
+        );
         assert_eq!(
             mapping.py_type, "list[tuple[float, float, float, float]]",
             "Vec<PyBbox> with type PyBbox = (f32, f32, f32, f32) should map to list[tuple[float, float, float, float]]"
@@ -959,7 +965,12 @@ mod my_mod {
         };
         assert_eq!(func.params.len(), 1);
         let policy = RenderPolicy::from_version(3, 9);
-        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, &policy, None);
+        let mapping = crate::type_map::map_type(
+            &func.params[0].ty.rust_type,
+            &policy,
+            None,
+            &Default::default(),
+        );
         assert_eq!(
             mapping.py_type, "float",
             "Score alias (= f64) should expand to float"
@@ -1467,7 +1478,12 @@ mod my_mod {
         );
         assert_eq!(func.params[0].name, "data");
         let policy = RenderPolicy::from_version(3, 9);
-        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, &policy, None);
+        let mapping = crate::type_map::map_type(
+            &func.params[0].ty.rust_type,
+            &policy,
+            None,
+            &Default::default(),
+        );
         assert_eq!(
             mapping.py_type, "bytes",
             "PyBytes should map to Python bytes"
@@ -1523,6 +1539,7 @@ fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             &from_bytes.return_type.rust_type,
             &policy,
             Some("PdfDocument"),
+            &Default::default(),
         );
         assert_eq!(
             mapping.py_type, "PdfDocument",

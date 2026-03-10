@@ -10,14 +10,16 @@ use std::collections::HashMap;
 
 pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
     let policy = config.render_policy();
+    let (known_classes, pre_warnings) = collect_class_names(modules);
     let mut ctx = GenCtx {
         config,
         policy,
         needs_any: false,
         needs_optional: false,
         needs_self_import: false,
-        warnings: Vec::new(),
+        warnings: pre_warnings,
         current_self_type: None,
+        known_classes,
     };
 
     let mut body = String::new();
@@ -95,6 +97,11 @@ struct GenCtx<'a> {
     /// Set to the Python class name while generating methods for that class,
     /// so that Rust `Self` return types resolve correctly.
     current_self_type: Option<String>,
+    /// Maps each `#[pyclass]` Rust struct name to its Python-visible class name, collected
+    /// before generation starts.  This allows return types like `-> PyResult<PyPageIterator>`
+    /// (where the Rust struct is `PyPageIterator` but the Python name is `PageIterator`) to
+    /// resolve correctly instead of falling back to `Any`.
+    known_classes: HashMap<String, String>,
 }
 
 impl<'a> GenCtx<'a> {
@@ -108,6 +115,7 @@ impl<'a> GenCtx<'a> {
             &py_type.rust_type,
             &self.policy,
             self.current_self_type.as_deref(),
+            &self.known_classes,
         );
         self.absorb_mapping(&mapping, location)?;
         Ok(mapping.py_type)
@@ -404,6 +412,50 @@ impl<'a> GenCtx<'a> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Recursively collect all `#[pyclass]` entries from a slice of modules, returning a map
+/// from Rust struct/enum name → Python class name, plus any collision warnings.
+///
+/// When the Rust struct and the Python class share the same name (no `name = "..."` attr)
+/// both key and value are identical.  When they differ (e.g. `PyPageIterator` → `PageIterator`)
+/// the Rust name is the key so that type-signature lookups can resolve the correct Python name.
+///
+/// If two `#[pyclass]` items in different modules share the same Rust name but map to
+/// different Python names, the first registration wins and a warning is emitted.
+fn collect_class_names(modules: &[PyModule]) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::new();
+    let mut warnings = Vec::new();
+    for m in modules {
+        collect_class_names_from_module(m, &mut map, &mut warnings);
+    }
+    (map, warnings)
+}
+
+fn collect_class_names_from_module(
+    m: &PyModule,
+    map: &mut HashMap<String, String>,
+    warnings: &mut Vec<String>,
+) {
+    for item in &m.items {
+        match item {
+            PyItem::Class(c) => {
+                if let Some(existing) = map.get(&c.rust_name) {
+                    if existing != &c.name {
+                        warnings.push(format!(
+                            "Rust type `{}` is registered as both `{}` and `{}` — \
+                             using `{}`. Rename one struct or add `#[pyclass(name = \"...\")]`.",
+                            c.rust_name, existing, c.name, existing
+                        ));
+                    }
+                } else {
+                    map.insert(c.rust_name.clone(), c.name.clone());
+                }
+            }
+            PyItem::Module(sub) => collect_class_names_from_module(sub, map, warnings),
+            PyItem::Function(_) => {}
+        }
+    }
+}
+
 fn item_name(item: &PyItem) -> &str {
     match item {
         PyItem::Function(f) => &f.name,
@@ -527,6 +579,7 @@ mod tests {
     fn make_class_with_self_return(class_name: &str, method_name: &str) -> PyClass {
         PyClass {
             name: class_name.to_string(),
+            rust_name: class_name.to_string(),
             doc: vec![],
             methods: vec![PyMethod {
                 name: method_name.to_string(),
@@ -861,6 +914,75 @@ mod tests {
         assert!(
             stub.contains("x: int | None"),
             "py 3.10 must use int | None, got:\n{stub}"
+        );
+    }
+
+    // ── collect_class_names ──────────────────────────────────────────────────
+
+    fn make_class(rust_name: &str, python_name: &str) -> PyClass {
+        PyClass {
+            name: python_name.to_string(),
+            rust_name: rust_name.to_string(),
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        }
+    }
+
+    /// Classes at the top level and inside nested sub-modules are all collected.
+    #[test]
+    fn collect_class_names_recurses_into_nested_modules() {
+        let inner_module = PyModule {
+            name: "inner".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Class(make_class("PyInner", "Inner"))],
+            source_file: dummy_path(),
+        };
+        let outer_module = PyModule {
+            name: "outer".to_string(),
+            doc: vec![],
+            items: vec![
+                PyItem::Class(make_class("PyOuter", "Outer")),
+                PyItem::Module(inner_module),
+            ],
+            source_file: dummy_path(),
+        };
+
+        let (map, warnings) = collect_class_names(&[outer_module]);
+
+        assert_eq!(map.get("PyOuter").map(String::as_str), Some("Outer"));
+        assert_eq!(map.get("PyInner").map(String::as_str), Some("Inner"));
+        assert!(warnings.is_empty(), "no collision expected");
+    }
+
+    /// When two classes share the same Rust name, the first registration wins
+    /// and a warning is emitted — no silent overwrite.
+    #[test]
+    fn collect_class_names_warns_on_rust_name_collision() {
+        let mod_a = PyModule {
+            name: "mod_a".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Class(make_class("Shared", "PythonA"))],
+            source_file: dummy_path(),
+        };
+        let mod_b = PyModule {
+            name: "mod_b".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Class(make_class("Shared", "PythonB"))],
+            source_file: dummy_path(),
+        };
+
+        let (map, warnings) = collect_class_names(&[mod_a, mod_b]);
+
+        assert_eq!(
+            map.get("Shared").map(String::as_str),
+            Some("PythonA"),
+            "first registration must win"
+        );
+        assert_eq!(warnings.len(), 1, "exactly one collision warning expected");
+        assert!(
+            warnings[0].contains("Shared"),
+            "warning must mention the colliding Rust name"
         );
     }
 }

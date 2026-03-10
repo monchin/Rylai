@@ -1,4 +1,5 @@
 use crate::config::RenderPolicy;
+use std::collections::HashMap;
 use syn::{Type, TypePath};
 
 /// Convert a Rust `syn::Type` to a Python type string.
@@ -7,10 +8,19 @@ use syn::{Type, TypePath};
 /// `self_type`: when resolving a `#[pymethods]` method, pass the Python class name so
 /// that Rust `Self` return types are mapped correctly (to `Self` or to the class name
 /// depending on `policy.native_self`).
-pub fn map_type(ty: &Type, policy: &RenderPolicy, self_type: Option<&str>) -> TypeMapping {
+/// `known_classes`: map from Rust struct name to Python class name, built from all
+/// `#[pyclass]` items in the crate.  Used so that return types like `-> PyResult<PyFoo>`
+/// (where the Python name is `Foo` via `#[pyclass(name = "Foo")]`) resolve correctly
+/// instead of falling back to `Any`.
+pub fn map_type(
+    ty: &Type,
+    policy: &RenderPolicy,
+    self_type: Option<&str>,
+    known_classes: &HashMap<String, String>,
+) -> TypeMapping {
     match ty {
-        Type::Path(tp) => map_type_path(tp, policy, self_type),
-        Type::Reference(r) => map_type(&r.elem, policy, self_type),
+        Type::Path(tp) => map_type_path(tp, policy, self_type, known_classes),
+        Type::Reference(r) => map_type(&r.elem, policy, self_type, known_classes),
         // &[u8] / [u8] → bytes  (pyo3 accepts Python `bytes` as &[u8])
         Type::Slice(s) => {
             if let Type::Path(tp) = s.elem.as_ref()
@@ -25,7 +35,7 @@ pub fn map_type(ty: &Type, policy: &RenderPolicy, self_type: Option<&str>) -> Ty
             let mapped: Vec<TypeMapping> = t
                 .elems
                 .iter()
-                .map(|e| map_type(e, policy, self_type))
+                .map(|e| map_type(e, policy, self_type, known_classes))
                 .collect();
             let py = format!(
                 "tuple[{}]",
@@ -93,7 +103,12 @@ impl TypeMapping {
     }
 }
 
-fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) -> TypeMapping {
+fn map_type_path(
+    tp: &TypePath,
+    policy: &RenderPolicy,
+    self_type: Option<&str>,
+    known_classes: &HashMap<String, String>,
+) -> TypeMapping {
     // Ignore leading `self::` / `crate::` qualifiers, work with the last segment chain
     let full = tp
         .path
@@ -143,7 +158,7 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
         // PyResult<T> → unwrap T (errors become Python exceptions, not part of the type)
         "PyResult" | "Result" => {
             if let Some(inner) = args.first() {
-                return map_type(inner, policy, self_type);
+                return map_type(inner, policy, self_type, known_classes);
             }
             return TypeMapping::known("None");
         }
@@ -151,7 +166,7 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
         // Option<T> → T | None  or  Optional[T]
         "Option" => {
             if let Some(inner) = args.first() {
-                let inner_mapped = map_type(inner, policy, self_type);
+                let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 let py_type = if policy.union_optional {
                     format!("{} | None", inner_mapped.py_type)
                 } else {
@@ -176,7 +191,7 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
                 {
                     return TypeMapping::known("bytes");
                 }
-                let inner_mapped = map_type(inner, policy, self_type);
+                let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 return TypeMapping {
                     py_type: format!("list[{}]", inner_mapped.py_type),
                     ..inner_mapped
@@ -187,8 +202,12 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
 
         // HashMap<K, V> / BTreeMap<K, V> → dict[K, V]
         "HashMap" | "BTreeMap" | "IndexMap" => {
-            let k = args.first().map(|t| map_type(t, policy, self_type));
-            let v = args.get(1).map(|t| map_type(t, policy, self_type));
+            let k = args
+                .first()
+                .map(|t| map_type(t, policy, self_type, known_classes));
+            let v = args
+                .get(1)
+                .map(|t| map_type(t, policy, self_type, known_classes));
             match (k, v) {
                 (Some(km), Some(vm)) => {
                     return TypeMapping {
@@ -206,7 +225,7 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
         // HashSet<T> / BTreeSet<T> → set[T]
         "HashSet" | "BTreeSet" => {
             if let Some(inner) = args.first() {
-                let inner_mapped = map_type(inner, policy, self_type);
+                let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 return TypeMapping {
                     py_type: format!("set[{}]", inner_mapped.py_type),
                     ..inner_mapped
@@ -238,7 +257,7 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
         "PyRef" | "PyRefMut" => {
             let type_args = generic_args(last_seg);
             if let Some(inner) = type_args.first() {
-                return map_type(inner, policy, self_type);
+                return map_type(inner, policy, self_type, known_classes);
             }
             return TypeMapping::unknown();
         }
@@ -248,12 +267,19 @@ fn map_type_path(tp: &TypePath, policy: &RenderPolicy, self_type: Option<&str>) 
             // For Bound<'_, T> the lifetime is a GenericArgument::Lifetime, skip it
             let type_args = generic_args(last_seg);
             if let Some(inner) = type_args.first() {
-                return map_type(inner, policy, self_type);
+                return map_type(inner, policy, self_type, known_classes);
             }
             return TypeMapping::unknown();
         }
 
-        _ => {}
+        _ => {
+            // User-defined #[pyclass] structs/enums: look up by Rust name to get the
+            // Python class name.  Handles both un-renamed classes (key == value) and
+            // renamed ones (e.g. `PyPageIterator` → `PageIterator`).
+            if let Some(python_name) = known_classes.get(&last_ident) {
+                return TypeMapping::known(python_name);
+            }
+        }
     }
 
     // ── Unknown — fall through to Any ────────────────────────────────────────
@@ -284,6 +310,11 @@ mod tests {
         syn::parse_str(s).expect("invalid type in test")
     }
 
+    /// Empty known-classes map for tests that do not exercise pyclass lookup.
+    fn no_classes() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     /// Returns a policy with the given `union_optional` flag and `native_self: false`.
     /// Use this as the default in tests that do not specifically test `native_self`.
     fn p(union_optional: bool) -> RenderPolicy {
@@ -307,7 +338,7 @@ mod tests {
     #[test]
     fn pybytes_maps_to_bytes() {
         let ty = parse_ty("PyBytes");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
         assert!(!m.needs_any);
     }
@@ -316,7 +347,7 @@ mod tests {
     #[test]
     fn pybytearray_maps_to_bytearray() {
         let ty = parse_ty("PyByteArray");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytearray");
     }
 
@@ -324,7 +355,7 @@ mod tests {
     #[test]
     fn pystring_maps_to_str() {
         let ty = parse_ty("PyString");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "str");
     }
 
@@ -332,25 +363,28 @@ mod tests {
     #[test]
     fn py_container_types_map_to_python_builtins() {
         assert_eq!(
-            map_type(&parse_ty("PyDict"), &p(false), None).py_type,
+            map_type(&parse_ty("PyDict"), &p(false), None, &no_classes()).py_type,
             "dict"
         );
         assert_eq!(
-            map_type(&parse_ty("PyList"), &p(false), None).py_type,
+            map_type(&parse_ty("PyList"), &p(false), None, &no_classes()).py_type,
             "list"
         );
         assert_eq!(
-            map_type(&parse_ty("PyTuple"), &p(false), None).py_type,
+            map_type(&parse_ty("PyTuple"), &p(false), None, &no_classes()).py_type,
             "tuple"
         );
-        assert_eq!(map_type(&parse_ty("PySet"), &p(false), None).py_type, "set");
+        assert_eq!(
+            map_type(&parse_ty("PySet"), &p(false), None, &no_classes()).py_type,
+            "set"
+        );
     }
 
     /// `&Bound<'_, PyBytes>` (reference stripped, then Bound unwraps to PyBytes) → bytes.
     #[test]
     fn bound_pybytes_maps_to_bytes() {
         let ty = parse_ty("Bound<'_, PyBytes>");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
         assert!(!m.needs_any);
     }
@@ -359,7 +393,7 @@ mod tests {
     #[test]
     fn ref_bound_pybytes_maps_to_bytes() {
         let ty = parse_ty("&Bound<'_, PyBytes>");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
     }
 
@@ -367,7 +401,7 @@ mod tests {
     #[test]
     fn ref_slice_u8_maps_to_bytes() {
         let ty = parse_ty("&[u8]");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
         assert!(!m.needs_any);
     }
@@ -376,7 +410,7 @@ mod tests {
     #[test]
     fn slice_u8_maps_to_bytes() {
         let ty = parse_ty("[u8]");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
     }
 
@@ -384,7 +418,7 @@ mod tests {
     #[test]
     fn vec_u8_maps_to_bytes() {
         let ty = parse_ty("Vec<u8>");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "bytes");
         assert!(!m.needs_any);
     }
@@ -393,7 +427,7 @@ mod tests {
     #[test]
     fn vec_i32_maps_to_list_int() {
         let ty = parse_ty("Vec<i32>");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "list[int]");
     }
 
@@ -401,7 +435,7 @@ mod tests {
     #[test]
     fn self_without_context_maps_to_any() {
         let ty = parse_ty("Self");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "Any");
         assert!(m.is_unknown);
     }
@@ -410,7 +444,7 @@ mod tests {
     #[test]
     fn self_with_context_maps_to_class_name() {
         let ty = parse_ty("Self");
-        let m = map_type(&ty, &p(false), Some("PdfDocument"));
+        let m = map_type(&ty, &p(false), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "PdfDocument");
         assert!(!m.needs_any);
         assert!(!m.is_unknown);
@@ -421,7 +455,7 @@ mod tests {
     #[test]
     fn pyresult_self_with_context_maps_to_class_name() {
         let ty = parse_ty("PyResult<Self>");
-        let m = map_type(&ty, &p(false), Some("PdfDocument"));
+        let m = map_type(&ty, &p(false), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "PdfDocument");
         assert!(!m.needs_any);
     }
@@ -431,7 +465,7 @@ mod tests {
     #[test]
     fn self_native_keyword_emitted_for_py311() {
         let ty = parse_ty("Self");
-        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"));
+        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "Self");
         assert!(!m.is_unknown);
         assert!(m.needs_self_import, "Self import must be flagged");
@@ -441,7 +475,7 @@ mod tests {
     #[test]
     fn pyresult_self_native_keyword_for_py311() {
         let ty = parse_ty("PyResult<Self>");
-        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"));
+        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "Self");
         assert!(m.needs_self_import);
         assert!(!m.needs_any);
@@ -451,7 +485,7 @@ mod tests {
     #[test]
     fn pyref_self_with_context_maps_to_class_name() {
         let ty = parse_ty("pyo3::PyRef<'_, Self>");
-        let m = map_type(&ty, &p(false), Some("PdfDocument"));
+        let m = map_type(&ty, &p(false), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "PdfDocument");
         assert!(!m.needs_any);
     }
@@ -460,7 +494,7 @@ mod tests {
     #[test]
     fn pyref_self_native_keyword_for_py311() {
         let ty = parse_ty("pyo3::PyRef<'_, Self>");
-        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"));
+        let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
         assert_eq!(m.py_type, "Self");
         assert!(m.needs_self_import);
     }
@@ -469,7 +503,7 @@ mod tests {
     #[test]
     fn option_uses_union_syntax_when_enabled() {
         let ty = parse_ty("Option<i32>");
-        let m = map_type(&ty, &p(true), None);
+        let m = map_type(&ty, &p(true), None, &no_classes());
         assert_eq!(m.py_type, "int | None");
         assert!(!m.needs_optional);
     }
@@ -478,8 +512,50 @@ mod tests {
     #[test]
     fn option_uses_optional_syntax_when_disabled() {
         let ty = parse_ty("Option<i32>");
-        let m = map_type(&ty, &p(false), None);
+        let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "Optional[int]");
         assert!(m.needs_optional);
+    }
+
+    /// An un-renamed `#[pyclass]` (Rust name == Python name) maps to its own name.
+    #[test]
+    fn known_pyclass_maps_to_class_name() {
+        let known = HashMap::from([("Pyo3Page".to_string(), "Pyo3Page".to_string())]);
+        let ty = parse_ty("Pyo3Page");
+        let m = map_type(&ty, &p(true), None, &known);
+        assert_eq!(m.py_type, "Pyo3Page");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    /// `PyResult<Pyo3Page>` unwraps to `Pyo3Page` when `Pyo3Page` is in `known_classes`.
+    #[test]
+    fn pyresult_known_pyclass_unwraps_to_class_name() {
+        let known = HashMap::from([("Pyo3Page".to_string(), "Pyo3Page".to_string())]);
+        let ty = parse_ty("PyResult<Pyo3Page>");
+        let m = map_type(&ty, &p(true), None, &known);
+        assert_eq!(m.py_type, "Pyo3Page");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    /// A renamed `#[pyclass]`: Rust `PyPageIterator` maps to Python `PageIterator`.
+    #[test]
+    fn renamed_pyclass_rust_name_maps_to_python_name() {
+        let known = HashMap::from([("PyPageIterator".to_string(), "PageIterator".to_string())]);
+        let ty = parse_ty("PyResult<PyPageIterator>");
+        let m = map_type(&ty, &p(true), None, &known);
+        assert_eq!(m.py_type, "PageIterator");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    /// An unknown user type NOT in `known_classes` still falls back to `Any`.
+    #[test]
+    fn unknown_type_not_in_known_classes_maps_to_any() {
+        let ty = parse_ty("SomeUnknownType");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Any");
+        assert!(m.is_unknown);
     }
 }
