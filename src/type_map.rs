@@ -6,6 +6,15 @@ pub fn map_type(ty: &Type, use_union_syntax: bool) -> TypeMapping {
     match ty {
         Type::Path(tp) => map_type_path(tp, use_union_syntax),
         Type::Reference(r) => map_type(&r.elem, use_union_syntax),
+        // &[u8] / [u8] → bytes  (pyo3 accepts Python `bytes` as &[u8])
+        Type::Slice(s) => {
+            if let Type::Path(tp) = s.elem.as_ref()
+                && tp.path.is_ident("u8")
+            {
+                return TypeMapping::known("bytes");
+            }
+            TypeMapping::unknown()
+        }
         Type::Tuple(t) if t.elems.is_empty() => TypeMapping::known("None"),
         Type::Tuple(t) => {
             let mapped: Vec<TypeMapping> = t
@@ -124,9 +133,14 @@ fn map_type_path(tp: &TypePath, use_union_syntax: bool) -> TypeMapping {
             return TypeMapping::unknown();
         }
 
-        // Vec<T> → list[T]
+        // Vec<T> → list[T], but Vec<u8> → bytes (pyo3 auto-converts to Python bytes)
         "Vec" => {
             if let Some(inner) = args.first() {
+                if let Type::Path(inner_tp) = inner
+                    && inner_tp.path.is_ident("u8")
+                {
+                    return TypeMapping::known("bytes");
+                }
                 let inner_mapped = map_type(inner, use_union_syntax);
                 return TypeMapping {
                     py_type: format!("list[{}]", inner_mapped.py_type),
@@ -165,14 +179,22 @@ fn map_type_path(tp: &TypePath, use_union_syntax: bool) -> TypeMapping {
             return TypeMapping::known("set");
         }
 
-        // PyAny / Py<T> / Bound<T> / PyObject → Any
-        "PyAny" | "PyObject" | "PyDict" | "PyList" | "PyTuple" | "PySet" | "PyBytes"
-        | "PyByteArray" | "PyString" => {
+        // PyO3 types with direct Python equivalents
+        "PyBytes" => return TypeMapping::known("bytes"),
+        "PyByteArray" => return TypeMapping::known("bytearray"),
+        "PyString" => return TypeMapping::known("str"),
+        "PyDict" => return TypeMapping::known("dict"),
+        "PyList" => return TypeMapping::known("list"),
+        "PyTuple" => return TypeMapping::known("tuple"),
+        "PySet" => return TypeMapping::known("set"),
+
+        // PyAny / PyObject — truly opaque, map to Any
+        "PyAny" | "PyObject" => {
             return TypeMapping {
                 py_type: "Any".to_string(),
                 needs_any: true,
                 needs_optional: false,
-                is_unknown: false, // Known pyo3 opaque type, not truly unknown
+                is_unknown: false,
             };
         }
         "Py" | "Bound" | "Borrowed" => {
@@ -214,5 +236,99 @@ fn generic_args(seg: &syn::PathSegment) -> Vec<&Type> {
             })
             .collect(),
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ty(s: &str) -> Type {
+        syn::parse_str(s).expect("invalid type in test")
+    }
+
+    /// PyO3 PyBytes in function signature should map to Python `bytes`.
+    #[test]
+    fn pybytes_maps_to_bytes() {
+        let ty = parse_ty("PyBytes");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+        assert!(!m.needs_any);
+    }
+
+    /// PyO3 PyByteArray should map to Python `bytearray`.
+    #[test]
+    fn pybytearray_maps_to_bytearray() {
+        let ty = parse_ty("PyByteArray");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytearray");
+    }
+
+    /// PyO3 PyString should map to Python `str`.
+    #[test]
+    fn pystring_maps_to_str() {
+        let ty = parse_ty("PyString");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "str");
+    }
+
+    /// PyDict / PyList / PyTuple / PySet map to dict / list / tuple / set.
+    #[test]
+    fn py_container_types_map_to_python_builtins() {
+        assert_eq!(map_type(&parse_ty("PyDict"), false).py_type, "dict");
+        assert_eq!(map_type(&parse_ty("PyList"), false).py_type, "list");
+        assert_eq!(map_type(&parse_ty("PyTuple"), false).py_type, "tuple");
+        assert_eq!(map_type(&parse_ty("PySet"), false).py_type, "set");
+    }
+
+    /// `&Bound<'_, PyBytes>` (reference stripped, then Bound unwraps to PyBytes) → bytes.
+    #[test]
+    fn bound_pybytes_maps_to_bytes() {
+        let ty = parse_ty("Bound<'_, PyBytes>");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+        assert!(!m.needs_any);
+    }
+
+    /// Reference type is stripped; inner Bound<PyBytes> still maps to bytes.
+    #[test]
+    fn ref_bound_pybytes_maps_to_bytes() {
+        let ty = parse_ty("&Bound<'_, PyBytes>");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+    }
+
+    /// `&[u8]` is pyo3's idiomatic way to accept Python `bytes` without the GIL wrapper.
+    #[test]
+    fn ref_slice_u8_maps_to_bytes() {
+        let ty = parse_ty("&[u8]");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+        assert!(!m.needs_any);
+    }
+
+    /// Bare `[u8]` (no reference) also maps to bytes.
+    #[test]
+    fn slice_u8_maps_to_bytes() {
+        let ty = parse_ty("[u8]");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+    }
+
+    /// `Vec<u8>` is auto-converted by pyo3 to Python `bytes` on return.
+    #[test]
+    fn vec_u8_maps_to_bytes() {
+        let ty = parse_ty("Vec<u8>");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "bytes");
+        assert!(!m.needs_any);
+    }
+
+    /// `Vec<i32>` must still map to `list[int]`, not affected by the u8 special-case.
+    #[test]
+    fn vec_i32_maps_to_list_int() {
+        let ty = parse_ty("Vec<i32>");
+        let m = map_type(&ty, false);
+        assert_eq!(m.py_type, "list[int]");
     }
 }

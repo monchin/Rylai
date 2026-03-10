@@ -782,7 +782,19 @@ fn is_pyo3_injected_param(ty: &Type) -> bool {
         && let Some(seg) = tp.path.segments.last()
     {
         let name = seg.ident.to_string();
-        return matches!(name.as_str(), "Python" | "PyModule" | "Bound" | "Borrowed");
+        if matches!(name.as_str(), "Python" | "PyModule") {
+            return true;
+        }
+        // &Bound<'_, T> / &Borrowed<'_, T> — only injected when T is PyModule
+        if matches!(name.as_str(), "Bound" | "Borrowed") {
+            return match &seg.arguments {
+                syn::PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| {
+                    matches!(a, syn::GenericArgument::Type(Type::Path(tp))
+                        if tp.path.segments.last().map(|s| s.ident == "PyModule").unwrap_or(false))
+                }),
+                _ => false,
+            };
+        }
     }
     false
 }
@@ -1419,5 +1431,74 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             vec!["index"],
             "only 'index' should remain, got: {param_names:?}"
         );
+    }
+
+    // ── &Bound<'_, PyBytes> etc. are real params; &Bound<'_, PyModule> is injected ─────
+
+    /// A #[pyfunction] with `data: &Bound<'_, PyBytes>` must keep the param and map it to Python `bytes`.
+    #[test]
+    fn bound_pybytes_param_kept_and_maps_to_bytes() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn bytes_len(data: &pyo3::Bound<'_, pyo3::types::PyBytes>) -> usize { data.as_bytes().len() }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let type_alias_map = HashMap::new();
+        let pyclass_map = HashMap::new();
+        let modules =
+            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        assert_eq!(
+            func.params.len(),
+            1,
+            "&Bound<PyBytes> must not be filtered as injected"
+        );
+        assert_eq!(func.params[0].name, "data");
+        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, false);
+        assert_eq!(
+            mapping.py_type, "bytes",
+            "PyBytes should map to Python bytes"
+        );
+    }
+
+    /// A #[pyfunction] with `m: &Bound<'_, PyModule>` must exclude that param (injected by pyo3).
+    #[test]
+    fn bound_pymodule_param_excluded() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn needs_module(m: &pyo3::Bound<'_, pyo3::PyModule>, x: i64) -> i64 { x }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let type_alias_map = HashMap::new();
+        let pyclass_map = HashMap::new();
+        let modules =
+            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        assert_eq!(
+            func.params.len(),
+            1,
+            "only x should remain; m (Bound<PyModule>) is injected"
+        );
+        assert_eq!(func.params[0].name, "x");
     }
 }
