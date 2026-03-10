@@ -557,12 +557,46 @@ fn extract_pyo3_signature(attrs: &[Attribute]) -> Option<String> {
                     } else {
                         value
                     };
-                    return Some(inner.trim().to_string());
+                    return Some(normalize_py_literals(inner.trim()));
                 }
             }
         }
     }
     None
+}
+
+/// Replace whole-word Rust boolean literals (`true`/`false`) with their Python equivalents
+/// (`True`/`False`). `None` is spelled the same in both languages and requires no replacement.
+///
+/// Handles word-boundary checks so that identifiers containing `true` or `false`
+/// (e.g. `extract_text`) are not accidentally modified.
+fn normalize_py_literals(s: &str) -> String {
+    const REPLACEMENTS: &[(&str, &str)] = &[("true", "True"), ("false", "False")];
+
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    'outer: while i < bytes.len() {
+        for (from, to) in REPLACEMENTS {
+            let flen = from.len();
+            if bytes[i..].starts_with(from.as_bytes()) {
+                let before_ok =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let after_ok = i + flen >= bytes.len()
+                    || !(bytes[i + flen].is_ascii_alphanumeric() || bytes[i + flen] == b'_');
+                if before_ok && after_ok {
+                    out.push_str(to);
+                    i += flen;
+                    continue 'outer;
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Extract `#[pyo3(name = "foo")]` or `#[pyclass(name = "Foo")]` rename.
@@ -900,6 +934,39 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let sig = func.signature_override.unwrap();
         assert!(!sig.starts_with('('), "got: {sig}");
         assert!(!sig.ends_with(')'), "got: {sig}");
+    }
+
+    /// Rust `true`/`false` defaults in a pyo3 signature are rewritten to Python `True`/`False`.
+    /// Identifiers that merely contain the word (e.g. `extract_text`) must not be modified.
+    #[test]
+    fn signature_override_normalizes_rust_bools_to_python() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            #[pyo3(signature = (page = None, extract_text = true, verbose = false, clip = None, **kwargs))]
+            fn find_tables(
+                page: Option<i32>,
+                extract_text: bool,
+                verbose: bool,
+                clip: Option<i32>,
+            ) -> Vec<i32> { vec![] }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let sig = func.signature_override.unwrap();
+        assert!(sig.contains("True"), "expected Python True, got: {sig}");
+        assert!(
+            !sig.contains(" = true"),
+            "Rust `true` should have been replaced, got: {sig}"
+        );
+        assert!(sig.contains("False"), "expected Python False, got: {sig}");
+        assert!(
+            !sig.contains(" = false"),
+            "Rust `false` should have been replaced, got: {sig}"
+        );
+        assert!(
+            sig.contains("extract_text"),
+            "identifier 'extract_text' must not be mangled, got: {sig}"
+        );
     }
 
     /// Only the single outer pair of parentheses is stripped; nested parens are preserved.
