@@ -3,10 +3,98 @@ use crate::config::Config;
 use std::collections::HashMap;
 use std::path::Path;
 use syn::{
-    Attribute, Expr, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta, Pat, ReturnType, Signature, Type,
+    Attribute, Expr, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta, Pat, ReturnType, Signature,
+    Type, TypePath,
 };
 
+/// Maximum recursion depth when expanding type aliases to avoid infinite loops.
+/// Aliases nested deeper than this value are returned unexpanded.
+const MAX_TYPE_ALIAS_DEPTH: u8 = 10;
+
 // ── Entry point ──────────────────────────────────────────────────────────────
+
+/// Build a map: Rust type alias name -> underlying `syn::Type` from all `type Foo = ...` in the crate.
+/// Used to resolve e.g. `PyBbox` to `(f32, f32, f32, f32)` when mapping to Python types.
+/// If the same alias name appears in multiple files, the last occurrence wins.
+pub fn build_type_alias_map(files: &[(std::path::PathBuf, syn::File)]) -> HashMap<String, Type> {
+    let mut map = HashMap::new();
+    for (_path, file) in files {
+        collect_type_aliases_from_items(&file.items, &mut map);
+    }
+    map
+}
+
+fn collect_type_aliases_from_items(items: &[Item], map: &mut HashMap<String, Type>) {
+    for item in items {
+        match item {
+            Item::Type(ta) => {
+                map.insert(ta.ident.to_string(), (*ta.ty).clone());
+            }
+            Item::Mod(m) => {
+                if let Some((_, content)) = &m.content {
+                    collect_type_aliases_from_items(content, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recursively expand type aliases in `ty` using `map`. Stops at depth limit to avoid cycles.
+fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Type {
+    if depth >= MAX_TYPE_ALIAS_DEPTH {
+        return ty.clone();
+    }
+    match ty {
+        Type::Path(tp) if is_single_ident_path(tp) => {
+            let name = tp.path.segments.last().unwrap().ident.to_string();
+            if let Some(underlying) = map.get(&name) {
+                return expand_type_aliases(underlying, map, depth + 1);
+            }
+            ty.clone()
+        }
+        Type::Path(tp) => {
+            let mut new_tp = tp.clone();
+            if let Some(last) = new_tp.path.segments.last_mut()
+                && let syn::PathArguments::AngleBracketed(ref mut ab) = last.arguments
+            {
+                for arg in ab.args.iter_mut() {
+                    if let syn::GenericArgument::Type(t) = arg {
+                        *t = expand_type_aliases(t, map, depth + 1);
+                    }
+                }
+            }
+            Type::Path(new_tp)
+        }
+        Type::Tuple(t) => {
+            let mut elems = syn::punctuated::Punctuated::new();
+            for pair in t.elems.pairs() {
+                elems.push_value(expand_type_aliases(pair.value(), map, depth + 1));
+                if let Some(punct) = pair.punct() {
+                    elems.push_punct(**punct);
+                }
+            }
+            Type::Tuple(syn::TypeTuple {
+                paren_token: t.paren_token,
+                elems,
+            })
+        }
+        Type::Reference(r) => {
+            let elem = expand_type_aliases(&r.elem, map, depth + 1);
+            Type::Reference(syn::TypeReference {
+                elem: Box::new(elem),
+                ..r.clone()
+            })
+        }
+        _ => ty.clone(),
+    }
+}
+
+fn is_single_ident_path(tp: &TypePath) -> bool {
+    tp.path.leading_colon.is_none()
+        && tp.path.segments.len() == 1
+        && matches!(tp.path.segments[0].arguments, syn::PathArguments::None)
+}
 
 /// Build a map: Rust type name (struct/enum ident) -> Python name from `#[pyclass(name = "...")]`.
 /// Used so that when we see `m.add_class::<PyPdfDocument>()` we can emit `class PdfDocument`.
@@ -16,23 +104,32 @@ pub fn build_pyclass_name_map(
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (_path, file) in files {
-        for item in &file.items {
-            match item {
-                Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                    if let Some(python_name) = extract_pyo3_name(&s.attrs) {
-                        map.insert(s.ident.to_string(), python_name);
-                    }
-                }
-                Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                    if let Some(python_name) = extract_pyo3_name(&e.attrs) {
-                        map.insert(e.ident.to_string(), python_name);
-                    }
-                }
-                _ => {}
-            }
-        }
+        collect_pyclass_names_from_items(&file.items, &mut map);
     }
     map
+}
+
+fn collect_pyclass_names_from_items(items: &[Item], map: &mut HashMap<String, String>) {
+    for item in items {
+        match item {
+            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
+                if let Some(python_name) = extract_pyo3_name(&s.attrs) {
+                    map.insert(s.ident.to_string(), python_name);
+                }
+            }
+            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
+                if let Some(python_name) = extract_pyo3_name(&e.attrs) {
+                    map.insert(e.ident.to_string(), python_name);
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, content)) = &m.content {
+                    collect_pyclass_names_from_items(content, map);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Extract all `#[pymodule]` items from a parsed file.
@@ -41,6 +138,7 @@ pub fn extract_modules_from_file(
     path: &Path,
     config: &Config,
     pyclass_name_map: &HashMap<String, String>,
+    type_alias_map: &HashMap<String, Type>,
 ) -> Vec<PyModule> {
     // First pass: collect all #[pymethods] impl blocks keyed by struct name,
     // so we can attach them to PyClass items found later.
@@ -52,15 +150,23 @@ pub fn extract_modules_from_file(
         match item {
             // Style A: #[pymodule] mod Foo { ... }
             Item::Mod(m) if has_attr(&m.attrs, "pymodule") => {
-                if let Some(module) = parse_mod_style_module(m, path, config, &impl_map) {
+                if let Some(module) =
+                    parse_mod_style_module(m, path, config, &impl_map, type_alias_map)
+                {
                     result.push(module);
                 }
             }
             // Style B: #[pymodule] fn foo(m: &Bound<PyModule>) -> PyResult<()> { ... }
             Item::Fn(f) if has_attr(&f.attrs, "pymodule") => {
-                if let Some(module) =
-                    parse_fn_style_module(f, &file.items, path, config, &impl_map, pyclass_name_map)
-                {
+                if let Some(module) = parse_fn_style_module(
+                    f,
+                    &file.items,
+                    path,
+                    config,
+                    &impl_map,
+                    pyclass_name_map,
+                    type_alias_map,
+                ) {
                     result.push(module);
                 }
             }
@@ -77,12 +183,13 @@ fn parse_mod_style_module(
     path: &Path,
     config: &Config,
     impl_map: &ImplMap,
+    type_alias_map: &HashMap<String, Type>,
 ) -> Option<PyModule> {
     let (_, items) = m.content.as_ref()?;
     let name = m.ident.to_string();
     let doc = extract_doc(&m.attrs);
 
-    let py_items = collect_items_from_list(items, path, config, impl_map);
+    let py_items = collect_items_from_list(items, path, config, impl_map, type_alias_map);
 
     Some(PyModule {
         name,
@@ -97,32 +204,49 @@ fn collect_items_from_list(
     path: &Path,
     config: &Config,
     impl_map: &ImplMap,
+    type_alias_map: &HashMap<String, Type>,
 ) -> Vec<PyItem> {
     let mut result = Vec::new();
     for item in items {
         match item {
             Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
-                if let Some(func) = parse_pyfunction(f, path, config) {
+                if let Some(func) = parse_pyfunction(f, path, config, type_alias_map) {
                     result.push(PyItem::Function(func));
                 }
             }
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
                 let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
                 let rust_name = s.ident.to_string();
-                let class =
-                    parse_pyclass_struct(&name, &rust_name, &s.attrs, path, impl_map, config);
+                let class = parse_pyclass_struct(
+                    &name,
+                    &rust_name,
+                    &s.attrs,
+                    path,
+                    impl_map,
+                    config,
+                    type_alias_map,
+                );
                 result.push(PyItem::Class(class));
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
                 let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
                 let rust_name = e.ident.to_string();
-                let class =
-                    parse_pyclass_struct(&name, &rust_name, &e.attrs, path, impl_map, config);
+                let class = parse_pyclass_struct(
+                    &name,
+                    &rust_name,
+                    &e.attrs,
+                    path,
+                    impl_map,
+                    config,
+                    type_alias_map,
+                );
                 result.push(PyItem::Class(class));
             }
             // Nested submodule
             Item::Mod(sub) if has_attr(&sub.attrs, "pymodule") => {
-                if let Some(sub_mod) = parse_mod_style_module(sub, path, config, impl_map) {
+                if let Some(sub_mod) =
+                    parse_mod_style_module(sub, path, config, impl_map, type_alias_map)
+                {
                     result.push(PyItem::Module(sub_mod));
                 }
             }
@@ -141,6 +265,7 @@ fn parse_fn_style_module(
     config: &Config,
     impl_map: &ImplMap,
     pyclass_name_map: &HashMap<String, String>,
+    type_alias_map: &HashMap<String, Type>,
 ) -> Option<PyModule> {
     let name = f.sig.ident.to_string();
     let doc = extract_doc(&f.attrs);
@@ -148,16 +273,16 @@ fn parse_fn_style_module(
     let mut py_items = Vec::new();
 
     // Walk the function body looking for m.add_function(...) / m.add_class::<T>()
+    let ctx = CollectAddCallsContext {
+        file_items,
+        path,
+        config,
+        impl_map,
+        pyclass_name_map,
+        type_alias_map,
+    };
     for stmt in &f.block.stmts {
-        collect_add_calls_from_stmt(
-            stmt,
-            file_items,
-            path,
-            config,
-            impl_map,
-            pyclass_name_map,
-            &mut py_items,
-        );
+        collect_add_calls_from_stmt(stmt, &ctx, &mut py_items);
     }
 
     Some(PyModule {
@@ -168,72 +293,54 @@ fn parse_fn_style_module(
     })
 }
 
+struct CollectAddCallsContext<'a> {
+    file_items: &'a [Item],
+    path: &'a Path,
+    config: &'a Config,
+    impl_map: &'a ImplMap,
+    pyclass_name_map: &'a HashMap<String, String>,
+    type_alias_map: &'a HashMap<String, Type>,
+}
+
 fn collect_add_calls_from_stmt(
     stmt: &syn::Stmt,
-    file_items: &[Item],
-    path: &Path,
-    config: &Config,
-    impl_map: &ImplMap,
-    pyclass_name_map: &HashMap<String, String>,
+    ctx: &CollectAddCallsContext<'_>,
     out: &mut Vec<PyItem>,
 ) {
     let expr = match stmt {
         syn::Stmt::Expr(e, _) => e,
         syn::Stmt::Local(l) => {
             if let Some(init) = &l.init {
-                collect_add_calls_from_expr(
-                    &init.expr,
-                    file_items,
-                    path,
-                    config,
-                    impl_map,
-                    pyclass_name_map,
-                    out,
-                );
+                collect_add_calls_from_expr(&init.expr, ctx, out);
             }
             return;
         }
         _ => return,
     };
-    collect_add_calls_from_expr(
-        expr,
-        file_items,
-        path,
-        config,
-        impl_map,
-        pyclass_name_map,
-        out,
-    );
+    collect_add_calls_from_expr(expr, ctx, out);
 }
 
 fn collect_add_calls_from_expr(
     expr: &Expr,
-    file_items: &[Item],
-    path: &Path,
-    config: &Config,
-    impl_map: &ImplMap,
-    pyclass_name_map: &HashMap<String, String>,
+    ctx: &CollectAddCallsContext<'_>,
     out: &mut Vec<PyItem>,
 ) {
     match expr {
         // m.add_function(...)?  or  m.add_class::<T>()?
-        Expr::Try(t) => collect_add_calls_from_expr(
-            &t.expr,
-            file_items,
-            path,
-            config,
-            impl_map,
-            pyclass_name_map,
-            out,
-        ),
+        Expr::Try(t) => collect_add_calls_from_expr(&t.expr, ctx, out),
         Expr::MethodCall(mc) => {
             let method = mc.method.to_string();
             match method.as_str() {
                 "add_function" => {
                     // m.add_function(wrap_pyfunction!(foo, m)?)
                     if let Some(fn_name) = extract_wrap_pyfunction_name(mc.args.first())
-                        && let Some(func) =
-                            find_pyfunction_by_name(&fn_name, file_items, path, config)
+                        && let Some(func) = find_pyfunction_by_name(
+                            &fn_name,
+                            ctx.file_items,
+                            ctx.path,
+                            ctx.config,
+                            ctx.type_alias_map,
+                        )
                     {
                         out.push(PyItem::Function(func));
                     }
@@ -244,7 +351,8 @@ fn collect_add_calls_from_expr(
                     if let Some(type_name) = extract_turbofish_type_name(&mc.method, &mc.turbofish)
                     {
                         let rust_name = type_name.clone();
-                        let class_name = pyclass_name_map
+                        let class_name = ctx
+                            .pyclass_name_map
                             .get(&type_name)
                             .cloned()
                             .unwrap_or(type_name);
@@ -252,9 +360,10 @@ fn collect_add_calls_from_expr(
                             &class_name,
                             &rust_name,
                             &[],
-                            path,
-                            impl_map,
-                            config,
+                            ctx.path,
+                            ctx.impl_map,
+                            ctx.config,
+                            ctx.type_alias_map,
                         );
                         out.push(PyItem::Class(class));
                     }
@@ -307,13 +416,14 @@ fn find_pyfunction_by_name(
     file_items: &[Item],
     path: &Path,
     config: &Config,
+    type_alias_map: &HashMap<String, Type>,
 ) -> Option<PyFunction> {
     for item in file_items {
         if let Item::Fn(f) = item
             && f.sig.ident == name
             && has_attr(&f.attrs, "pyfunction")
         {
-            return parse_pyfunction(f, path, config);
+            return parse_pyfunction(f, path, config, type_alias_map);
         }
     }
     None
@@ -321,13 +431,18 @@ fn find_pyfunction_by_name(
 
 // ── #[pyfunction] parsing ────────────────────────────────────────────────────
 
-pub fn parse_pyfunction(f: &ItemFn, path: &Path, config: &Config) -> Option<PyFunction> {
+pub fn parse_pyfunction(
+    f: &ItemFn,
+    path: &Path,
+    config: &Config,
+    type_alias_map: &HashMap<String, Type>,
+) -> Option<PyFunction> {
     // #[pyo3(name = "foo")] overrides the Rust function name
     let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| f.sig.ident.to_string());
     let doc = extract_doc(&f.attrs);
     let signature_override = extract_pyo3_signature(&f.attrs);
-    let params = parse_params(&f.sig, config);
-    let return_type = parse_return_type(&f.sig.output, config);
+    let params = parse_params(&f.sig, config, type_alias_map);
+    let return_type = parse_return_type(&f.sig.output, config, type_alias_map);
 
     Some(PyFunction {
         name,
@@ -339,7 +454,11 @@ pub fn parse_pyfunction(f: &ItemFn, path: &Path, config: &Config) -> Option<PyFu
     })
 }
 
-fn parse_params(sig: &Signature, config: &Config) -> Vec<PyParam> {
+fn parse_params(
+    sig: &Signature,
+    config: &Config,
+    type_alias_map: &HashMap<String, Type>,
+) -> Vec<PyParam> {
     let mut params = Vec::new();
     for input in &sig.inputs {
         match input {
@@ -353,11 +472,13 @@ fn parse_params(sig: &Signature, config: &Config) -> Vec<PyParam> {
                     Pat::Ident(pi) => pi.ident.to_string(),
                     _ => "_".to_string(),
                 };
-                let override_str = lookup_type_override(&pt.ty, config);
+                let rust_type = expand_type_aliases(&pt.ty, type_alias_map, 0);
+                let override_str = lookup_type_override(&pt.ty, config)
+                    .or_else(|| lookup_type_override(&rust_type, config));
                 params.push(PyParam {
                     name,
                     ty: PyType {
-                        rust_type: *pt.ty.clone(),
+                        rust_type,
                         override_str,
                     },
                     default: None,
@@ -369,16 +490,22 @@ fn parse_params(sig: &Signature, config: &Config) -> Vec<PyParam> {
     params
 }
 
-fn parse_return_type(output: &ReturnType, config: &Config) -> PyType {
+fn parse_return_type(
+    output: &ReturnType,
+    config: &Config,
+    type_alias_map: &HashMap<String, Type>,
+) -> PyType {
     match output {
         ReturnType::Default => PyType {
             rust_type: syn::parse_quote! { () },
             override_str: None,
         },
         ReturnType::Type(_, ty) => {
-            let override_str = lookup_type_override(ty, config);
+            let rust_type = expand_type_aliases(ty, type_alias_map, 0);
+            let override_str = lookup_type_override(ty, config)
+                .or_else(|| lookup_type_override(&rust_type, config));
             PyType {
-                rust_type: *ty.clone(),
+                rust_type,
                 override_str,
             }
         }
@@ -396,6 +523,7 @@ fn parse_pyclass_struct(
     path: &Path,
     impl_map: &ImplMap,
     config: &Config,
+    type_alias_map: &HashMap<String, Type>,
 ) -> PyClass {
     let doc = extract_doc(attrs);
     let methods = impl_map
@@ -403,7 +531,7 @@ fn parse_pyclass_struct(
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|item| parse_pymethod(&item, config))
+        .filter_map(|item| parse_pymethod(&item, config, type_alias_map))
         .collect();
 
     PyClass {
@@ -414,14 +542,18 @@ fn parse_pyclass_struct(
     }
 }
 
-fn parse_pymethod(item: &ImplItem, config: &Config) -> Option<PyMethod> {
+fn parse_pymethod(
+    item: &ImplItem,
+    config: &Config,
+    type_alias_map: &HashMap<String, Type>,
+) -> Option<PyMethod> {
     let ImplItem::Fn(m) = item else { return None };
 
     // #[pyo3(name = "foo")] overrides the Rust method name
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| m.sig.ident.to_string());
     let doc = extract_doc(&m.attrs);
-    let params = parse_params(&m.sig, config);
-    let return_type = parse_return_type(&m.sig.output, config);
+    let params = parse_params(&m.sig, config, type_alias_map);
+    let return_type = parse_return_type(&m.sig.output, config, type_alias_map);
     let kind = detect_method_kind(&m.attrs, &name);
 
     Some(PyMethod {
@@ -735,6 +867,91 @@ mod tests {
         );
     }
 
+    // ── build_type_alias_map (type alias → Python type resolution) ───────────
+
+    #[test]
+    fn build_type_alias_map_collects_type_alias() {
+        let file = syn::parse_file(
+            r#"
+type PyBbox = (f32, f32, f32, f32);
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let files = vec![(path, file)];
+        let map = build_type_alias_map(&files);
+        assert!(
+            map.contains_key("PyBbox"),
+            "PyBbox alias should be collected"
+        );
+    }
+
+    /// When a #[pyfunction] returns Vec<PyBbox> and the crate has `type PyBbox = (f32, f32, f32, f32)`,
+    /// the return type is expanded and maps to list[tuple[float, float, float, float]].
+    #[test]
+    fn type_alias_expansion_in_return_produces_correct_python_type() {
+        let file = syn::parse_file(
+            r#"
+type PyBbox = (f32, f32, f32, f32);
+
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn find_all_cells_bboxes() -> Vec<PyBbox> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
+        let modules =
+            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        let mapping = crate::type_map::map_type(&func.return_type.rust_type, true);
+        assert_eq!(
+            mapping.py_type, "list[tuple[float, float, float, float]]",
+            "Vec<PyBbox> with type PyBbox = (f32, f32, f32, f32) should map to list[tuple[float, float, float, float]]"
+        );
+    }
+
+    /// When a #[pyfunction] parameter uses a type alias, it is expanded and maps correctly.
+    #[test]
+    fn type_alias_expansion_in_param_produces_correct_python_type() {
+        let file = syn::parse_file(
+            r#"
+type Score = f64;
+
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn rank(score: Score) -> bool { score > 0.5 }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
+        let modules =
+            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        assert_eq!(func.params.len(), 1);
+        let mapping = crate::type_map::map_type(&func.params[0].ty.rust_type, false);
+        assert_eq!(
+            mapping.py_type, "float",
+            "Score alias (= f64) should expand to float"
+        );
+    }
+
     // ── build_pyclass_name_map (style B: add_class uses this) ───────────────
 
     #[test]
@@ -768,7 +985,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let mut map = HashMap::new();
         map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
 
-        let modules = extract_modules_from_file(&file, path, &config, &map);
+        let type_alias_map = HashMap::new();
+        let modules = extract_modules_from_file(&file, path, &config, &map, &type_alias_map);
         assert_eq!(modules.len(), 1, "one pymodule");
         let module = &modules[0];
         assert_eq!(module.items.len(), 1, "one item (the class)");
@@ -794,8 +1012,9 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let path = Path::new("lib.rs");
         let config = Config::default();
         let map = HashMap::new(); // empty map
+        let type_alias_map = HashMap::new();
 
-        let modules = extract_modules_from_file(&file, path, &config, &map);
+        let modules = extract_modules_from_file(&file, path, &config, &map, &type_alias_map);
         assert_eq!(modules.len(), 1);
         match &modules[0].items[0] {
             PyItem::Class(c) => assert_eq!(c.name, "MyRustType"),
@@ -813,7 +1032,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn py_find_all_cells_bboxes(a: usize) -> usize { a }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         assert_eq!(func.name, "find_all_cells_bboxes");
     }
 
@@ -824,7 +1043,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn sum_as_string(a: usize, b: usize) -> String { String::new() }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         assert_eq!(func.name, "sum_as_string");
     }
 
@@ -838,6 +1057,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         };
         let impl_map = ImplMap::default();
         let config = Config::default();
+        let type_alias_map = HashMap::new();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
         let rust_name = item.ident.to_string();
         let class = parse_pyclass_struct(
@@ -847,6 +1067,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             dummy_path(),
             &impl_map,
             &config,
+            &type_alias_map,
         );
         assert_eq!(class.name, "Point");
     }
@@ -859,6 +1080,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         };
         let impl_map = ImplMap::default();
         let config = Config::default();
+        let type_alias_map = HashMap::new();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
         let rust_name = item.ident.to_string();
         let class = parse_pyclass_struct(
@@ -868,6 +1090,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             dummy_path(),
             &impl_map,
             &config,
+            &type_alias_map,
         );
         assert_eq!(class.name, "MyType");
     }
@@ -883,7 +1106,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn rust_foo(a: i64, b: i64) -> i64 { a + b }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let type_alias_map = HashMap::new();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &type_alias_map).unwrap();
         assert_eq!(func.name, "foo");
         assert!(func.signature_override.is_some());
     }
@@ -898,7 +1122,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn py_find(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         let sig = func.signature_override.unwrap();
         // Must NOT start with '(' or end with ')'
         assert!(
@@ -929,7 +1153,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn py_find_all_cells_bboxes(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         assert_eq!(func.name, "find_all_cells_bboxes");
         let sig = func.signature_override.unwrap();
         assert!(!sig.starts_with('('), "got: {sig}");
@@ -951,7 +1175,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             ) -> Vec<i32> { vec![] }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         let sig = func.signature_override.unwrap();
         assert!(sig.contains("True"), "expected Python True, got: {sig}");
         assert!(
@@ -978,7 +1202,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn f(a: i64, b: i64, c: i64) -> i64 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config).unwrap();
+        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
         let sig = func.signature_override.unwrap();
         // We strip only the single outer pair; result may still end with ')' if nested
         assert!(
@@ -1019,7 +1243,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let modules =
+            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1055,7 +1280,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let modules =
+            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1092,7 +1318,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let modules =
+            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1133,7 +1360,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let modules =
+            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1174,7 +1402,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map);
+        let modules =
+            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),

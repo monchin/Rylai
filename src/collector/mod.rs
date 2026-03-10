@@ -35,11 +35,18 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
 
     // First pass: build Rust type name -> Python name for #[pyclass(name = "...")]
     let pyclass_name_map = parse::build_pyclass_name_map(&files);
+    // Second pass: build type alias name -> underlying type for `type Foo = ...`
+    let type_alias_map = parse::build_type_alias_map(&files);
 
     let mut modules: Vec<PyModule> = Vec::new();
     for (path, file) in files {
-        let file_modules =
-            parse::extract_modules_from_file(&file, &path, config, &pyclass_name_map);
+        let file_modules = parse::extract_modules_from_file(
+            &file,
+            &path,
+            config,
+            &pyclass_name_map,
+            &type_alias_map,
+        );
         modules.extend(file_modules);
     }
 
