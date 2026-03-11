@@ -143,6 +143,8 @@ pub(crate) struct ParseContext<'a> {
     pub impl_map: &'a ImplMap,
     pub struct_fields_map: &'a StructFieldsMap,
     pub type_alias_map: &'a HashMap<String, Type>,
+    /// Attributes of each `#[pyclass]` struct/enum by Rust type name. Used in Style B to restore docstrings.
+    pub pyclass_attrs_map: &'a PyclassAttrsMap,
 }
 
 /// Extract all `#[pymodule]` items from a parsed file.
@@ -318,7 +320,7 @@ fn collect_add_calls_from_expr(
                 }
                 "add_class" => {
                     // m.add_class::<PyPdfDocument>() — use pyclass_name_map for #[pyclass(name = "PdfDocument")]
-                    // Style B: struct attrs (for doc) are not available here; only fields via struct_fields_map.
+                    // Style B: look up struct/enum attrs (e.g. doc comments) from pyclass_attrs_map.
                     if let Some(type_name) = extract_turbofish_type_name(&mc.method, &mc.turbofish)
                     {
                         let rust_name = type_name.clone();
@@ -327,8 +329,14 @@ fn collect_add_calls_from_expr(
                             .get(&type_name)
                             .cloned()
                             .unwrap_or(type_name);
+                        let attrs: &[Attribute] = ctx
+                            .cx
+                            .pyclass_attrs_map
+                            .get(&rust_name)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
                         let class =
-                            parse_pyclass_struct(&class_name, &rust_name, &[], ctx.path, ctx.cx);
+                            parse_pyclass_struct(&class_name, &rust_name, attrs, ctx.path, ctx.cx);
                         out.push(PyItem::Class(class));
                     }
                 }
@@ -748,6 +756,43 @@ fn collect_struct_fields_from_items(items: &[Item], map: &mut StructFieldsMap) {
     }
 }
 
+/// Maps Rust `#[pyclass]` type name → its attributes (e.g. for doc comments).
+/// Used in Style B so that `m.add_class::<T>()` can still get the docstring from the struct/enum definition.
+///
+/// Keys are bare type names (no module path). Duplicate type names across the crate overwrite;
+/// the last one wins. Same limitation as [`ImplMap`].
+pub type PyclassAttrsMap = std::collections::HashMap<String, Vec<Attribute>>;
+
+/// Build a global [`PyclassAttrsMap`] from every `.rs` file in the crate.
+///
+/// See [`PyclassAttrsMap`] for the known name-collision limitation.
+pub fn build_pyclass_attrs_map(files: &[(std::path::PathBuf, syn::File)]) -> PyclassAttrsMap {
+    let mut map = PyclassAttrsMap::new();
+    for (_path, file) in files {
+        collect_pyclass_attrs_from_items(&file.items, &mut map);
+    }
+    map
+}
+
+fn collect_pyclass_attrs_from_items(items: &[Item], map: &mut PyclassAttrsMap) {
+    for item in items {
+        match item {
+            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
+                map.insert(s.ident.to_string(), s.attrs.clone());
+            }
+            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
+                map.insert(e.ident.to_string(), e.attrs.clone());
+            }
+            Item::Mod(m) => {
+                if let Some((_, content)) = &m.content {
+                    collect_pyclass_attrs_from_items(content, map);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Build a global ImplMap from every `.rs` file in the crate.
 ///
 /// This must be called before [`extract_modules_from_file`] so that
@@ -983,12 +1028,14 @@ mod tests {
         impl_map: &'a ImplMap,
         struct_fields_map: &'a StructFieldsMap,
         type_alias_map: &'a HashMap<String, Type>,
+        pyclass_attrs_map: &'a PyclassAttrsMap,
     ) -> ParseContext<'a> {
         ParseContext {
             config,
             impl_map,
             struct_fields_map,
             type_alias_map,
+            pyclass_attrs_map,
         }
     }
 
@@ -1079,7 +1126,8 @@ mod my_mod {
         let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
@@ -1119,7 +1167,8 @@ mod my_mod {
         let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
@@ -1175,7 +1224,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let type_alias_map = HashMap::new();
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &map, cx);
         assert_eq!(modules.len(), 1, "one pymodule");
         let module = &modules[0];
@@ -1205,13 +1255,73 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let type_alias_map = HashMap::new();
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &map, cx);
         assert_eq!(modules.len(), 1);
         match &modules[0].items[0] {
             PyItem::Class(c) => assert_eq!(c.name, "MyRustType"),
             other => panic!("expected PyItem::Class, got {:?}", other),
         }
+    }
+
+    /// Style B: docstring on the struct/enum is looked up via pyclass_attrs_map and
+    /// appears on the collected class (fixes docstring loss when class is added via m.add_class::<T>()).
+    #[test]
+    fn style_b_class_docstring_from_pyclass_attrs_map() {
+        let file = syn::parse_file(
+            r#"
+/// Python-exposed TableCellValue for to_list().
+#[pyclass(name = "TableCellValue")]
+struct PyTableCellValue {
+    #[pyo3(get)]
+    pub text: Option<String>,
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<PyTableCellValue>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let mut pyclass_name_map = HashMap::new();
+        pyclass_name_map.insert("PyTableCellValue".to_string(), "TableCellValue".to_string());
+
+        let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())]);
+        let struct_fields_map = build_struct_fields_map(&[(path_buf.clone(), file.clone())]);
+        let pyclass_attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())]);
+
+        let cx = make_cx(
+            &config,
+            &impl_map,
+            &struct_fields_map,
+            &type_alias_map,
+            &pyclass_attrs_map,
+        );
+        let modules = extract_modules_from_file(&file, path, &pyclass_name_map, cx);
+
+        assert_eq!(modules.len(), 1);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {:?}", other),
+        };
+        assert_eq!(class.name, "TableCellValue");
+        assert!(
+            !class.doc.is_empty(),
+            "Style B class must get doc from pyclass_attrs_map, got doc: {:?}",
+            class.doc
+        );
+        assert_eq!(
+            class.doc[0].trim(),
+            "Python-exposed TableCellValue for to_list().",
+            "doc line should match struct doc comment"
+        );
     }
 
     // ── parse_pyfunction respects #[pyo3(name = "...")] ─────────────────────
@@ -1253,7 +1363,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let fields_map = StructFieldsMap::new();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
         let rust_name = item.ident.to_string();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx);
         assert_eq!(class.name, "Point");
     }
@@ -1270,7 +1381,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let fields_map = StructFieldsMap::new();
         let name = extract_pyo3_name(&item.attrs).unwrap_or_else(|| item.ident.to_string());
         let rust_name = item.ident.to_string();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx);
         assert_eq!(class.name, "MyType");
     }
@@ -1426,7 +1538,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1466,7 +1579,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1507,7 +1621,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1552,7 +1667,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1597,7 +1713,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1637,7 +1754,8 @@ mod my_mod {
         let pyclass_map = HashMap::new();
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
@@ -1694,7 +1812,8 @@ fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let type_alias_map = HashMap::new();
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -1740,7 +1859,8 @@ mod my_mod {
         let pyclass_map = HashMap::new();
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
@@ -1794,7 +1914,8 @@ impl Edge {
         let impl_map = build_impl_map(&files);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&lib_file, lib_path.as_path(), &HashMap::new(), cx);
 
         assert_eq!(modules.len(), 1, "one pymodule");
@@ -1942,7 +2063,8 @@ mod outer {
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
 
         assert_eq!(modules.len(), 1, "one top-level module");
@@ -1976,7 +2098,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
         let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
         assert_eq!(modules.len(), 1, "module should still be collected");
         assert_eq!(
@@ -2038,7 +2161,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &struct_fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(
+            &config,
+            &impl_map,
+            &struct_fields_map,
+            &type_alias_map,
+            &attrs_map,
+        );
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
 
         let class = match &modules[0].items[0] {
@@ -2093,7 +2223,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &struct_fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(
+            &config,
+            &impl_map,
+            &struct_fields_map,
+            &type_alias_map,
+            &attrs_map,
+        );
         let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
 
         let class = match &modules[0].items[0] {
@@ -2141,7 +2278,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
         let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &struct_fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(
+            &config,
+            &impl_map,
+            &struct_fields_map,
+            &type_alias_map,
+            &attrs_map,
+        );
         let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
@@ -2193,7 +2337,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let impl_map = build_impl_map(&files);
         let struct_fields_map = build_struct_fields_map(&files);
         let type_alias_map = HashMap::new();
-        let cx = make_cx(&config, &impl_map, &struct_fields_map, &type_alias_map);
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(
+            &config,
+            &impl_map,
+            &struct_fields_map,
+            &type_alias_map,
+            &attrs_map,
+        );
 
         // Parse only the module file — struct definition lives in a separate file.
         let modules = extract_modules_from_file(&mod_file, mod_path.as_path(), &HashMap::new(), cx);

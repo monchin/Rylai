@@ -43,12 +43,15 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
     // Fourth pass: build #[pyclass] struct fields map so that #[pyo3(get)] / #[pyo3(set)]
     // fields on structs defined in any file generate @property stubs.
     let struct_fields_map = parse::build_struct_fields_map(&files);
+    // Fifth pass: build #[pyclass] type name -> attributes (for docstrings in Style B).
+    let pyclass_attrs_map = parse::build_pyclass_attrs_map(&files);
 
     let cx = parse::ParseContext {
         config,
         impl_map: &impl_map,
         struct_fields_map: &struct_fields_map,
         type_alias_map: &type_alias_map,
+        pyclass_attrs_map: &pyclass_attrs_map,
     };
 
     let mut modules: Vec<PyModule> = Vec::new();
