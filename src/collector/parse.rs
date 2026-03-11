@@ -133,25 +133,25 @@ fn collect_pyclass_names_from_items(items: &[Item], map: &mut HashMap<String, St
 }
 
 /// Extract all `#[pymodule]` items from a parsed file.
+///
+/// `impl_map` must be the **global** map built by [`build_impl_map`] across the
+/// entire crate so that `#[pymethods]` blocks in other files are resolved.
 pub fn extract_modules_from_file(
     file: &syn::File,
     path: &Path,
     config: &Config,
     pyclass_name_map: &HashMap<String, String>,
     type_alias_map: &HashMap<String, Type>,
+    impl_map: &ImplMap,
 ) -> Vec<PyModule> {
-    // First pass: collect all #[pymethods] impl blocks keyed by struct name,
-    // so we can attach them to PyClass items found later.
-    let impl_map = collect_impl_blocks(&file.items, path, config);
-
-    // Second pass: collect modules
+    // Collect modules
     let mut result = Vec::new();
     for item in &file.items {
         match item {
             // Style A: #[pymodule] mod Foo { ... }
             Item::Mod(m) if has_attr(&m.attrs, "pymodule") => {
                 if let Some(module) =
-                    parse_mod_style_module(m, path, config, &impl_map, type_alias_map)
+                    parse_mod_style_module(m, path, config, impl_map, type_alias_map)
                 {
                     result.push(module);
                 }
@@ -163,7 +163,7 @@ pub fn extract_modules_from_file(
                     &file.items,
                     path,
                     config,
-                    &impl_map,
+                    impl_map,
                     pyclass_name_map,
                     type_alias_map,
                 ) {
@@ -620,26 +620,58 @@ fn extract_attr_string_arg(attr: &Attribute) -> Option<String> {
 
 // ── impl block collection ────────────────────────────────────────────────────
 
-/// Maps struct/enum name → list of ImplItem from `#[pymethods]` blocks.
-type ImplMap = std::collections::HashMap<String, Vec<ImplItem>>;
+/// Maps struct/enum **simple name** → list of ImplItem from `#[pymethods]` blocks.
+///
+/// # Known limitation — name collision
+///
+/// The key is the last path segment of the `impl` self-type (e.g. `Foo` for both
+/// `mod a::Foo` and `mod b::Foo`).  If two different structs in separate modules
+/// share the same simple name *and* both carry `#[pymethods]`, their impl items
+/// are merged under a single key and will both appear on whichever class happens
+/// to match that name.  In practice this is rare for pyo3 codebases because
+/// Python class names (the public API) are almost always unique within a crate,
+/// but it is a known static-analysis blind spot.
+///
+/// A proper fix requires tracking fully-qualified Rust paths for both the
+/// `#[pyclass]` struct and the `impl` block, which is planned for Phase 5
+/// (cross-file symbol resolution).  Until then, avoid exposing two `#[pyclass]`
+/// types with the same simple name from the same crate.
+pub type ImplMap = std::collections::HashMap<String, Vec<ImplItem>>;
 
-fn collect_impl_blocks(items: &[Item], _path: &Path, _config: &Config) -> ImplMap {
-    let mut map: ImplMap = std::collections::HashMap::new();
-    for item in items {
-        if let Item::Impl(imp) = item {
-            if !has_attr(&imp.attrs, "pymethods") {
-                continue;
-            }
-            // Get the struct/enum name from `impl MyType { ... }`
-            if let Type::Path(tp) = imp.self_ty.as_ref()
-                && let Some(seg) = tp.path.segments.last()
-            {
-                let name = seg.ident.to_string();
-                map.entry(name).or_default().extend(imp.items.clone());
-            }
-        }
+/// Build a global ImplMap from every `.rs` file in the crate.
+///
+/// This must be called before [`extract_modules_from_file`] so that
+/// `#[pymethods]` blocks defined in a different file from the `#[pymodule]`
+/// (e.g. `edges.rs` vs `lib.rs`) are still resolved correctly.
+///
+/// See [`ImplMap`] for the known name-collision limitation.
+pub fn build_impl_map(files: &[(std::path::PathBuf, syn::File)]) -> ImplMap {
+    let mut map = ImplMap::new();
+    for (_path, file) in files {
+        collect_impl_blocks_from_items(&file.items, &mut map);
     }
     map
+}
+
+fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap) {
+    for item in items {
+        match item {
+            Item::Impl(imp) if has_attr(&imp.attrs, "pymethods") => {
+                if let Type::Path(tp) = imp.self_ty.as_ref()
+                    && let Some(seg) = tp.path.segments.last()
+                {
+                    let name = seg.ident.to_string();
+                    map.entry(name).or_default().extend(imp.items.clone());
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, content)) = &m.content {
+                    collect_impl_blocks_from_items(content, map);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ── Attribute helpers ────────────────────────────────────────────────────────
@@ -919,8 +951,15 @@ mod my_mod {
         let config = Config::default();
         let pyclass_map = HashMap::new();
         let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
-        let modules =
-            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &pyclass_map,
+            &type_alias_map,
+            &impl_map,
+        );
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
             other => panic!("expected PyItem::Function, got {other:?}"),
@@ -957,8 +996,15 @@ mod my_mod {
         let config = Config::default();
         let pyclass_map = HashMap::new();
         let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
-        let modules =
-            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &pyclass_map,
+            &type_alias_map,
+            &impl_map,
+        );
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
             other => panic!("expected PyItem::Function, got {other:?}"),
@@ -1011,7 +1057,9 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
 
         let type_alias_map = HashMap::new();
-        let modules = extract_modules_from_file(&file, path, &config, &map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules =
+            extract_modules_from_file(&file, path, &config, &map, &type_alias_map, &impl_map);
         assert_eq!(modules.len(), 1, "one pymodule");
         let module = &modules[0];
         assert_eq!(module.items.len(), 1, "one item (the class)");
@@ -1038,8 +1086,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let config = Config::default();
         let map = HashMap::new(); // empty map
         let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
 
-        let modules = extract_modules_from_file(&file, path, &config, &map, &type_alias_map);
+        let modules =
+            extract_modules_from_file(&file, path, &config, &map, &type_alias_map, &impl_map);
         assert_eq!(modules.len(), 1);
         match &modules[0].items[0] {
             PyItem::Class(c) => assert_eq!(c.name, "MyRustType"),
@@ -1268,8 +1318,15 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
+        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            Path::new("lib.rs"),
+            &config,
+            &map,
+            &HashMap::new(),
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1305,8 +1362,15 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
+        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            Path::new("lib.rs"),
+            &config,
+            &map,
+            &HashMap::new(),
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1343,8 +1407,15 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
+        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            Path::new("lib.rs"),
+            &config,
+            &map,
+            &HashMap::new(),
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1385,8 +1456,15 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
+        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            Path::new("lib.rs"),
+            &config,
+            &map,
+            &HashMap::new(),
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1427,8 +1505,15 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, Path::new("lib.rs"), &config, &map, &HashMap::new());
+        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            Path::new("lib.rs"),
+            &config,
+            &map,
+            &HashMap::new(),
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1465,8 +1550,15 @@ mod my_mod {
         let config = Config::default();
         let type_alias_map = HashMap::new();
         let pyclass_map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &pyclass_map,
+            &type_alias_map,
+            &impl_map,
+        );
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
             other => panic!("expected PyItem::Function, got {other:?}"),
@@ -1520,8 +1612,15 @@ fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let mut pyclass_map = HashMap::new();
         pyclass_map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
         let type_alias_map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &pyclass_map,
+            &type_alias_map,
+            &impl_map,
+        );
         let class = match &modules[0].items[0] {
             PyItem::Class(c) => c,
             other => panic!("expected PyItem::Class, got {other:?}"),
@@ -1564,8 +1663,15 @@ mod my_mod {
         let config = Config::default();
         let type_alias_map = HashMap::new();
         let pyclass_map = HashMap::new();
-        let modules =
-            extract_modules_from_file(&file, path, &config, &pyclass_map, &type_alias_map);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &pyclass_map,
+            &type_alias_map,
+            &impl_map,
+        );
         let func = match &modules[0].items[0] {
             PyItem::Function(f) => f,
             other => panic!("expected PyItem::Function, got {other:?}"),
@@ -1576,5 +1682,68 @@ mod my_mod {
             "only x should remain; m (Bound<PyModule>) is injected"
         );
         assert_eq!(func.params[0].name, "x");
+    }
+
+    /// The primary scenario this module change was designed to fix:
+    /// `#[pyclass]` lives in `lib.rs` and its `#[pymethods]` impl block lives in a
+    /// separate file (`impl.rs`).  Both files are passed to `build_impl_map` together,
+    /// so the methods must still appear on the collected class.
+    #[test]
+    fn pymethods_in_separate_file_are_resolved() {
+        let lib_file = syn::parse_file(
+            r#"
+#[pyclass]
+struct Edge {}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Edge>()?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+
+        let impl_file = syn::parse_file(
+            r#"
+#[pymethods]
+impl Edge {
+    fn weight(&self) -> f64 { 0.0 }
+    fn label(&self) -> String { String::new() }
+}
+"#,
+        )
+        .unwrap();
+
+        let lib_path = std::path::PathBuf::from("lib.rs");
+        let impl_path = std::path::PathBuf::from("impl.rs");
+
+        let files = vec![(lib_path.clone(), lib_file.clone()), (impl_path, impl_file)];
+
+        let impl_map = build_impl_map(&files);
+        let modules = extract_modules_from_file(
+            &lib_file,
+            lib_path.as_path(),
+            &Config::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &impl_map,
+        );
+
+        assert_eq!(modules.len(), 1, "one pymodule");
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        assert_eq!(class.name, "Edge");
+        let method_names: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            method_names.contains(&"weight"),
+            "weight method from separate file missing: {method_names:?}"
+        );
+        assert!(
+            method_names.contains(&"label"),
+            "label method from separate file missing: {method_names:?}"
+        );
     }
 }

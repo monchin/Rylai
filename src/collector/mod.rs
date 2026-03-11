@@ -18,7 +18,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
         crate_root.to_path_buf()
     };
 
-    // Collect all .rs paths and parsed files (two passes: first build pyclass name map, then extract modules).
+    // Collect all .rs paths and parsed files up front; subsequent passes operate over this slice.
     // All parsed ASTs are held in memory; for very large crates consider streaming or lazy parsing in the future.
     let mut files: Vec<(std::path::PathBuf, syn::File)> = Vec::new();
     for entry in WalkDir::new(&root)
@@ -37,6 +37,9 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
     let pyclass_name_map = parse::build_pyclass_name_map(&files);
     // Second pass: build type alias name -> underlying type for `type Foo = ...`
     let type_alias_map = parse::build_type_alias_map(&files);
+    // Third pass: build #[pymethods] impl map across the whole crate so that
+    // impl blocks defined in a different file from the #[pymodule] are found.
+    let impl_map = parse::build_impl_map(&files);
 
     let mut modules: Vec<PyModule> = Vec::new();
     for (path, file) in files {
@@ -46,6 +49,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
             config,
             &pyclass_name_map,
             &type_alias_map,
+            &impl_map,
         );
         modules.extend(file_modules);
     }
