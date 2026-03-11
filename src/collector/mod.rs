@@ -40,17 +40,20 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
     // Third pass: build #[pymethods] impl map across the whole crate so that
     // impl blocks defined in a different file from the #[pymodule] are found.
     let impl_map = parse::build_impl_map(&files);
+    // Fourth pass: build #[pyclass] struct fields map so that #[pyo3(get)] / #[pyo3(set)]
+    // fields on structs defined in any file generate @property stubs.
+    let struct_fields_map = parse::build_struct_fields_map(&files);
+
+    let cx = parse::ParseContext {
+        config,
+        impl_map: &impl_map,
+        struct_fields_map: &struct_fields_map,
+        type_alias_map: &type_alias_map,
+    };
 
     let mut modules: Vec<PyModule> = Vec::new();
     for (path, file) in files {
-        let file_modules = parse::extract_modules_from_file(
-            &file,
-            &path,
-            config,
-            &pyclass_name_map,
-            &type_alias_map,
-            &impl_map,
-        );
+        let file_modules = parse::extract_modules_from_file(&file, &path, &pyclass_name_map, cx);
         modules.extend(file_modules);
     }
 
