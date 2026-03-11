@@ -1746,4 +1746,224 @@ impl Edge {
             "label method from separate file missing: {method_names:?}"
         );
     }
+
+    // ── detect_method_kind ───────────────────────────────────────────────────
+
+    #[test]
+    fn method_kind_new_detected() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[new]
+            fn new() -> Self { Self {} }
+        };
+        assert!(
+            matches!(detect_method_kind(&item.attrs, "new"), MethodKind::New),
+            "expected MethodKind::New"
+        );
+    }
+
+    #[test]
+    fn method_kind_getter_uses_fn_name_by_default() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[getter]
+            fn value(&self) -> i32 { 0 }
+        };
+        assert_eq!(
+            detect_method_kind(&item.attrs, "value"),
+            MethodKind::Getter("value".to_string())
+        );
+    }
+
+    #[test]
+    fn method_kind_getter_uses_rename_arg() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[getter(count)]
+            fn internal_count(&self) -> i32 { 0 }
+        };
+        assert_eq!(
+            detect_method_kind(&item.attrs, "internal_count"),
+            MethodKind::Getter("count".to_string())
+        );
+    }
+
+    #[test]
+    fn method_kind_setter_uses_fn_name_by_default() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[setter]
+            fn value(&mut self, v: i32) {}
+        };
+        assert_eq!(
+            detect_method_kind(&item.attrs, "value"),
+            MethodKind::Setter("value".to_string())
+        );
+    }
+
+    #[test]
+    fn method_kind_setter_uses_rename_arg() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[setter(count)]
+            fn set_internal(&mut self, v: i32) {}
+        };
+        assert_eq!(
+            detect_method_kind(&item.attrs, "set_internal"),
+            MethodKind::Setter("count".to_string())
+        );
+    }
+
+    #[test]
+    fn method_kind_classmethod_detected() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[classmethod]
+            fn create(cls: &pyo3::Bound<'_, pyo3::types::PyType>) -> Self { Self {} }
+        };
+        assert!(
+            matches!(detect_method_kind(&item.attrs, "create"), MethodKind::Class),
+            "expected MethodKind::Class"
+        );
+    }
+
+    // ── extract_doc ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_doc_single_line_strips_leading_space() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            /// Hello, world!
+            fn foo() {}
+        };
+        let doc = extract_doc(&item.attrs);
+        assert_eq!(doc, vec!["Hello, world!"]);
+    }
+
+    #[test]
+    fn extract_doc_multi_line_collects_all_lines() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            /// First line.
+            /// Second line.
+            /// Third line.
+            fn foo() {}
+        };
+        let doc = extract_doc(&item.attrs);
+        assert_eq!(doc, vec!["First line.", "Second line.", "Third line."]);
+    }
+
+    #[test]
+    fn extract_doc_empty_when_no_doc_comment() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            fn foo() {}
+        };
+        assert_eq!(extract_doc(&item.attrs), Vec::<String>::new());
+    }
+
+    // ── nested #[pymodule] in Style A ────────────────────────────────────────
+
+    #[test]
+    fn nested_pymodule_in_style_a_becomes_submodule_item() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod outer {
+    #[pymodule]
+    mod inner {
+        #[pyfunction]
+        fn greet() -> String { String::new() }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = dummy_path();
+        let config = Config::default();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &HashMap::new(),
+            &HashMap::new(),
+            &impl_map,
+        );
+
+        assert_eq!(modules.len(), 1, "one top-level module");
+        assert_eq!(modules[0].name, "outer");
+        assert_eq!(modules[0].items.len(), 1, "one item: the nested module");
+        match &modules[0].items[0] {
+            PyItem::Module(sub) => {
+                assert_eq!(sub.name, "inner");
+                assert_eq!(sub.items.len(), 1, "inner has one function");
+            }
+            other => panic!("expected PyItem::Module, got {other:?}"),
+        }
+    }
+
+    // ── Style B: add_function with missing function ──────────────────────────
+
+    #[test]
+    fn style_b_add_function_for_missing_fn_is_skipped() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_function(pyo3::wrap_pyfunction!(missing_fn, m)?)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = dummy_path();
+        let config = Config::default();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let modules = extract_modules_from_file(
+            &file,
+            path,
+            &config,
+            &HashMap::new(),
+            &HashMap::new(),
+            &impl_map,
+        );
+        assert_eq!(modules.len(), 1, "module should still be collected");
+        assert_eq!(
+            modules[0].items.len(),
+            0,
+            "missing function should be silently skipped"
+        );
+    }
+
+    // ── build_type_alias_map: nested mod ────────────────────────────────────
+
+    #[test]
+    fn build_type_alias_map_inside_nested_mod() {
+        let file = syn::parse_file(
+            r#"
+mod inner {
+    type Coord = (f32, f32);
+}
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_type_alias_map(&[(path, file)]);
+        assert!(
+            map.contains_key("Coord"),
+            "type alias inside nested mod should be collected"
+        );
+    }
+
+    // ── build_pyclass_name_map: #[pyclass] enum ─────────────────────────────
+
+    #[test]
+    fn build_pyclass_name_map_collects_enum() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass(name = "Color")]
+enum PyColor { Red, Green, Blue }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyclass_name_map(&[(path, file)]);
+        assert_eq!(
+            map.get("PyColor"),
+            Some(&"Color".to_string()),
+            "renamed enum should appear in pyclass name map"
+        );
+    }
 }

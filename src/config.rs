@@ -238,4 +238,81 @@ mod tests {
         assert!(p.native_self);
         assert!(!p.future_annotations);
     }
+
+    // ── Config::load_or_default ──────────────────────────────────────────────
+
+    #[test]
+    fn load_or_default_returns_default_when_file_absent() {
+        let path = std::path::Path::new("/no/such/rylai.toml");
+        let config = Config::load_or_default(path).expect("absent file must not error");
+        assert_eq!(
+            config.output.python_version, "3.10",
+            "default python version"
+        );
+        assert!(config.output.add_header, "header enabled by default");
+        assert!(config.type_map.is_empty(), "type_map empty by default");
+        assert!(config.overrides.is_empty(), "overrides empty by default");
+    }
+
+    #[test]
+    fn load_or_default_parses_valid_toml() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("rylai_test_valid.toml");
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            write!(
+                f,
+                r#"
+[type_map]
+"numpy::PyReadonlyArray1" = "numpy.ndarray"
+
+[fallback]
+strategy = "error"
+
+[output]
+python_version = "3.11"
+add_header = false
+
+[[override]]
+item = "my_module::my_fn"
+stub = "def my_fn() -> int: ..."
+"#
+            )
+            .expect("write temp file");
+        }
+
+        let config = Config::load_or_default(&path).expect("valid toml must parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            config
+                .type_map
+                .get("numpy::PyReadonlyArray1")
+                .map(String::as_str),
+            Some("numpy.ndarray")
+        );
+        assert_eq!(config.fallback.strategy, FallbackStrategy::Error);
+        assert_eq!(config.output.python_version, "3.11");
+        assert!(!config.output.add_header);
+        assert_eq!(config.overrides.len(), 1);
+        assert_eq!(config.overrides[0].item, "my_module::my_fn");
+        assert_eq!(config.overrides[0].stub, "def my_fn() -> int: ...");
+    }
+
+    #[test]
+    fn load_or_default_errors_on_invalid_toml() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("rylai_test_invalid.toml");
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp file");
+            write!(f, "this is not valid = [ toml").expect("write temp file");
+        }
+
+        let result = Config::load_or_default(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err(), "invalid TOML must return Err");
+    }
 }

@@ -558,4 +558,124 @@ mod tests {
         assert_eq!(m.py_type, "Any");
         assert!(m.is_unknown);
     }
+
+    // ── HashMap / BTreeMap ───────────────────────────────────────────────────
+
+    #[test]
+    fn hashmap_maps_to_dict() {
+        let ty = parse_ty("HashMap<String, i32>");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "dict[str, int]");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    #[test]
+    fn btreemap_maps_to_dict() {
+        let ty = parse_ty("BTreeMap<u32, String>");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "dict[int, str]");
+        assert!(!m.needs_any);
+    }
+
+    #[test]
+    fn hashmap_without_type_params_maps_to_bare_dict() {
+        let ty = parse_ty("HashMap");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "dict");
+        assert!(!m.is_unknown);
+    }
+
+    // ── HashSet / BTreeSet ───────────────────────────────────────────────────
+
+    #[test]
+    fn hashset_maps_to_set() {
+        let ty = parse_ty("HashSet<i32>");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "set[int]");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    #[test]
+    fn btreeset_maps_to_set() {
+        let ty = parse_ty("BTreeSet<String>");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "set[str]");
+        assert!(!m.needs_any);
+    }
+
+    #[test]
+    fn hashset_without_type_param_maps_to_bare_set() {
+        let ty = parse_ty("HashSet");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "set");
+        assert!(!m.is_unknown);
+    }
+
+    // ── Non-empty tuple ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tuple_two_elems_maps_to_python_tuple() {
+        let ty = parse_ty("(i32, String)");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "tuple[int, str]");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    #[test]
+    fn tuple_three_elems_maps_to_python_tuple() {
+        let ty = parse_ty("(f32, f32, f32, f32)");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "tuple[float, float, float, float]");
+    }
+
+    #[test]
+    fn tuple_with_unknown_inner_propagates_is_unknown() {
+        let ty = parse_ty("(i32, SomeOpaque)");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert!(m.py_type.starts_with("tuple["), "got: {}", m.py_type);
+        assert!(m.is_unknown, "unknown inner type should propagate");
+        assert!(m.needs_any);
+    }
+
+    // ── PyAny / PyObject ─────────────────────────────────────────────────────
+
+    /// `PyAny` maps to `Any` but is NOT treated as an unresolvable type:
+    /// it is a deliberate opaque handle, so `is_unknown` must be `false`.
+    #[test]
+    fn pyany_maps_to_any_not_unknown() {
+        let ty = parse_ty("PyAny");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Any");
+        assert!(m.needs_any);
+        assert!(
+            !m.is_unknown,
+            "PyAny is opaque by design, not an unresolved type"
+        );
+    }
+
+    #[test]
+    fn pyobject_maps_to_any_not_unknown() {
+        let ty = parse_ty("PyObject");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Any");
+        assert!(m.needs_any);
+        assert!(
+            !m.is_unknown,
+            "PyObject is opaque by design, not an unresolved type"
+        );
+    }
+
+    // ── Result<T, E> ─────────────────────────────────────────────────────────
+
+    /// `Result<T, E>` (std::result::Result) must be handled the same as `PyResult<T>`.
+    #[test]
+    fn std_result_unwraps_to_ok_type() {
+        let ty = parse_ty("Result<i32, String>");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "int");
+        assert!(!m.needs_any);
+    }
 }

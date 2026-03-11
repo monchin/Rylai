@@ -985,4 +985,289 @@ mod tests {
             "warning must mention the colliding Rust name"
         );
     }
+
+    // ── FallbackStrategy ─────────────────────────────────────────────────────
+
+    fn make_fn_unknown_return(name: &str) -> PyFunction {
+        make_fn(name, None, vec![], syn::parse_quote! { SomeOpaqueType })
+    }
+
+    /// With `fallback.strategy = "error"`, an unknown type must cause generation to fail.
+    #[test]
+    fn fallback_strategy_error_returns_err_on_unknown_type() {
+        let mut config = Config::default();
+        config.fallback.strategy = FallbackStrategy::Error;
+        let f = make_fn_unknown_return("risky");
+        let result = generate(&[make_module(vec![PyItem::Function(f)])], &config);
+        assert!(
+            result.is_err(),
+            "expected Err for unknown type with Error strategy"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unknown type"),
+            "error message should mention unknown type, got: {msg}"
+        );
+    }
+
+    /// With `fallback.strategy = "skip"`, an unknown type must not cause an error;
+    /// the item is still emitted with `Any` (current behaviour: skip == silent Any).
+    #[test]
+    fn fallback_strategy_skip_succeeds_on_unknown_type() {
+        let mut config = Config::default();
+        config.fallback.strategy = FallbackStrategy::Skip;
+        let f = make_fn_unknown_return("quiet");
+        let stub = generate(&[make_module(vec![PyItem::Function(f)])], &config)
+            .expect("Skip strategy must not return an error");
+        assert!(
+            stub.contains("def quiet"),
+            "function should still be emitted, got:\n{stub}"
+        );
+    }
+
+    // ── config.overrides ─────────────────────────────────────────────────────
+
+    /// A manual override entry matching a function name must replace the generated stub line.
+    #[test]
+    fn config_override_replaces_generated_stub() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "complex_fn".to_string(),
+            stub: "def complex_fn(x: Any, **kwargs: Any) -> dict[str, Any]: ...".to_string(),
+        });
+        let f = make_fn("complex_fn", None, vec![], syn::parse_quote! { () });
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("def complex_fn(x: Any, **kwargs: Any) -> dict[str, Any]: ..."),
+            "override stub should appear verbatim, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("def complex_fn() ->"),
+            "auto-generated version must not appear when overridden, got:\n{stub}"
+        );
+    }
+
+    /// A fully-qualified override (`module::item`) must also match.
+    #[test]
+    fn config_override_qualified_path_matches() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::qualified_fn".to_string(),
+            stub: "def qualified_fn() -> int: ...".to_string(),
+        });
+        let f = make_fn("qualified_fn", None, vec![], syn::parse_quote! { () });
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("def qualified_fn() -> int: ..."),
+            "qualified override must match, got:\n{stub}"
+        );
+    }
+
+    // ── add_header ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_header_true_prepends_comment() {
+        let mut config = Config::default();
+        config.output.add_header = true;
+        let f = make_fn("foo", None, vec![], syn::parse_quote! { () });
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.starts_with("# Auto-generated"),
+            "header should be first line, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn add_header_false_omits_comment() {
+        let mut config = Config::default();
+        config.output.add_header = false;
+        let f = make_fn("foo", None, vec![], syn::parse_quote! { () });
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            !stub.contains("# Auto-generated"),
+            "header must be absent when add_header = false, got:\n{stub}"
+        );
+    }
+
+    // ── gen_method: special MethodKinds ─────────────────────────────────────
+
+    fn make_method(name: &str, kind: MethodKind, params: Vec<PyParam>, ret: syn::Type) -> PyMethod {
+        PyMethod {
+            name: name.to_string(),
+            doc: vec![],
+            kind,
+            params,
+            return_type: PyType {
+                rust_type: ret,
+                override_str: None,
+            },
+        }
+    }
+
+    fn make_class_with_methods(class_name: &str, methods: Vec<PyMethod>) -> PyClass {
+        PyClass {
+            name: class_name.to_string(),
+            rust_name: class_name.to_string(),
+            doc: vec![],
+            methods,
+            source_file: dummy_path(),
+        }
+    }
+
+    #[test]
+    fn new_method_generates_init() {
+        let m = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        let class = make_class_with_methods("Counter", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, x: int) -> None:"),
+            "#[new] must emit __init__, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn getter_method_generates_property() {
+        let m = make_method(
+            "value",
+            MethodKind::Getter("value".to_string()),
+            vec![],
+            syn::parse_quote! { i32 },
+        );
+        let class = make_class_with_methods("Counter", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("@property"),
+            "getter must emit @property, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def value(self) -> int:"),
+            "getter must emit def value(self), got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn getter_with_rename_uses_property_name() {
+        let m = make_method(
+            "get_count",
+            MethodKind::Getter("count".to_string()),
+            vec![],
+            syn::parse_quote! { i32 },
+        );
+        let class = make_class_with_methods("Counter", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def count(self) -> int:"),
+            "renamed getter must use property name, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn setter_method_generates_setter_decorator() {
+        let m = make_method(
+            "set_value",
+            MethodKind::Setter("value".to_string()),
+            vec![make_param("v", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        let class = make_class_with_methods("Counter", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("@value.setter"),
+            "setter must emit @value.setter, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def value(self, value: int) -> None:"),
+            "setter must emit def value(self, value: T), got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn classmethod_generates_classmethod_decorator() {
+        let m = make_method(
+            "create",
+            MethodKind::Class,
+            vec![],
+            syn::parse_quote! { Self },
+        );
+        let class = make_class_with_methods("MyClass", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("@classmethod"),
+            "@classmethod decorator must appear, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def create(self)"),
+            "classmethod must include self param, got:\n{stub}"
+        );
+    }
+
+    // ── gen_module: nested submodule ─────────────────────────────────────────
+
+    #[test]
+    fn nested_submodule_generates_class_namespace() {
+        let inner = PyModule {
+            name: "utils".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "helper",
+                None,
+                vec![],
+                syn::parse_quote! { i32 },
+            ))],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for(vec![PyItem::Module(inner)]);
+        assert!(
+            stub.contains("class utils:"),
+            "submodule must be emitted as class, got:\n{stub}"
+        );
+        // Functions inside a sub-namespace module are emitted as regular `def` (no `self`).
+        assert!(
+            stub.contains("def helper() -> int:"),
+            "inner function must appear inside namespace, got:\n{stub}"
+        );
+    }
+
+    // ── gen_docstring ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn single_line_docstring_inline_triple_quotes() {
+        let mut f = make_fn("described", None, vec![], syn::parse_quote! { () });
+        f.doc = vec!["A brief description.".to_string()];
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("\"\"\"A brief description.\"\"\""),
+            "single-line doc must use inline triple quotes, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn multi_line_docstring_uses_block_format() {
+        let mut f = make_fn("described", None, vec![], syn::parse_quote! { () });
+        f.doc = vec!["First line.".to_string(), "Second line.".to_string()];
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("\"\"\""),
+            "multi-line doc must start with triple quotes, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("First line."),
+            "first doc line must appear, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("Second line."),
+            "second doc line must appear, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("\"\"\"First line.\"\"\""),
+            "multi-line must not use inline format, got:\n{stub}"
+        );
+    }
 }
