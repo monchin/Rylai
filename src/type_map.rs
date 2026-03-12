@@ -168,7 +168,7 @@ fn map_type_path(
 
         "bool" => return TypeMapping::known("bool"),
 
-        "str" | "String" => return TypeMapping::known("str"),
+        "str" | "String" | "char" => return TypeMapping::known("str"),
 
         // Unit / never
         "()" => return TypeMapping::known("None"),
@@ -404,6 +404,16 @@ mod tests {
         let ty = parse_ty("PyString");
         let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "str");
+    }
+
+    /// Rust `char` (single Unicode scalar) maps to Python `str` (pyo3 accepts/returns length-1 str).
+    #[test]
+    fn char_maps_to_str() {
+        let ty = parse_ty("char");
+        let m = map_type(&ty, &p(false), None, &no_classes());
+        assert_eq!(m.py_type, "str");
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
     }
 
     /// PyDict / PyList / PyTuple / PySet map to dict / list / tuple / set.
