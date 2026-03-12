@@ -283,17 +283,17 @@ impl<'a> GenCtx<'a> {
 
         match &m.kind {
             MethodKind::New => {
-                let params = self.gen_params(&m.params, &location, true)?;
+                let params = self.method_params(m, &location, true)?;
                 out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
             }
             MethodKind::Static => {
                 out.push_str(&format!("{pad}@staticmethod\n"));
-                let params = self.gen_params(&m.params, &location, false)?;
+                let params = self.method_params(m, &location, false)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
             MethodKind::Class => {
                 out.push_str(&format!("{pad}@classmethod\n"));
-                let params = self.gen_params(&m.params, &location, true)?;
+                let params = self.method_params(m, &location, true)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
             MethodKind::Getter(prop) => {
@@ -317,7 +317,7 @@ impl<'a> GenCtx<'a> {
                 ));
             }
             MethodKind::Instance => {
-                let params = self.gen_params(&m.params, &location, true)?;
+                let params = self.method_params(m, &location, true)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
         }
@@ -329,6 +329,21 @@ impl<'a> GenCtx<'a> {
         }
         out.push('\n');
         Ok(())
+    }
+
+    /// Build the parameter list for a method: uses `signature_override` when present,
+    /// otherwise `gen_params`. When `with_self` is true, the result includes a leading `self`.
+    fn method_params(&mut self, m: &PyMethod, location: &str, with_self: bool) -> Result<String> {
+        if let Some(sig) = &m.signature_override {
+            let merged = self.merge_sig_with_types(sig, &m.params, location)?;
+            Ok(if with_self {
+                format!("self, {merged}")
+            } else {
+                merged
+            })
+        } else {
+            self.gen_params(&m.params, location, with_self)
+        }
     }
 
     // ── Signature merge ──────────────────────────────────────────────────────
@@ -359,29 +374,17 @@ impl<'a> GenCtx<'a> {
             }
 
             if let Some(name) = token.strip_prefix("**") {
-                // **kwargs — resolve type, then strip the `| None` wrapper that pyo3
-                // uses internally (callers never pass None as **kwargs)
-                let ty = if let Some(p) = param_by_name.get(name) {
-                    let full = self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?;
-                    strip_option_none(&full)
-                } else {
-                    self.needs_any = true;
-                    "Any".to_string()
-                };
-                out_parts.push(format!("**{name}: {ty}"));
+                let name = name.trim(); // proc-macro may emit "** kwargs" with a space
+                // **kwargs are unpacked; no type (Unpack[TypedDict] etc. not supported yet).
+                out_parts.push(format!("**{name}"));
             } else if let Some(name) = token.strip_prefix('*') {
+                let name = name.trim();
                 if name.is_empty() {
-                    // bare `*` — keyword-only argument separator, no type annotation
+                    // bare `*` — keyword-only argument separator
                     out_parts.push("*".to_string());
                 } else {
-                    // *args
-                    let ty = if let Some(p) = param_by_name.get(name) {
-                        self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?
-                    } else {
-                        self.needs_any = true;
-                        "Any".to_string()
-                    };
-                    out_parts.push(format!("*{name}: {ty}"));
+                    // *args are unpacked; no type.
+                    out_parts.push(format!("*{name}"));
                 }
             } else {
                 let (name, default_opt) = split_name_default(token);
@@ -537,30 +540,6 @@ fn split_name_default(token: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Remove the ` | None` (or `Optional[…]`) wrapper added by the `Option<T>` mapping.
-///
-/// Used for `**kwargs` parameters: pyo3 uses `Option<&Bound<'_, PyDict>>` internally,
-/// but from Python's perspective `**kwargs` is never `None`.
-fn strip_option_none(ty: &str) -> String {
-    let t = ty.trim();
-    // "X | None" → "X"
-    if let Some(inner) = t.strip_suffix("| None") {
-        let stripped = inner.trim_end();
-        if !stripped.is_empty() {
-            return stripped.to_string();
-        }
-    }
-    // "Optional[X]" → "X"
-    if let Some(inner) = t
-        .strip_prefix("Optional[")
-        .and_then(|s| s.strip_suffix(']'))
-        && !inner.is_empty()
-    {
-        return inner.to_string();
-    }
-    t.to_string()
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -624,6 +603,7 @@ mod tests {
                 name: method_name.to_string(),
                 doc: vec![],
                 kind: MethodKind::Static,
+                signature_override: None,
                 params: vec![make_param("data", syn::parse_quote! { &[u8] })],
                 return_type: PyType {
                     rust_type: syn::parse_quote! { pyo3::PyResult<Self> },
@@ -712,33 +692,6 @@ mod tests {
         assert_eq!(split_name_default("clip=(1,2)"), ("clip", Some("(1,2)")));
     }
 
-    // ── strip_option_none ────────────────────────────────────────────────────
-
-    #[test]
-    fn strip_union_none() {
-        assert_eq!(strip_option_none("Any | None"), "Any");
-    }
-
-    #[test]
-    fn strip_optional_syntax() {
-        assert_eq!(strip_option_none("Optional[Any]"), "Any");
-    }
-
-    #[test]
-    fn strip_complex_union() {
-        assert_eq!(strip_option_none("list[int] | None"), "list[int]");
-    }
-
-    #[test]
-    fn strip_leaves_plain_type_unchanged() {
-        assert_eq!(strip_option_none("int"), "int");
-    }
-
-    #[test]
-    fn strip_leaves_any_unchanged() {
-        assert_eq!(strip_option_none("Any"), "Any");
-    }
-
     // ── merge_sig_with_types (via generate) ──────────────────────────────────
 
     /// Regular params with defaults get their Rust types attached.
@@ -777,9 +730,9 @@ mod tests {
         assert!(!stub.contains("cells: list[int] ="), "got:\n{stub}");
     }
 
-    /// `**kwargs` gets the inner type with `| None` stripped.
+    /// `**kwargs` is emitted without a type (no Unpack[TypedDict] etc. for now).
     #[test]
-    fn merge_kwargs_strips_option_none() {
+    fn merge_kwargs_no_type() {
         let f = make_fn(
             "my_fn",
             Some("page=None, **kwargs"),
@@ -790,8 +743,52 @@ mod tests {
             syn::parse_quote! { () },
         );
         let stub = stub_for(vec![PyItem::Function(f)]);
-        assert!(stub.contains("**kwargs: int"), "got:\n{stub}");
-        assert!(!stub.contains("**kwargs: int | None"), "got:\n{stub}");
+        assert!(stub.contains("**kwargs"), "got:\n{stub}");
+        assert!(
+            !stub.contains("**kwargs:"),
+            "**kwargs should have no type annotation, got:\n{stub}"
+        );
+    }
+
+    /// When signature has regular params before *args and **kwargs, regular params keep their types.
+    #[test]
+    fn merge_mixed_args_kwargs_regular_params_typed() {
+        let f = make_fn(
+            "find_tables",
+            Some("page=None, clip=None, *args, **kwargs"),
+            vec![
+                make_param("page", syn::parse_quote! { Option<i32> }),
+                make_param("clip", syn::parse_quote! { Option<f64> }),
+                make_param("args", syn::parse_quote! { Vec<String> }),
+                make_param(
+                    "kwargs",
+                    syn::parse_quote! { Option<pyo3::Bound<'_, pyo3::types::PyDict>> },
+                ),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("page: "), "page must have type, got:\n{stub}");
+        assert!(stub.contains("clip: "), "clip must have type, got:\n{stub}");
+        assert!(
+            stub.contains("page: int | None = None") || stub.contains("page: Optional[int] = None"),
+            "got:\n{stub}"
+        );
+        assert!(
+            stub.contains("clip: float | None = None")
+                || stub.contains("clip: Optional[float] = None"),
+            "got:\n{stub}"
+        );
+        assert!(stub.contains("*args"), "got:\n{stub}");
+        assert!(
+            !stub.contains("*args:"),
+            "*args must have no type, got:\n{stub}"
+        );
+        assert!(stub.contains("**kwargs"), "got:\n{stub}");
+        assert!(
+            !stub.contains("**kwargs:"),
+            "**kwargs must have no type, got:\n{stub}"
+        );
     }
 
     /// A token in the signature with no matching Rust param is kept verbatim.
@@ -836,8 +833,9 @@ mod tests {
     }
 
     /// `*args` gets the correct type from the Rust param (e.g. `Vec<i32>` → `list[int]`).
+    /// `*args` is emitted without a type (unpacked positional args).
     #[test]
-    fn merge_args_typed_in_stub() {
+    fn merge_args_no_type() {
         let f = make_fn(
             "my_fn",
             Some("a, *args"),
@@ -848,9 +846,10 @@ mod tests {
             syn::parse_quote! { () },
         );
         let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("*args"), "got:\n{stub}");
         assert!(
-            stub.contains("*args: list[int]"),
-            "*args should get type from Vec<i32>, got:\n{stub}"
+            !stub.contains("*args:"),
+            "*args should have no type annotation, got:\n{stub}"
         );
     }
 
@@ -1173,6 +1172,7 @@ mod tests {
             name: name.to_string(),
             doc: vec![],
             kind,
+            signature_override: None,
             params,
             return_type: PyType {
                 rust_type: ret,
@@ -1204,6 +1204,27 @@ mod tests {
         assert!(
             stub.contains("def __init__(self, x: int) -> None:"),
             "#[new] must emit __init__, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn new_method_with_signature_override_emits_kwargs() {
+        // #[new] with #[pyo3(signature = (**kwargs))] — **kwargs are unpacked, so type is Any not dict.
+        let mut m = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param(
+                "kwargs",
+                syn::parse_quote! { Option<&pyo3::Bound<'_, pyo3::types::PyDict>> },
+            )],
+            syn::parse_quote! { () },
+        );
+        m.signature_override = Some("**kwargs".to_string());
+        let class = make_class_with_methods("TfSettings", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, **kwargs) -> None:"),
+            "#[new] with signature (**kwargs) must emit __init__(self, **kwargs), got:\n{stub}"
         );
     }
 

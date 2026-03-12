@@ -605,6 +605,7 @@ fn parse_struct_fields_as_methods(
                 name: prop_name.clone(),
                 doc: doc.clone(),
                 kind: MethodKind::Getter(prop_name.clone()),
+                signature_override: None,
                 params: vec![],
                 return_type: py_type.clone(),
             });
@@ -614,6 +615,7 @@ fn parse_struct_fields_as_methods(
                 name: prop_name.clone(),
                 doc: doc.clone(),
                 kind: MethodKind::Setter(prop_name.clone()),
+                signature_override: None,
                 params: vec![PyParam {
                     name: "value".to_string(),
                     ty: py_type.clone(),
@@ -678,6 +680,7 @@ fn parse_pymethod(
     // #[pyo3(name = "foo")] overrides the Rust method name
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| m.sig.ident.to_string());
     let doc = extract_doc(&m.attrs);
+    let signature_override = extract_pyo3_signature(&m.attrs);
     let params = parse_params(&m.sig, config, type_alias_map);
     let return_type = parse_return_type(&m.sig.output, config, type_alias_map);
     let kind = detect_method_kind(&m.attrs, &name);
@@ -686,6 +689,7 @@ fn parse_pymethod(
         name,
         doc,
         kind,
+        signature_override,
         params,
         return_type,
     })

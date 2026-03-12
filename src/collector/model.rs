@@ -84,6 +84,8 @@ pub struct PyMethod {
     pub name: String,
     pub doc: Vec<String>,
     pub kind: MethodKind,
+    /// If `#[pyo3(signature = (...))]` is present, this overrides params (e.g. `**kwargs` for `#[new]`).
+    pub signature_override: Option<String>,
     pub params: Vec<PyParam>,
     pub return_type: PyType,
 }
