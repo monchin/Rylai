@@ -33,18 +33,19 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
         files.push((path, file));
     }
 
+    let enabled_features = &config.features.enabled;
     // First pass: build Rust type name -> Python name for #[pyclass(name = "...")]
-    let pyclass_name_map = parse::build_pyclass_name_map(&files);
+    let pyclass_name_map = parse::build_pyclass_name_map(&files, enabled_features);
     // Second pass: build type alias name -> underlying type for `type Foo = ...`
-    let type_alias_map = parse::build_type_alias_map(&files);
+    let type_alias_map = parse::build_type_alias_map(&files, enabled_features);
     // Third pass: build #[pymethods] impl map across the whole crate so that
     // impl blocks defined in a different file from the #[pymodule] are found.
-    let impl_map = parse::build_impl_map(&files);
+    let impl_map = parse::build_impl_map(&files, enabled_features);
     // Fourth pass: build #[pyclass] struct fields map so that #[pyo3(get)] / #[pyo3(set)]
     // fields on structs defined in any file generate @property stubs.
-    let struct_fields_map = parse::build_struct_fields_map(&files);
+    let struct_fields_map = parse::build_struct_fields_map(&files, enabled_features);
     // Fifth pass: build #[pyclass] type name -> attributes (for docstrings in Style B).
-    let pyclass_attrs_map = parse::build_pyclass_attrs_map(&files);
+    let pyclass_attrs_map = parse::build_pyclass_attrs_map(&files, enabled_features);
 
     let cx = parse::ParseContext {
         config,

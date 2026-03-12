@@ -16,23 +16,35 @@ const MAX_TYPE_ALIAS_DEPTH: u8 = 10;
 /// Build a map: Rust type alias name -> underlying `syn::Type` from all `type Foo = ...` in the crate.
 /// Used to resolve e.g. `PyBbox` to `(f32, f32, f32, f32)` when mapping to Python types.
 /// If the same alias name appears in multiple files, the last occurrence wins.
-pub fn build_type_alias_map(files: &[(std::path::PathBuf, syn::File)]) -> HashMap<String, Type> {
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
+pub fn build_type_alias_map(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> HashMap<String, Type> {
     let mut map = HashMap::new();
     for (_path, file) in files {
-        collect_type_aliases_from_items(&file.items, &mut map);
+        collect_type_aliases_from_items(&file.items, &mut map, enabled_features);
     }
     map
 }
 
-fn collect_type_aliases_from_items(items: &[Item], map: &mut HashMap<String, Type>) {
+fn collect_type_aliases_from_items(
+    items: &[Item],
+    map: &mut HashMap<String, Type>,
+    enabled_features: &[String],
+) {
     for item in items {
         match item {
             Item::Type(ta) => {
-                map.insert(ta.ident.to_string(), (*ta.ty).clone());
+                if cfg_is_active(&ta.attrs, enabled_features) {
+                    map.insert(ta.ident.to_string(), (*ta.ty).clone());
+                }
             }
             Item::Mod(m) => {
-                if let Some((_, content)) = &m.content {
-                    collect_type_aliases_from_items(content, map);
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_type_aliases_from_items(content, map, enabled_features);
                 }
             }
             _ => {}
@@ -99,32 +111,44 @@ fn is_single_ident_path(tp: &TypePath) -> bool {
 /// Build a map: Rust type name (struct/enum ident) -> Python name from `#[pyclass(name = "...")]`.
 /// Used so that when we see `m.add_class::<PyPdfDocument>()` we can emit `class PdfDocument`.
 /// If the same Rust type name appears in multiple files, the last occurrence wins.
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
 pub fn build_pyclass_name_map(
     files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for (_path, file) in files {
-        collect_pyclass_names_from_items(&file.items, &mut map);
+        collect_pyclass_names_from_items(&file.items, &mut map, enabled_features);
     }
     map
 }
 
-fn collect_pyclass_names_from_items(items: &[Item], map: &mut HashMap<String, String>) {
+fn collect_pyclass_names_from_items(
+    items: &[Item],
+    map: &mut HashMap<String, String>,
+    enabled_features: &[String],
+) {
     for item in items {
         match item {
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if let Some(python_name) = extract_pyo3_name(&s.attrs) {
+                if cfg_is_active(&s.attrs, enabled_features)
+                    && let Some(python_name) = extract_pyo3_name(&s.attrs)
+                {
                     map.insert(s.ident.to_string(), python_name);
                 }
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                if let Some(python_name) = extract_pyo3_name(&e.attrs) {
+                if cfg_is_active(&e.attrs, enabled_features)
+                    && let Some(python_name) = extract_pyo3_name(&e.attrs)
+                {
                     map.insert(e.ident.to_string(), python_name);
                 }
             }
             Item::Mod(m) => {
-                if let Some((_, content)) = &m.content {
-                    collect_pyclass_names_from_items(content, map);
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_pyclass_names_from_items(content, map, enabled_features);
                 }
             }
             _ => {}
@@ -167,14 +191,17 @@ pub fn extract_modules_from_file(
         match item {
             // Style A: #[pymodule] mod Foo { ... }
             Item::Mod(m) if has_attr(&m.attrs, "pymodule") => {
-                if let Some(module) = parse_mod_style_module(m, path, cx) {
+                if cfg_is_active(&m.attrs, &cx.config.features.enabled)
+                    && let Some(module) = parse_mod_style_module(m, path, cx)
+                {
                     result.push(module);
                 }
             }
             // Style B: #[pymodule] fn foo(m: &Bound<PyModule>) -> PyResult<()> { ... }
             Item::Fn(f) if has_attr(&f.attrs, "pymodule") => {
-                if let Some(module) =
-                    parse_fn_style_module(f, &file.items, path, pyclass_name_map, cx)
+                if cfg_is_active(&f.attrs, &cx.config.features.enabled)
+                    && let Some(module) =
+                        parse_fn_style_module(f, &file.items, path, pyclass_name_map, cx)
                 {
                     result.push(module);
                 }
@@ -203,29 +230,38 @@ fn parse_mod_style_module(m: &ItemMod, path: &Path, cx: ParseContext<'_>) -> Opt
 }
 
 fn collect_items_from_list(items: &[Item], path: &Path, cx: ParseContext<'_>) -> Vec<PyItem> {
+    let enabled = &cx.config.features.enabled;
     let mut result = Vec::new();
     for item in items {
         match item {
             Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
-                if let Some(func) = parse_pyfunction(f, path, cx.config, cx.type_alias_map) {
+                if cfg_is_active(&f.attrs, enabled)
+                    && let Some(func) = parse_pyfunction(f, path, cx.config, cx.type_alias_map)
+                {
                     result.push(PyItem::Function(func));
                 }
             }
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
-                let rust_name = s.ident.to_string();
-                let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx);
-                result.push(PyItem::Class(class));
+                if cfg_is_active(&s.attrs, enabled) {
+                    let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
+                    let rust_name = s.ident.to_string();
+                    let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx);
+                    result.push(PyItem::Class(class));
+                }
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
-                let rust_name = e.ident.to_string();
-                let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx);
-                result.push(PyItem::Class(class));
+                if cfg_is_active(&e.attrs, enabled) {
+                    let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
+                    let rust_name = e.ident.to_string();
+                    let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx);
+                    result.push(PyItem::Class(class));
+                }
             }
             // Nested submodule
             Item::Mod(sub) if has_attr(&sub.attrs, "pymodule") => {
-                if let Some(sub_mod) = parse_mod_style_module(sub, path, cx) {
+                if cfg_is_active(&sub.attrs, enabled)
+                    && let Some(sub_mod) = parse_mod_style_module(sub, path, cx)
+                {
                     result.push(PyItem::Module(sub_mod));
                 }
             }
@@ -786,26 +822,38 @@ pub type StructFieldsMap = std::collections::HashMap<String, Vec<syn::Field>>;
 /// Build a global [`StructFieldsMap`] from every `.rs` file in the crate.
 ///
 /// Only named-field `#[pyclass]` structs are included; tuple structs and enums are skipped.
-pub fn build_struct_fields_map(files: &[(std::path::PathBuf, syn::File)]) -> StructFieldsMap {
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
+pub fn build_struct_fields_map(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> StructFieldsMap {
     let mut map = StructFieldsMap::new();
     for (_path, file) in files {
-        collect_struct_fields_from_items(&file.items, &mut map);
+        collect_struct_fields_from_items(&file.items, &mut map, enabled_features);
     }
     map
 }
 
-fn collect_struct_fields_from_items(items: &[Item], map: &mut StructFieldsMap) {
+fn collect_struct_fields_from_items(
+    items: &[Item],
+    map: &mut StructFieldsMap,
+    enabled_features: &[String],
+) {
     for item in items {
         match item {
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if let Fields::Named(named) = &s.fields {
+                if cfg_is_active(&s.attrs, enabled_features)
+                    && let Fields::Named(named) = &s.fields
+                {
                     let fields: Vec<syn::Field> = named.named.iter().cloned().collect();
                     map.insert(s.ident.to_string(), fields);
                 }
             }
             Item::Mod(m) => {
-                if let Some((_, content)) = &m.content {
-                    collect_struct_fields_from_items(content, map);
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_struct_fields_from_items(content, map, enabled_features);
                 }
             }
             _ => {}
@@ -823,26 +871,40 @@ pub type PyclassAttrsMap = std::collections::HashMap<String, Vec<Attribute>>;
 /// Build a global [`PyclassAttrsMap`] from every `.rs` file in the crate.
 ///
 /// See [`PyclassAttrsMap`] for the known name-collision limitation.
-pub fn build_pyclass_attrs_map(files: &[(std::path::PathBuf, syn::File)]) -> PyclassAttrsMap {
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
+pub fn build_pyclass_attrs_map(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> PyclassAttrsMap {
     let mut map = PyclassAttrsMap::new();
     for (_path, file) in files {
-        collect_pyclass_attrs_from_items(&file.items, &mut map);
+        collect_pyclass_attrs_from_items(&file.items, &mut map, enabled_features);
     }
     map
 }
 
-fn collect_pyclass_attrs_from_items(items: &[Item], map: &mut PyclassAttrsMap) {
+fn collect_pyclass_attrs_from_items(
+    items: &[Item],
+    map: &mut PyclassAttrsMap,
+    enabled_features: &[String],
+) {
     for item in items {
         match item {
             Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                map.insert(s.ident.to_string(), s.attrs.clone());
+                if cfg_is_active(&s.attrs, enabled_features) {
+                    map.insert(s.ident.to_string(), s.attrs.clone());
+                }
             }
             Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                map.insert(e.ident.to_string(), e.attrs.clone());
+                if cfg_is_active(&e.attrs, enabled_features) {
+                    map.insert(e.ident.to_string(), e.attrs.clone());
+                }
             }
             Item::Mod(m) => {
-                if let Some((_, content)) = &m.content {
-                    collect_pyclass_attrs_from_items(content, map);
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_pyclass_attrs_from_items(content, map, enabled_features);
                 }
             }
             _ => {}
@@ -857,19 +919,24 @@ fn collect_pyclass_attrs_from_items(items: &[Item], map: &mut PyclassAttrsMap) {
 /// (e.g. `edges.rs` vs `lib.rs`) are still resolved correctly.
 ///
 /// See [`ImplMap`] for the known name-collision limitation.
-pub fn build_impl_map(files: &[(std::path::PathBuf, syn::File)]) -> ImplMap {
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
+pub fn build_impl_map(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> ImplMap {
     let mut map = ImplMap::new();
     for (_path, file) in files {
-        collect_impl_blocks_from_items(&file.items, &mut map);
+        collect_impl_blocks_from_items(&file.items, &mut map, enabled_features);
     }
     map
 }
 
-fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap) {
+fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap, enabled_features: &[String]) {
     for item in items {
         match item {
             Item::Impl(imp) if has_attr(&imp.attrs, "pymethods") => {
-                if let Type::Path(tp) = imp.self_ty.as_ref()
+                if cfg_is_active(&imp.attrs, enabled_features)
+                    && let Type::Path(tp) = imp.self_ty.as_ref()
                     && let Some(seg) = tp.path.segments.last()
                 {
                     let name = seg.ident.to_string();
@@ -877,11 +944,118 @@ fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap) {
                 }
             }
             Item::Mod(m) => {
-                if let Some((_, content)) = &m.content {
-                    collect_impl_blocks_from_items(content, map);
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_impl_blocks_from_items(content, map, enabled_features);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+// ── cfg(feature) evaluation for [features] enabled ──────────────────────────
+
+/// Returns true if the item should be considered active given the configured enabled features.
+/// - If there is no `#[cfg(...)]` attribute, returns true.
+/// - If there are one or more `#[cfg(...)]`, all must evaluate to true (Rust semantics).
+/// - Supports: `feature = "x"`, `not(...)`, `all(...)`, `any(...)`.
+/// - Unknown predicates (e.g. `target_os`) are treated as true (permissive for stub generation).
+pub fn cfg_is_active(attrs: &[Attribute], enabled_features: &[String]) -> bool {
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+        let Meta::List(ml) = &attr.meta else {
+            continue;
+        };
+        let Ok(inner) = syn::parse2::<Meta>(ml.tokens.clone()) else {
+            continue;
+        };
+        match eval_cfg_meta(&inner, enabled_features) {
+            Some(true) => {}
+            Some(false) => return false,
+            None => {}
+        }
+    }
+    true
+}
+
+/// Parses a single nested meta from `parse_nested_meta` into a full `Meta`.
+/// Handles `feature = "x"` (NameValue); used for all(...) and any(...) with feature predicates.
+fn parse_nested_meta_as_meta(meta: syn::meta::ParseNestedMeta) -> syn::Result<Meta> {
+    let path = meta.path.clone();
+    if meta.input.peek(syn::token::Eq) {
+        let eq_token: syn::token::Eq = meta.input.parse()?;
+        let value: Expr = meta.input.parse()?;
+        Ok(Meta::NameValue(syn::MetaNameValue {
+            path,
+            eq_token,
+            value,
+        }))
+    } else {
+        // Nested list (e.g. not(...)): re-parse the rest as Meta and wrap in List
+        let inner: Meta = meta.input.parse()?;
+        Ok(Meta::List(syn::MetaList {
+            path,
+            delimiter: syn::MacroDelimiter::Paren(Default::default()),
+            tokens: quote::quote!(#inner),
+        }))
+    }
+}
+
+/// Evaluates a single cfg predicate (or compound). Returns None for unknown predicates (treated as true).
+fn eval_cfg_meta(meta: &Meta, enabled: &[String]) -> Option<bool> {
+    match meta {
+        Meta::Path(_) => Some(true),
+        Meta::NameValue(nv) => {
+            if nv.path.is_ident("feature")
+                && let Expr::Lit(lit) = &nv.value
+                && let Lit::Str(s) = &lit.lit
+            {
+                let name = s.value();
+                return Some(enabled.iter().any(|f| f == &name));
+            }
+            Some(true)
+        }
+        Meta::List(ml) => {
+            let ident = ml.path.get_ident().map(|i| i.to_string());
+            match ident.as_deref() {
+                Some("not") => {
+                    let inner: Meta = syn::parse2(ml.tokens.clone()).ok()?;
+                    Some(!eval_cfg_meta(&inner, enabled)?)
+                }
+                Some("all") => {
+                    let mut nested = Vec::new();
+                    ml.parse_nested_meta(|meta| {
+                        nested.push(parse_nested_meta_as_meta(meta)?);
+                        Ok(())
+                    })
+                    .ok()?;
+                    for m in &nested {
+                        if !eval_cfg_meta(m, enabled)? {
+                            return Some(false);
+                        }
+                    }
+                    Some(true)
+                }
+                Some("any") => {
+                    let mut nested = Vec::new();
+                    ml.parse_nested_meta(|meta| {
+                        nested.push(parse_nested_meta_as_meta(meta)?);
+                        Ok(())
+                    })
+                    .ok()?;
+                    for m in &nested {
+                        if eval_cfg_meta(m, enabled)? {
+                            return Some(true);
+                        }
+                    }
+                    Some(false)
+                }
+                _ => Some(true),
+            }
         }
     }
 }
@@ -1074,6 +1248,11 @@ mod tests {
     use crate::config::{Config, RenderPolicy};
     use std::path::Path;
 
+    /// Empty enabled features for tests that do not gate on cfg(feature).
+    fn no_features() -> Vec<String> {
+        vec![]
+    }
+
     fn dummy_path() -> &'static Path {
         Path::new("test.rs")
     }
@@ -1142,6 +1321,62 @@ mod tests {
         );
     }
 
+    // ── cfg_is_active ([features] enabled) ───────────────────────────────────
+
+    fn attrs_from_cfg(cfg_expr: &str) -> Vec<syn::Attribute> {
+        let item: syn::ItemFn =
+            syn::parse_str(&format!("#[cfg({cfg_expr})]\nfn _dummy() {{}}")).unwrap();
+        item.attrs
+    }
+
+    #[test]
+    fn cfg_is_active_no_cfg_returns_true() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            fn foo() -> i32 { 0 }
+        };
+        assert!(cfg_is_active(&item.attrs, &[]));
+        assert!(cfg_is_active(&item.attrs, &["extra".to_string()]));
+    }
+
+    #[test]
+    fn cfg_is_active_feature_enabled() {
+        let attrs = attrs_from_cfg(r#"feature = "foo""#);
+        assert!(!cfg_is_active(&attrs, &[]));
+        assert!(cfg_is_active(&attrs, &["foo".to_string()]));
+        assert!(!cfg_is_active(&attrs, &["bar".to_string()]));
+        assert!(cfg_is_active(
+            &attrs,
+            &["bar".to_string(), "foo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn cfg_is_active_not_feature() {
+        let attrs = attrs_from_cfg(r#"not(feature = "foo")"#);
+        assert!(cfg_is_active(&attrs, &[]));
+        assert!(!cfg_is_active(&attrs, &["foo".to_string()]));
+        assert!(cfg_is_active(&attrs, &["bar".to_string()]));
+    }
+
+    #[test]
+    fn cfg_is_active_all() {
+        let attrs = attrs_from_cfg(r#"all(feature = "a", feature = "b")"#);
+        assert!(!cfg_is_active(&attrs, &[]));
+        assert!(!cfg_is_active(&attrs, &["a".to_string()]));
+        assert!(!cfg_is_active(&attrs, &["b".to_string()]));
+        assert!(cfg_is_active(&attrs, &["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn cfg_is_active_any() {
+        let attrs = attrs_from_cfg(r#"any(feature = "a", feature = "b")"#);
+        assert!(!cfg_is_active(&attrs, &[]));
+        assert!(cfg_is_active(&attrs, &["a".to_string()]));
+        assert!(cfg_is_active(&attrs, &["b".to_string()]));
+        assert!(cfg_is_active(&attrs, &["a".to_string(), "b".to_string()]));
+    }
+
     // ── build_type_alias_map (type alias → Python type resolution) ───────────
 
     #[test]
@@ -1154,7 +1389,7 @@ type PyBbox = (f32, f32, f32, f32);
         .unwrap();
         let path = std::path::PathBuf::from("lib.rs");
         let files = vec![(path, file)];
-        let map = build_type_alias_map(&files);
+        let map = build_type_alias_map(&files, &no_features());
         assert!(
             map.contains_key("PyBbox"),
             "PyBbox alias should be collected"
@@ -1180,8 +1415,9 @@ mod my_mod {
         let path = Path::new("lib.rs");
         let config = Config::default();
         let pyclass_map = HashMap::new();
-        let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let type_alias_map =
+            build_type_alias_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1221,8 +1457,9 @@ mod my_mod {
         let path = Path::new("lib.rs");
         let config = Config::default();
         let pyclass_map = HashMap::new();
-        let type_alias_map = build_type_alias_map(&[(path.to_path_buf(), file.clone())]);
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let type_alias_map =
+            build_type_alias_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1255,7 +1492,7 @@ mod my_mod {
         };
         let path = std::path::PathBuf::from("lib.rs");
         let files = vec![(path, file)];
-        let map = build_pyclass_name_map(&files);
+        let map = build_pyclass_name_map(&files, &no_features());
         assert_eq!(map.get("PyPdfDocument"), Some(&"PdfDocument".to_string()));
     }
 
@@ -1279,7 +1516,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
 
         let type_alias_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1310,7 +1547,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let config = Config::default();
         let map = HashMap::new(); // empty map
         let type_alias_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1350,9 +1587,11 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         pyclass_name_map.insert("PyTableCellValue".to_string(), "TableCellValue".to_string());
 
         let type_alias_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())]);
-        let struct_fields_map = build_struct_fields_map(&[(path_buf.clone(), file.clone())]);
-        let pyclass_attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())]);
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let struct_fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let pyclass_attrs_map =
+            build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
 
         let cx = make_cx(
             &config,
@@ -1592,7 +1831,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -1633,7 +1875,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -1675,7 +1920,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -1721,7 +1969,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -1767,7 +2018,10 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
 
         let config = Config::default();
         let map = HashMap::new();
-        let impl_map = build_impl_map(&[(std::path::PathBuf::from("lib.rs"), file.clone())]);
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -1809,7 +2063,7 @@ mod my_mod {
         let config = Config::default();
         let type_alias_map = HashMap::new();
         let pyclass_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1867,7 +2121,7 @@ fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let mut pyclass_map = HashMap::new();
         pyclass_map.insert("PyPdfDocument".to_string(), "PdfDocument".to_string());
         let type_alias_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1914,7 +2168,7 @@ mod my_mod {
         let config = Config::default();
         let type_alias_map = HashMap::new();
         let pyclass_map = HashMap::new();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
@@ -1968,7 +2222,7 @@ impl Edge {
         let files = vec![(lib_path.clone(), lib_file.clone()), (impl_path, impl_file)];
 
         let config = Config::default();
-        let impl_map = build_impl_map(&files);
+        let impl_map = build_impl_map(&files, &no_features());
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -2117,7 +2371,7 @@ mod outer {
         .unwrap();
         let path = dummy_path();
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -2152,7 +2406,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         .unwrap();
         let path = dummy_path();
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -2185,7 +2439,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         .unwrap();
         let path = dummy_path();
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -2232,7 +2486,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         .unwrap();
         let path = dummy_path();
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let fields_map = StructFieldsMap::new();
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
@@ -2259,7 +2513,7 @@ mod inner {
         )
         .unwrap();
         let path = std::path::PathBuf::from("lib.rs");
-        let map = build_type_alias_map(&[(path, file)]);
+        let map = build_type_alias_map(&[(path, file)], &no_features());
         assert!(
             map.contains_key("Coord"),
             "type alias inside nested mod should be collected"
@@ -2295,8 +2549,9 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let config = Config::default();
         let mut pyclass_map = HashMap::new();
         pyclass_map.insert("PyTableCellValue".to_string(), "TableCellValue".to_string());
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
-        let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let struct_fields_map =
+            build_struct_fields_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(
@@ -2357,8 +2612,9 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         .unwrap();
         let path = Path::new("lib.rs");
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
-        let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let struct_fields_map =
+            build_struct_fields_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(
@@ -2412,8 +2668,9 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         .unwrap();
         let path = Path::new("lib.rs");
         let config = Config::default();
-        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
-        let struct_fields_map = build_struct_fields_map(&[(path.to_path_buf(), file.clone())]);
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let struct_fields_map =
+            build_struct_fields_map(&[(path.to_path_buf(), file.clone())], &no_features());
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(
@@ -2471,8 +2728,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         ];
 
         let config = Config::default();
-        let impl_map = build_impl_map(&files);
-        let struct_fields_map = build_struct_fields_map(&files);
+        let impl_map = build_impl_map(&files, &no_features());
+        let struct_fields_map = build_struct_fields_map(&files, &no_features());
         let type_alias_map = HashMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(
@@ -2529,7 +2786,7 @@ enum PyColor { Red, Green, Blue }
         )
         .unwrap();
         let path = std::path::PathBuf::from("lib.rs");
-        let map = build_pyclass_name_map(&[(path, file)]);
+        let map = build_pyclass_name_map(&[(path, file)], &no_features());
         assert_eq!(
             map.get("PyColor"),
             Some(&"Color".to_string()),

@@ -10,7 +10,6 @@ pub struct Config {
     pub type_map: HashMap<String, String>,
 
     #[serde(default)]
-    #[allow(dead_code)] // Phase 5: cfg(feature) gating
     pub features: FeaturesConfig,
 
     #[serde(default)]
@@ -26,9 +25,8 @@ pub struct Config {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct FeaturesConfig {
-    /// cfg features considered active during parsing (Phase 5)
+    /// cfg features considered active during parsing (used to evaluate #[cfg(feature = "...")]).
     #[serde(default)]
-    #[allow(dead_code)]
     pub enabled: Vec<String>,
 }
 
@@ -314,5 +312,23 @@ stub = "def my_fn() -> int: ..."
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err(), "invalid TOML must return Err");
+    }
+
+    #[test]
+    fn load_or_default_parses_features_enabled() {
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            temp,
+            r#"
+[features]
+enabled = ["default", "extra"]
+"#
+        )
+        .expect("write temp file");
+        let path = temp.path();
+
+        let config = Config::load_or_default(path).expect("valid toml must parse");
+        assert_eq!(config.features.enabled, ["default", "extra"]);
     }
 }
