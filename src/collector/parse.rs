@@ -3,7 +3,7 @@ use crate::config::Config;
 use std::collections::HashMap;
 use std::path::Path;
 use syn::{
-    Attribute, Expr, Fields, FnArg, ImplItem, Item, ItemFn, ItemMod, Meta, Pat, ReturnType,
+    Attribute, Expr, Fields, FnArg, ImplItem, Item, ItemFn, ItemMod, Lit, Meta, Pat, ReturnType,
     Signature, Type, TypePath,
 };
 
@@ -340,6 +340,15 @@ fn collect_add_calls_from_expr(
                         out.push(PyItem::Class(class));
                     }
                 }
+                "add" => {
+                    // m.add("__version__", env!("CARGO_PKG_VERSION")) — module-level constant
+                    let mut args = mc.args.iter();
+                    if let Some((name, py_type)) =
+                        extract_add_constant_name_and_type(args.next(), args.next())
+                    {
+                        out.push(PyItem::Constant(PyConstant { name, py_type }));
+                    }
+                }
                 _ => {}
             }
         }
@@ -366,6 +375,50 @@ fn extract_wrap_pyfunction_name(arg: Option<&Expr>) -> Option<String> {
         return extract_wrap_pyfunction_name(Some(&t.expr));
     }
     None
+}
+
+/// Extract name and Python type from `m.add("name", value)` for module-level constants.
+/// - First arg must be a string literal (e.g. `"__version__"`).
+/// - Second arg type: `env!(...)` → str, literal → corresponding type, else str.
+fn extract_add_constant_name_and_type(
+    first: Option<&Expr>,
+    second: Option<&Expr>,
+) -> Option<(String, String)> {
+    let name = match first? {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Str(s) => s.value(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let expr = second?;
+    let py_type = infer_constant_value_type(expr);
+    Some((name, py_type))
+}
+
+/// Infers the Python type string for a constant value expression.
+/// - `env!(...)` → `"str"`.
+/// - Literals (str, int, float, bool) → corresponding type.
+/// - Any other macro (e.g. `concat!(...)`) or expression → `"str"` as a safe default.
+fn infer_constant_value_type(expr: &Expr) -> String {
+    match expr {
+        // env!("CARGO_PKG_VERSION") etc. → str
+        Expr::Macro(m) => {
+            let seg = m.mac.path.segments.last();
+            if seg.map(|s| s.ident == "env") == Some(true) {
+                return "str".to_string();
+            }
+            "str".to_string()
+        }
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Str(_) | Lit::ByteStr(_) | Lit::Char(_) => "str".to_string(),
+            Lit::Int(_) | Lit::Byte(_) => "int".to_string(),
+            Lit::Float(_) => "float".to_string(),
+            Lit::Bool(_) => "bool".to_string(),
+            _ => "str".to_string(),
+        },
+        _ => "str".to_string(),
+    }
 }
 
 /// Extract `MyType` from `add_class::<MyType>()` turbofish.
@@ -2076,6 +2129,86 @@ mod outer {
                 assert_eq!(sub.items.len(), 1, "inner has one function");
             }
             other => panic!("expected PyItem::Module, got {other:?}"),
+        }
+    }
+
+    // ── Style B: m.add("name", value) → module-level constant ──────────────
+
+    #[test]
+    fn style_b_add_constant_infers_str_from_env_macro() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = dummy_path();
+        let config = Config::default();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let fields_map = StructFieldsMap::new();
+        let type_alias_map = HashMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].items.len(), 1);
+        match &modules[0].items[0] {
+            PyItem::Constant(c) => {
+                assert_eq!(c.name, "__version__");
+                assert_eq!(c.py_type, "str");
+            }
+            other => panic!("expected PyItem::Constant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn style_b_add_constant_infers_type_from_literal() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add("count", 42)?;
+    m.add("pi", 3.14)?;
+    m.add("flag", true)?;
+    Ok(())
+}
+"#,
+        )
+        .unwrap();
+        let path = dummy_path();
+        let config = Config::default();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())]);
+        let fields_map = StructFieldsMap::new();
+        let type_alias_map = HashMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &HashMap::new(), cx);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].items.len(), 3);
+        match &modules[0].items[0] {
+            PyItem::Constant(c) => {
+                assert_eq!(c.name, "count");
+                assert_eq!(c.py_type, "int");
+            }
+            other => panic!("expected Constant count, got {:?}", other),
+        }
+        match &modules[0].items[1] {
+            PyItem::Constant(c) => {
+                assert_eq!(c.name, "pi");
+                assert_eq!(c.py_type, "float");
+            }
+            other => panic!("expected Constant pi, got {:?}", other),
+        }
+        match &modules[0].items[2] {
+            PyItem::Constant(c) => {
+                assert_eq!(c.name, "flag");
+                assert_eq!(c.py_type, "bool");
+            }
+            other => panic!("expected Constant flag, got {:?}", other),
         }
     }
 

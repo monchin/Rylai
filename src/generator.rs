@@ -1,5 +1,6 @@
 use crate::collector::{
-    MethodKind, ParamKind, PyClass, PyFunction, PyItem, PyMethod, PyModule, PyParam, PyType,
+    MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod, PyModule, PyParam,
+    PyType,
 };
 use crate::config::{Config, FallbackStrategy, RenderPolicy};
 use crate::type_map::{self, TypeMapping};
@@ -19,6 +20,7 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
         needs_self_import: false,
         needs_path_import: false,
         needs_union: false,
+        needs_final: false,
         warnings: pre_warnings,
         current_self_type: None,
         known_classes,
@@ -56,6 +58,9 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
     }
     if ctx.needs_union {
         typing_parts.push("Union");
+    }
+    if ctx.needs_final {
+        typing_parts.push("Final");
     }
     if !typing_parts.is_empty() {
         out.push_str(&format!(
@@ -106,6 +111,8 @@ struct GenCtx<'a> {
     needs_path_import: bool,
     /// Whether any mapping used Union[...] (py < 3.10 style, e.g. Union[Path, str]).
     needs_union: bool,
+    /// Whether any module-level constant was emitted (needs `from typing import Final`).
+    needs_final: bool,
     warnings: Vec<String>,
     /// Set to the Python class name while generating methods for that class,
     /// so that Rust `Self` return types resolve correctly.
@@ -188,6 +195,7 @@ impl<'a> GenCtx<'a> {
             }
 
             match item {
+                PyItem::Constant(c) => self.gen_constant(c, out, indent)?,
                 PyItem::Function(f) => self.gen_function(f, out, indent)?,
                 PyItem::Class(c) => self.gen_class(c, out, indent)?,
                 PyItem::Module(m) => {
@@ -201,6 +209,16 @@ impl<'a> GenCtx<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    // ── Module-level constant (m.add("name", value)) ─────────────────────────
+
+    /// Emits `name: Final[py_type]` and sets `needs_final` so that `from typing import Final` is included.
+    fn gen_constant(&mut self, c: &PyConstant, out: &mut String, indent: usize) -> Result<()> {
+        self.needs_final = true;
+        let pad = "    ".repeat(indent);
+        out.push_str(&format!("{pad}{}: Final[{}]\n", c.name, c.py_type));
         Ok(())
     }
 
@@ -470,13 +488,14 @@ fn collect_class_names_from_module(
                 }
             }
             PyItem::Module(sub) => collect_class_names_from_module(sub, map, warnings),
-            PyItem::Function(_) => {}
+            PyItem::Function(_) | PyItem::Constant(_) => {}
         }
     }
 }
 
 fn item_name(item: &PyItem) -> &str {
     match item {
+        PyItem::Constant(c) => &c.name,
         PyItem::Function(f) => &f.name,
         PyItem::Class(c) => &c.name,
         PyItem::Module(m) => &m.name,
@@ -548,7 +567,8 @@ fn strip_option_none(ty: &str) -> String {
 mod tests {
     use super::*;
     use crate::collector::{
-        MethodKind, ParamKind, PyClass, PyFunction, PyItem, PyMethod, PyModule, PyParam, PyType,
+        MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod, PyModule,
+        PyParam, PyType,
     };
     use crate::config::Config;
     use std::path::PathBuf;
@@ -1095,6 +1115,42 @@ mod tests {
         assert!(
             stub.starts_with("# Auto-generated"),
             "header should be first line, got:\n{stub}"
+        );
+    }
+
+    // ── Module-level constant (m.add → Final[...]) ───────────────────────────
+
+    #[test]
+    fn constant_emits_final_annotation_and_typing_import() {
+        let c = PyConstant {
+            name: "__version__".to_string(),
+            py_type: "str".to_string(),
+        };
+        let stub = stub_for(vec![PyItem::Constant(c)]);
+        assert!(
+            stub.contains("__version__: Final[str]"),
+            "stub should contain Final[str] annotation, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("from typing import Final"),
+            "stub should import Final when constant is present, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn constant_with_other_typing_imports_includes_final() {
+        let c = PyConstant {
+            name: "VERSION".to_string(),
+            py_type: "str".to_string(),
+        };
+        let f = make_fn("foo", None, vec![], syn::parse_quote! { () });
+        let mut config = Config::default();
+        config.output.python_version = "3.9".to_string();
+        let stub = stub_for_config(vec![PyItem::Constant(c), PyItem::Function(f)], &config);
+        assert!(stub.contains("VERSION: Final[str]"), "got:\n{stub}");
+        assert!(
+            stub.contains("Final") && stub.contains("from typing import"),
+            "typing import line should include Final, got:\n{stub}"
         );
     }
 

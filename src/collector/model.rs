@@ -19,8 +19,19 @@ pub struct PyModule {
 #[allow(clippy::large_enum_variant)]
 pub enum PyItem {
     Function(PyFunction),
+    /// Module-level constant from `m.add("name", value)` (e.g. `__version__` from `env!(...)`).
+    Constant(PyConstant),
     Class(PyClass),
     Module(PyModule),
+}
+
+/// A module-level constant added via `m.add("name", value)` in the pymodule.
+#[derive(Debug, Clone)]
+pub struct PyConstant {
+    /// Python attribute name (e.g. `__version__`).
+    pub name: String,
+    /// Python type string for the .pyi (e.g. `str`, `int`).
+    pub py_type: String,
 }
 
 #[derive(Debug, Clone)]
