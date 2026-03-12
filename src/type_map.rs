@@ -50,6 +50,8 @@ pub fn map_type(
                 needs_any: mapped.iter().any(|m| m.needs_any),
                 needs_optional: mapped.iter().any(|m| m.needs_optional),
                 needs_self_import: mapped.iter().any(|m| m.needs_self_import),
+                needs_path_import: mapped.iter().any(|m| m.needs_path_import),
+                needs_union: mapped.iter().any(|m| m.needs_union),
                 is_unknown: mapped.iter().any(|m| m.is_unknown),
             }
         }
@@ -67,6 +69,10 @@ pub struct TypeMapping {
     pub needs_optional: bool,
     /// Whether the result contains `Self` (needs `from typing import Self`, py ≥ 3.11)
     pub needs_self_import: bool,
+    /// Whether the result contains `Path` (needs `from pathlib import Path`)
+    pub needs_path_import: bool,
+    /// Whether the result contains `Union[...]` (needs `from typing import Union`, py < 3.10)
+    pub needs_union: bool,
     /// True if the type was unresolvable (caller may warn/error/skip based on config)
     pub is_unknown: bool,
 }
@@ -78,6 +84,8 @@ impl TypeMapping {
             needs_any: false,
             needs_optional: false,
             needs_self_import: false,
+            needs_path_import: false,
+            needs_union: false,
             is_unknown: false,
         }
     }
@@ -88,6 +96,8 @@ impl TypeMapping {
             needs_any: false,
             needs_optional: false,
             needs_self_import: true,
+            needs_path_import: false,
+            needs_union: false,
             is_unknown: false,
         }
     }
@@ -98,8 +108,28 @@ impl TypeMapping {
             needs_any: true,
             needs_optional: false,
             needs_self_import: false,
+            needs_path_import: false,
+            needs_union: false,
             is_unknown: true,
         }
+    }
+}
+
+/// Rust `std::path::Path` / `PathBuf` (pyo3 accepts str or pathlib.Path) → Path | str or Union[Path, str].
+fn path_like_mapping(policy: &RenderPolicy) -> TypeMapping {
+    let (py_type, needs_union) = if policy.union_optional {
+        ("Path | str".to_string(), false)
+    } else {
+        ("Union[Path, str]".to_string(), true)
+    };
+    TypeMapping {
+        py_type,
+        needs_any: false,
+        needs_optional: false,
+        needs_self_import: false,
+        needs_path_import: true,
+        needs_union,
+        is_unknown: false,
     }
 }
 
@@ -117,6 +147,17 @@ fn map_type_path(
         .map(|s| s.ident.to_string())
         .collect::<Vec<_>>()
         .join("::");
+
+    // ── Path-like (Rust std::path::Path / PathBuf → pathlib.Path | str) ───────
+    if full == "Path"
+        || full == "PathBuf"
+        || full == "path::Path"
+        || full == "path::PathBuf"
+        || full == "std::path::Path"
+        || full == "std::path::PathBuf"
+    {
+        return path_like_mapping(policy);
+    }
 
     // ── Primitive scalars ────────────────────────────────────────────────────
     match full.as_str() {
@@ -177,6 +218,8 @@ fn map_type_path(
                     needs_any: inner_mapped.needs_any,
                     needs_optional: !policy.union_optional,
                     needs_self_import: inner_mapped.needs_self_import,
+                    needs_path_import: inner_mapped.needs_path_import,
+                    needs_union: inner_mapped.needs_union,
                     is_unknown: inner_mapped.is_unknown,
                 };
             }
@@ -215,6 +258,8 @@ fn map_type_path(
                         needs_any: km.needs_any || vm.needs_any,
                         needs_optional: km.needs_optional || vm.needs_optional,
                         needs_self_import: km.needs_self_import || vm.needs_self_import,
+                        needs_path_import: km.needs_path_import || vm.needs_path_import,
+                        needs_union: km.needs_union || vm.needs_union,
                         is_unknown: km.is_unknown || vm.is_unknown,
                     };
                 }
@@ -250,6 +295,8 @@ fn map_type_path(
                 needs_any: true,
                 needs_optional: false,
                 needs_self_import: false,
+                needs_path_import: false,
+                needs_union: false,
                 is_unknown: false,
             };
         }
@@ -429,6 +476,47 @@ mod tests {
         let ty = parse_ty("Vec<i32>");
         let m = map_type(&ty, &p(false), None, &no_classes());
         assert_eq!(m.py_type, "list[int]");
+    }
+
+    /// Rust `PathBuf` (e.g. pyo3 fn new(path: PathBuf)) maps to `Union[Path, str]` when union_optional is false (py < 3.10).
+    #[test]
+    fn pathbuf_maps_to_union_path_str_py38() {
+        let ty = parse_ty("PathBuf");
+        let m = map_type(&ty, &p(false), None, &no_classes());
+        assert_eq!(m.py_type, "Union[Path, str]");
+        assert!(m.needs_path_import);
+        assert!(m.needs_union);
+        assert!(!m.needs_any);
+        assert!(!m.is_unknown);
+    }
+
+    /// Rust `PathBuf` maps to `Path | str` when union_optional is true (py ≥ 3.10).
+    #[test]
+    fn pathbuf_maps_to_path_or_str_py310() {
+        let ty = parse_ty("PathBuf");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Path | str");
+        assert!(m.needs_path_import);
+        assert!(!m.needs_union);
+        assert!(!m.needs_any);
+    }
+
+    /// Rust `std::path::PathBuf` (fully qualified) maps to path-like.
+    #[test]
+    fn std_path_pathbuf_maps_to_path_or_str() {
+        let ty = parse_ty("std::path::PathBuf");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Path | str");
+        assert!(m.needs_path_import);
+    }
+
+    /// Rust `Path` (e.g. &Path) maps to path-like after reference is stripped.
+    #[test]
+    fn path_maps_to_path_or_str() {
+        let ty = parse_ty("Path");
+        let m = map_type(&ty, &p(true), None, &no_classes());
+        assert_eq!(m.py_type, "Path | str");
+        assert!(m.needs_path_import);
     }
 
     /// `Self` without a class context falls back to `Any` (py < 3.11).

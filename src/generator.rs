@@ -17,6 +17,8 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
         needs_any: false,
         needs_optional: false,
         needs_self_import: false,
+        needs_path_import: false,
+        needs_union: false,
         warnings: pre_warnings,
         current_self_type: None,
         known_classes,
@@ -52,11 +54,18 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
     if ctx.needs_self_import {
         typing_parts.push("Self");
     }
+    if ctx.needs_union {
+        typing_parts.push("Union");
+    }
     if !typing_parts.is_empty() {
         out.push_str(&format!(
             "from typing import {}\n\n",
             typing_parts.join(", ")
         ));
+    }
+
+    if ctx.needs_path_import {
+        out.push_str("from pathlib import Path\n\n");
     }
 
     out.push_str(&body);
@@ -93,6 +102,10 @@ struct GenCtx<'a> {
     needs_optional: bool,
     /// Whether any mapping emitted the `Self` keyword (py ≥ 3.11, PEP 673).
     needs_self_import: bool,
+    /// Whether any mapping used pathlib.Path (Rust PathBuf/Path → Path | str).
+    needs_path_import: bool,
+    /// Whether any mapping used Union[...] (py < 3.10 style, e.g. Union[Path, str]).
+    needs_union: bool,
     warnings: Vec<String>,
     /// Set to the Python class name while generating methods for that class,
     /// so that Rust `Self` return types resolve correctly.
@@ -130,6 +143,12 @@ impl<'a> GenCtx<'a> {
         }
         if m.needs_self_import {
             self.needs_self_import = true;
+        }
+        if m.needs_path_import {
+            self.needs_path_import = true;
+        }
+        if m.needs_union {
+            self.needs_union = true;
         }
         if m.is_unknown {
             match self.config.fallback.strategy {
