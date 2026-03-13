@@ -13,7 +13,28 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Python-version-aware output (`T | None` for ≥ 3.10, `Optional[T]` for older)
 - Zero-config by default; optionally configured via `rylai.toml`
 
+## Why Rylai?
+
+Compared with other tools that generate `.pyi` stubs for PyO3 projects, Rylai offers:
+
+- **No compilation** — Rylai parses Rust source code directly (via [syn](https://github.com/dtolnay/syn)). You don’t need to build the crate or depend on compiled artifacts, so stub generation is fast and works even when the project doesn’t compile (e.g. missing native deps or wrong toolchain).
+- **No code changes** — No need to add build scripts, `#[cfg]` blocks, or extra annotations to your Rust code. Point Rylai at your crate root and it reads existing `#[pymodule]` / `#[pyfunction]` / `#[pyclass]` as-is.
+- **No Python version lock-in** — Stubs are plain text. You generate them once and use them with any Python version; there’s no dependency on a specific Python interpreter or ABI, so you avoid “built for Python 3.x” issues and cross-version workflows stay simple.
+
+Together, this makes Rylai easy to integrate into CI, docs, or local dev without touching your PyO3 code or your Python environment.
+
 ## Installation
+
+Choose one of the following:
+
+| Method | Command | Notes |
+|--------|---------|--------|
+| **Cargo** | `cargo install rylai` | Build from source and install to `~/.cargo/bin` |
+| **uv** | `uv tool install rylai` | Install to uv tools dir; requires [publish to PyPI](https://pypi.org/project/rylai/) first |
+| **uvx** | `uvx rylai` | Run without installing (same as uv; requires PyPI release) |
+| **crgx** | `crgx rylai` | Run pre-built binary without compiling; requires [crgx](https://github.com/yfedoseev/crgx) and a GitHub Release |
+
+For local development:
 
 ```bash
 cargo install --path .

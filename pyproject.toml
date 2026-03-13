@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.10, <2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rylai"
+dynamic = ["version"]
+description = "Generate Python .pyi stub files from pyo3-annotated Rust source code statically without compilation"
+
+license = { text = "MIT" }
+authors = [
+    { name = "monchin", email = "mench92@126.com" }
+]
+keywords = ["pyo3", "stub", "pyi", "python", "type-hint"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Code Generators",
+]
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/monchin/Rylai"
+Repository = "https://github.com/monchin/Rylai"
+Changelog = "https://github.com/monchin/Rylai/blob/master/CHANGELOG.md"
+
+[tool.maturin]
+# Package Rust binary only (no Python bindings); provides the `rylai` command when installed
+bindings = "bin"
+strip = true
