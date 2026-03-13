@@ -165,10 +165,11 @@ jobs:
           name: wheels
           path: dist/wheels
 
-      - uses: PyO3/maturin-action@v1
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          command: publish
-          args: --skip-existing --only-wheel dist/wheels/*
+          packages-dir: dist/wheels
+          skip-existing: true
 
   # ==========================
   # Publish to crates.io

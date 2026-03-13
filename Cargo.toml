@@ -12,7 +12,7 @@ license = "MIT"
 repository = "https://github.com/monchin/Rylai"
 homepage = "https://github.com/monchin/Rylai"
 keywords = ["pyo3", "stub", "pyi", "python", "type-hints"]
-categories = ["development-tools", "code-generation"]
+categories = ["development-tools", "development-tools::ffi"]
 
 [[bin]]
 name = "rylai"
