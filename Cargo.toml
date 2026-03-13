@@ -3,10 +3,16 @@ members = [".", "examples/pyo3_sample"]
 resolver = "2"
 
 [package]
-name = "rylai-stub-gen"
+name = "rylai"
 version = "0.1.0"
 edition = "2024"
-description = "Generate Python .pyi stub files from pyo3-annotated Rust source code"
+authors = ["monchin <mench92@126.com>"]
+description = "Generate Python .pyi stub files from pyo3-annotated Rust source code statically without compilation"
+license = "MIT"
+repository = "https://github.com/monchin/Rylai"
+homepage = "https://github.com/monchin/Rylai"
+keywords = ["pyo3", "stub", "pyi", "python", "type-hints"]
+categories = ["development-tools", "code-generation"]
 
 [[bin]]
 name = "rylai"

@@ -1,0 +1,27 @@
+# See https://pre-commit.com for usage
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        pass_filenames: false
+
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --workspace
+        language: system
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false

@@ -1,5 +1,7 @@
 # Rylai
 
+[![CI](https://github.com/monchin/Rylai/actions/workflows/ci.yml/badge.svg)](https://github.com/monchin/Rylai/actions/workflows/ci.yml)
+
 Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-annotated Rust source code — **statically, without compilation**.
 
 ## Features
@@ -131,6 +133,10 @@ stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
 | `PyResult<T>` | `T` (errors become Python exceptions) |
 | `Py<T>`, `Bound<T>` | recurse into `T` |
 | Unknown types | `Any` (configurable) |
+
+## Contributing
+
+Before committing, run the pre-commit checks with [prek](https://github.com/j178/prek). See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
