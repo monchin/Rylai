@@ -72,24 +72,46 @@ jobs:
             rylai-*.zip
 
   # ==========================
-  # Build Python wheels
+  # Build Python wheels (Linux / Windows / macOS x86_64 + arm64)
   # ==========================
   build-wheels:
-    name: Build wheels
-    runs-on: ubuntu-latest
+    name: Build wheels (${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux
+            target: ""
+          - os: windows-latest
+            artifact_suffix: windows
+            target: ""
+          - os: macos-latest
+            artifact_suffix: macos-x64
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            artifact_suffix: macos-arm64
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Add Rust target (macOS cross-compile)
+        if: matrix.target != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          manylinux: manylinux_2_17
-          args: --release --strip --out dist
+          manylinux: ${{ matrix.os == 'ubuntu-latest' && 'manylinux_2_17' || '' }}
+          args: --release --strip --out dist ${{ matrix.target != '' && '--target ' || '' }}${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.artifact_suffix }}
           path: dist
 
   # ==========================
@@ -160,10 +182,32 @@ jobs:
       contents: read
 
     steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux
+          path: dist/wheels-linux
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
-          path: dist/wheels
+          name: wheels-windows
+          path: dist/wheels-windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-x64
+          path: dist/wheels-macos-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-arm64
+          path: dist/wheels-macos-arm64
+
+      - name: Merge wheels into one directory
+        run: |
+          mkdir -p dist/wheels
+          cp dist/wheels-linux/*.whl dist/wheels/ 2>/dev/null || true
+          cp dist/wheels-windows/*.whl dist/wheels/ 2>/dev/null || true
+          cp dist/wheels-macos-x64/*.whl dist/wheels/ 2>/dev/null || true
+          cp dist/wheels-macos-arm64/*.whl dist/wheels/ 2>/dev/null || true
+          ls -la dist/wheels/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
