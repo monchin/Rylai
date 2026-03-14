@@ -31,11 +31,13 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load config (optional, zero-config works)
-    let config_path = cli
+    // Load config: merge [tool.rylai] from pyproject.toml (base) and rylai.toml (override).
+    // Duplicate keys are resolved in favor of rylai.toml.
+    let rylai_toml_path = cli
         .config
         .unwrap_or_else(|| cli.crate_root.join("rylai.toml"));
-    let config = config::Config::load_or_default(&config_path)?;
+    let pyproject_path = cli.crate_root.join("pyproject.toml");
+    let config = config::Config::load_merged(&rylai_toml_path, &pyproject_path)?;
 
     // Collect all pyo3 items from the crate
     let items = collector::collect_crate(&cli.crate_root, &config)?;

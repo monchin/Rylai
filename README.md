@@ -106,7 +106,14 @@ def sum_as_string(a: int, b: int) -> str:
 
 ## Configuration
 
-Place a `rylai.toml` in your crate root to customize behavior. All sections are optional.
+You can configure rylai in either (or both) of these places:
+
+- **`rylai.toml`** in the crate root
+- **`[tool.rylai]`** in `pyproject.toml`
+
+When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]` / `[[tool.rylai.override]]`) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
+
+Example `rylai.toml`:
 
 ```toml
 [output]
@@ -134,6 +141,23 @@ enabled = ["some_feature"]
 
 [[override]]
 # Manually written stub for a specific item (takes precedence over generated output)
+item = "my_module::complex_function"
+stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+```
+
+The same options can be set in `pyproject.toml` under `[tool.rylai]`:
+
+```toml
+[tool.rylai.output]
+python_version = "3.10"
+
+[tool.rylai.fallback]
+strategy = "any"
+
+[tool.rylai.type_map]
+"numpy::PyReadonlyArray1" = "numpy.ndarray"
+
+[[tool.rylai.override]]
 item = "my_module::complex_function"
 stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
 ```

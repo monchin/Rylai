@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -129,14 +129,48 @@ impl RenderPolicy {
     }
 }
 
-impl Config {
-    /// Load from file if it exists; return default config if the file is absent.
-    pub fn load_or_default(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+/// Deep-merge two TOML values; keys in `override_val` take precedence over `base`.
+/// Array tables (e.g. `[[override]]`) are replaced as a whole, not merged item-by-item.
+fn deep_merge_toml(base: toml::Value, override_val: &toml::Value) -> toml::Value {
+    use toml::Value;
+    match (base, override_val) {
+        (Value::Table(mut base_t), Value::Table(override_t)) => {
+            for (k, ov) in override_t {
+                let merged = base_t
+                    .remove(k.as_str())
+                    .map(|b| deep_merge_toml(b, ov))
+                    .unwrap_or_else(|| ov.clone());
+                base_t.insert(k.clone(), merged);
+            }
+            Value::Table(base_t)
         }
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&content)?;
+        (_, override_v) => override_v.clone(),
+    }
+}
+
+/// Read `[tool.rylai]` from pyproject.toml if present.
+fn tool_rylai_from_pyproject(path: &Path) -> Option<toml::Value> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let doc: toml::Value = content.parse().ok()?;
+    doc.get("tool").and_then(|t| t.get("rylai")).cloned()
+}
+
+impl Config {
+    /// Load config by merging `[tool.rylai]` from pyproject.toml (base) and rylai.toml (override).
+    /// When both exist, duplicate keys are resolved in favor of rylai.toml; otherwise both apply.
+    pub fn load_merged(rylai_toml_path: &Path, pyproject_path: &Path) -> Result<Self> {
+        let base = tool_rylai_from_pyproject(pyproject_path)
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        let override_val = if rylai_toml_path.exists() {
+            let content = std::fs::read_to_string(rylai_toml_path)?;
+            toml::from_str(&content).context("parse rylai.toml")?
+        } else {
+            toml::Value::Table(Default::default())
+        };
+        let merged = deep_merge_toml(base, &override_val);
+        let config: Self = merged
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid config structure: {}", e))?;
         Ok(config)
     }
 
@@ -237,12 +271,15 @@ mod tests {
         assert!(!p.future_annotations);
     }
 
-    // ── Config::load_or_default ──────────────────────────────────────────────
+    // ── Config::load_merged ───────────────────────────────────────────────────
 
     #[test]
-    fn load_or_default_returns_default_when_file_absent() {
-        let path = std::path::Path::new("/no/such/rylai.toml");
-        let config = Config::load_or_default(path).expect("absent file must not error");
+    fn load_merged_returns_default_when_both_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("no_rylai_absent.toml");
+        let pyproject = dir.path().join("no_pyproject_absent.toml");
+        let config =
+            Config::load_merged(&rylai_toml, &pyproject).expect("absent files must not error");
         assert_eq!(
             config.output.python_version, "3.10",
             "default python version"
@@ -253,12 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn load_or_default_parses_valid_toml() {
+    fn load_merged_parses_valid_rylai_toml_only() {
         use std::io::Write;
-        let dir = std::env::temp_dir();
-        let path = dir.join("rylai_test_valid.toml");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("rylai_merged_valid.toml");
+        let pyproject = dir.path().join("pyproject_merged_nonexist.toml");
         {
-            let mut f = std::fs::File::create(&path).expect("create temp file");
+            let mut f = std::fs::File::create(&rylai_toml).expect("create temp file");
             write!(
                 f,
                 r#"
@@ -280,8 +318,7 @@ stub = "def my_fn() -> int: ..."
             .expect("write temp file");
         }
 
-        let config = Config::load_or_default(&path).expect("valid toml must parse");
-        let _ = std::fs::remove_file(&path);
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("valid toml must parse");
 
         assert_eq!(
             config
@@ -299,36 +336,178 @@ stub = "def my_fn() -> int: ..."
     }
 
     #[test]
-    fn load_or_default_errors_on_invalid_toml() {
+    fn load_merged_invalid_rylai_toml_errors() {
         use std::io::Write;
-        let dir = std::env::temp_dir();
-        let path = dir.join("rylai_test_invalid.toml");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("rylai_merged_invalid.toml");
+        let pyproject = dir.path().join("pyproject_merged_nonexist2.toml");
         {
-            let mut f = std::fs::File::create(&path).expect("create temp file");
+            let mut f = std::fs::File::create(&rylai_toml).expect("create temp file");
             write!(f, "this is not valid = [ toml").expect("write temp file");
         }
 
-        let result = Config::load_or_default(&path);
-        let _ = std::fs::remove_file(&path);
-
-        assert!(result.is_err(), "invalid TOML must return Err");
+        let result = Config::load_merged(&rylai_toml, &pyproject);
+        assert!(result.is_err(), "invalid rylai.toml must return Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("parse rylai.toml") || err.to_string().contains("toml"),
+            "error should mention rylai.toml or toml: {}",
+            err
+        );
     }
 
     #[test]
-    fn load_or_default_parses_features_enabled() {
+    fn load_merged_parses_features_from_rylai_toml() {
         use std::io::Write;
-        let mut temp = tempfile::NamedTempFile::new().expect("create temp file");
-        write!(
-            temp,
-            r#"
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("rylai_merged_features.toml");
+        let pyproject = dir.path().join("pyproject_merged_nonexist3.toml");
+        {
+            let mut f = std::fs::File::create(&rylai_toml).expect("create temp file");
+            write!(
+                f,
+                r#"
 [features]
 enabled = ["default", "extra"]
 "#
-        )
-        .expect("write temp file");
-        let path = temp.path();
+            )
+            .expect("write temp file");
+        }
 
-        let config = Config::load_or_default(path).expect("valid toml must parse");
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("valid toml must parse");
         assert_eq!(config.features.enabled, ["default", "extra"]);
+    }
+
+    #[test]
+    fn load_merged_only_pyproject() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pyproject = dir.path().join("pyproject_merge_test.toml");
+        let rylai_toml = dir.path().join("rylai_merge_nonexist.toml");
+        {
+            let mut f = std::fs::File::create(&pyproject).expect("create");
+            write!(
+                f,
+                r#"
+[project]
+name = "test"
+
+[tool.rylai.output]
+python_version = "3.9"
+add_header = false
+
+[tool.rylai.fallback]
+strategy = "skip"
+"#
+            )
+            .expect("write");
+        }
+
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("merge must succeed");
+        assert_eq!(config.output.python_version, "3.9");
+        assert!(!config.output.add_header);
+        assert_eq!(config.fallback.strategy, FallbackStrategy::Skip);
+    }
+
+    #[test]
+    fn load_merged_pyproject_parses_override_array() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pyproject = dir.path().join("pyproject_override_array_test.toml");
+        let rylai_toml = dir.path().join("rylai_nonexist_override_test.toml");
+        {
+            let mut f = std::fs::File::create(&pyproject).expect("create");
+            write!(
+                f,
+                r#"
+[project]
+name = "test"
+
+[tool.rylai.output]
+python_version = "3.11"
+
+[[tool.rylai.override]]
+item = "my_module::complex_function"
+stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+
+[[tool.rylai.override]]
+item = "other::fn"
+stub = "def fn() -> int: ..."
+"#
+            )
+            .expect("write");
+        }
+
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("merge must succeed");
+        assert_eq!(config.output.python_version, "3.11");
+        assert_eq!(config.overrides.len(), 2);
+        assert_eq!(config.overrides[0].item, "my_module::complex_function");
+        assert_eq!(
+            config.overrides[0].stub,
+            "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+        );
+        assert_eq!(config.overrides[1].item, "other::fn");
+        assert_eq!(config.overrides[1].stub, "def fn() -> int: ...");
+    }
+
+    #[test]
+    fn load_merged_rylai_toml_overrides_duplicate_keys() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pyproject = dir.path().join("pyproject_override_test.toml");
+        let rylai_toml = dir.path().join("rylai_override_test.toml");
+        {
+            let mut f = std::fs::File::create(&pyproject).expect("create");
+            write!(
+                f,
+                r#"
+[project]
+name = "test"
+
+[tool.rylai.output]
+python_version = "3.9"
+add_header = true
+
+[tool.rylai.type_map]
+"foo::Bar" = "bar.Foo"
+"only::Pyproject" = "pyproject.Only"
+"#
+            )
+            .expect("write");
+        }
+        {
+            let mut f = std::fs::File::create(&rylai_toml).expect("create");
+            write!(
+                f,
+                r#"
+[output]
+python_version = "3.12"
+add_header = false
+
+[type_map]
+"foo::Bar" = "rylai.Wins"
+"only::Rylai" = "rylai.Only"
+"#
+            )
+            .expect("write");
+        }
+
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("merge must succeed");
+        // Duplicate keys: rylai.toml wins
+        assert_eq!(config.output.python_version, "3.12");
+        assert!(!config.output.add_header);
+        assert_eq!(
+            config.type_map.get("foo::Bar").map(String::as_str),
+            Some("rylai.Wins")
+        );
+        // Non-duplicate: both apply
+        assert_eq!(
+            config.type_map.get("only::Pyproject").map(String::as_str),
+            Some("pyproject.Only")
+        );
+        assert_eq!(
+            config.type_map.get("only::Rylai").map(String::as_str),
+            Some("rylai.Only")
+        );
     }
 }
