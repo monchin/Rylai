@@ -116,6 +116,14 @@ When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other
 Example `rylai.toml`:
 
 ```toml
+# Root-level keys (e.g. format) should appear before any [section] or [[array]] to avoid being parsed as part of a table.
+# After generating .pyi files, run these commands with the generated .pyi paths appended.
+# Only use when you trust this config file — commands are executed as configured.
+# Each command must be executable (on PATH or use a full path); rylai will error if it cannot be run.
+# Empty or whitespace-only entries are ignored.
+# You may need "uvx ruff" or "uv/pdm run ruff" instead of "ruff"
+format = ["ruff format", "ruff check --select I --fix"]
+
 [output]
 # Target Python version — affects Optional[T] vs T | None syntax (default: "3.10")
 python_version = "3.10"
@@ -160,6 +168,9 @@ strategy = "any"
 [[tool.rylai.override]]
 item = "my_module::complex_function"
 stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+
+[tool.rylai]
+format = ["isort", "black"]
 ```
 
 ## Supported Type Mappings

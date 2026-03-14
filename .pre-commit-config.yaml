@@ -1,4 +1,7 @@
 # See https://pre-commit.com for usage
+# Note: cargo-check and cargo-clippy use -p rylai (main crate only) so prek/local
+# hooks do not require Python. examples/pyo3_sample depends on pyo3 and needs a
+# Python interpreter; CI still uses --workspace (runners have Python).
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -16,12 +19,12 @@ repos:
 
       - id: cargo-check
         name: cargo check
-        entry: cargo check --workspace
+        entry: cargo check -p rylai
         language: system
         pass_filenames: false
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: cargo clippy -p rylai --all-targets -- -D warnings
         language: system
         pass_filenames: false

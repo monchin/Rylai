@@ -3,9 +3,10 @@ mod config;
 mod generator;
 mod type_map;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,6 +47,8 @@ fn main() -> Result<()> {
     let out_dir = cli.output.unwrap_or_else(|| cli.crate_root.clone());
     std::fs::create_dir_all(&out_dir)?;
 
+    let mut generated_paths: Vec<PathBuf> = Vec::new();
+
     if items.is_empty() {
         // No pymodules found: write an empty stub using the best-guess name
         let name = infer_module_name_from_pyproject(&cli.crate_root)
@@ -55,6 +58,7 @@ fn main() -> Result<()> {
         let stub = generator::generate(&items, &config)?;
         std::fs::write(&path, stub)?;
         println!("Generated: {}", path.display());
+        generated_paths.push(path);
     } else {
         // One .pyi file per top-level #[pymodule]; name comes from the AST
         for module in &items {
@@ -62,9 +66,41 @@ fn main() -> Result<()> {
             let stub = generator::generate(std::slice::from_ref(module), &config)?;
             std::fs::write(&path, stub)?;
             println!("Generated: {}", path.display());
+            generated_paths.push(path);
         }
     }
 
+    if !config.format.is_empty() && !generated_paths.is_empty() {
+        run_format_commands(&config.format, &generated_paths)?;
+    }
+
+    Ok(())
+}
+
+/// Run each entry in `format` as a command with all generated .pyi paths appended.
+/// E.g. `ruff format` with paths [a.pyi, b.pyi] runs `ruff format a.pyi b.pyi`.
+/// Empty or whitespace-only entries are skipped.
+fn run_format_commands(format_commands: &[String], pyi_paths: &[PathBuf]) -> Result<()> {
+    for cmd_str in format_commands {
+        let cmd_str = cmd_str.trim();
+        if cmd_str.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        let (program, args) = match parts.split_first() {
+            Some((p, rest)) => (*p, rest.to_vec()),
+            None => continue,
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(&args);
+        cmd.args(pyi_paths);
+        let status = cmd
+            .status()
+            .with_context(|| format!("failed to run format command: {}", cmd_str))?;
+        if !status.success() {
+            anyhow::bail!("format command exited with {}: {}", status, cmd_str);
+        }
+    }
     Ok(())
 }
 

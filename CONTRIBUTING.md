@@ -18,13 +18,15 @@ This installs the Git hook so that **every commit** runs the configured checks a
 
 The hook runs the same checks as in `.pre-commit-config.yaml`:
 
-| Hook          | Purpose                                      |
-|---------------|----------------------------------------------|
-| `check-yaml`  | Validate YAML syntax (e.g. GitHub workflows) |
-| `check-toml`  | Validate TOML syntax (e.g. `Cargo.toml`)     |
-| `cargo-fmt`   | Format Rust code with `cargo fmt --all`     |
-| `cargo-check` | `cargo check --workspace`                   |
-| `cargo-clippy`| `cargo clippy --workspace --all-targets -- -D warnings` |
+| Hook          | Purpose                                                       |
+|---------------|---------------------------------------------------------------|
+| `check-yaml`  | Validate YAML syntax (e.g. GitHub workflows)                  |
+| `check-toml`  | Validate TOML syntax (e.g. `Cargo.toml`)                      |
+| `cargo-fmt`   | Format Rust code with `cargo fmt --all`                      |
+| `cargo-check` | `cargo check -p rylai` (main crate only; no Python required) |
+| `cargo-clippy`| `cargo clippy -p rylai --all-targets -- -D warnings`          |
+
+CI still runs `cargo check/clippy --workspace` (including the pyo3 example); runners have Python.
 
 If any step fails, the commit is aborted. Fix the reported issues and try again.
 

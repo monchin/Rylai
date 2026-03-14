@@ -21,6 +21,11 @@ pub struct Config {
     /// Manual stub overrides for specific items
     #[serde(default, rename = "override")]
     pub overrides: Vec<OverrideEntry>,
+
+    /// After generating .pyi files, run these format commands with generated .pyi paths appended.
+    /// Each entry is a command string, e.g. "ruff format", "black", "ruff check --select I --fix".
+    #[serde(default)]
+    pub format: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -448,6 +453,30 @@ stub = "def fn() -> int: ..."
         );
         assert_eq!(config.overrides[1].item, "other::fn");
         assert_eq!(config.overrides[1].stub, "def fn() -> int: ...");
+    }
+
+    #[test]
+    fn load_merged_parses_format_commands() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("rylai_format_test.toml");
+        let pyproject = dir.path().join("pyproject_nonexist.toml");
+        {
+            let mut f = std::fs::File::create(&rylai_toml).expect("create");
+            write!(
+                f,
+                r#"
+format = ["ruff format", "ruff check --select I --fix", "black"]
+"#
+            )
+            .expect("write");
+        }
+
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("valid toml must parse");
+        assert_eq!(config.format.len(), 3);
+        assert_eq!(config.format[0], "ruff format");
+        assert_eq!(config.format[1], "ruff check --select I --fix");
+        assert_eq!(config.format[2], "black");
     }
 
     #[test]
