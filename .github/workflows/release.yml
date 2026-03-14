@@ -128,6 +128,24 @@ jobs:
       contents: write   # create release and upload assets
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          awk -v ver="$VER" '
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ "\\[" ver "\\]") found = 1
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes.md
+          echo "Extracted notes for version $VER"
+          head -20 release_notes.md
+
       - uses: actions/download-artifact@v4
         with:
           name: bin-x86_64-unknown-linux-gnu
@@ -167,6 +185,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release_notes.md
           files: release/*
 
   # ==========================
