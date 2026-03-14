@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rylai"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["monchin <mench92@126.com>"]
 description = "Generate Python .pyi stub files from pyo3-annotated Rust source code statically without compilation"
