@@ -177,18 +177,36 @@ format = ["isort", "black"]
 
 | Rust type | Python type |
 |---|---|
-| `i8` … `usize` | `int` |
+| **Scalars** | |
+| `i8` … `i128`, `u8` … `u128`, `isize`, `usize` | `int` |
 | `f32`, `f64` | `float` |
 | `bool` | `bool` |
-| `str`, `String` | `str` |
+| `str`, `String`, `char` | `str` |
 | `()` | `None` |
+| **Bytes** | |
+| `&[u8]`, `[u8]` | `bytes` |
+| `Vec<u8>` | `bytes` |
+| **Path-like** | |
+| `Path`, `PathBuf` (incl. `std::path::*`) | `Path \| str` / `Union[Path, str]` |
+| **Containers** | |
 | `Option<T>` | `T \| None` / `Optional[T]` |
 | `Vec<T>` | `list[T]` |
-| `HashMap<K,V>`, `BTreeMap<K,V>` | `dict[K, V]` |
+| `(T1, T2, ...)` (non-empty tuple) | `tuple[T1, T2, ...]` |
+| `HashMap<K,V>`, `BTreeMap<K,V>`, `IndexMap<K,V>` | `dict[K, V]` |
 | `HashSet<T>`, `BTreeSet<T>` | `set[T]` |
-| `PyResult<T>` | `T` (errors become Python exceptions) |
-| `Py<T>`, `Bound<T>` | recurse into `T` |
-| Unknown types | `Any` (configurable) |
+| **PyO3 types** | |
+| `PyResult<T>`, `Result<T, E>` | `T` (errors become Python exceptions) |
+| `Py<T>`, `Bound<T>`, `Borrowed<T>` | recurse into `T` |
+| `PyRef<T>`, `PyRefMut<T>` | recurse into `T` |
+| `PyBytes` | `bytes` |
+| `PyByteArray` | `bytearray` |
+| `PyString` | `str` |
+| `PyDict`, `PyList`, `PyTuple`, `PySet` | `dict`, `list`, `tuple`, `set` |
+| `PyAny`, `PyObject` | `Any` |
+| **Other** | |
+| `Self` (in `#[pymethods]`) | `Self` (py ≥ 3.11) or class name |
+| `#[pyclass]` structs/enums | Python class name (from crate) |
+| Unknown types | `Any` (configurable via `[fallback]`) |
 
 ## Contributing
 
