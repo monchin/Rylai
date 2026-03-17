@@ -208,6 +208,16 @@ format = ["isort", "black"]
 | `#[pyclass]` structs/enums | Python class name (from crate) |
 | Unknown types | `Any` (configurable via `[fallback]`) |
 
+## Limitation
+
+Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. declarative macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
+
+For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
+
+For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). In that case, avoid Python-related PyO3 code that is hard to analyze without compilation — for example **declarative macros** that expand at compile time and inject `#[pyfunction]` / `#[pyclass]`; Rylai cannot see those statically and may not generate the corresponding stubs correctly.
+
+Related support is planned, but Rylai cannot generate stubs for all possible PyO3 code.
+
 ## Contributing
 
 Before committing, run the pre-commit checks with [prek](https://github.com/j178/prek). See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
