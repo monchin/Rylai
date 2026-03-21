@@ -9,8 +9,8 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Parses `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations directly from Rust source
 - Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]`, `Option<T>` → `T | None`, etc.)
 - Extracts doc comments and emits them as Python docstrings
-- Generates one `.pyi` file per top-level `#[pymodule]`
-- Python-version-aware output (`T | None` for ≥ 3.10, `Optional[T]` for older)
+- Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits multiple `.pyi` files (package layout) so type checkers and runtime `__module__` agree
+- Python-version-aware output (`T | None` for ≥ 3.10, `Optional[T]` for older; `Self` type for >= 3.11, etc.)
 - Zero-config by default; optionally configured via `rylai.toml`
 
 ## Why Rylai?
@@ -103,6 +103,14 @@ Rylai produces `pyo3_sample.pyi`:
 def sum_as_string(a: int, b: int) -> str:
     """Formats the sum of two numbers as string."""
 ```
+
+### Multi-module stubs (`#[pyclass(module = "...")]`)
+
+If you annotate a class with PyO3’s `module` attribute, e.g. `#[pyclass(module = "abcd.efg")]`, Rylai will emit **multiple** `.pyi` files in a package layout instead of a single flat stub. Classes with a `module` value are written to the corresponding stub file (e.g. `abcd/efg.pyi`), while functions, constants, and classes without `module` stay in the root (e.g. `abcd/__init__.pyi`). This keeps type-checker module resolution in sync with Python’s `__module__` at runtime. If no class has `module` set, behavior is unchanged: one `{name}.pyi` per top-level `#[pymodule]`. If everything is routed to submodules so the package root would be empty, Rylai still writes `{root}/__init__.pyi` (possibly empty, but still carrying the pymodule docstring when present) so the output tree remains a package.
+
+When using `--output` / `-o`, you can point either at a **parent** directory (e.g. `stubs/` → `stubs/abcd/__init__.pyi`) or directly at the **package directory** whose name matches the top-level `#[pymodule]` (e.g. `-o python/abcd` → `python/abcd/__init__.pyi` without an extra `abcd/` segment).
+
+If `pyproject.toml` sets `[tool.maturin] module-name` to a **submodule** of the pymodule (e.g. `abcd.abcd`), constants and functions collected from `m.add(...)` / `m.add_function(...)` are emitted into that submodule’s stub (e.g. `abcd/abcd.pyi`), matching the compiled extension module, not the package-root stub alone. Rylai still writes `abcd/__init__.pyi` (possibly empty) so the output tree remains a package layout.
 
 ## Configuration
 

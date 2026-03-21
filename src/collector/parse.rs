@@ -3,8 +3,8 @@ use crate::config::Config;
 use std::collections::HashMap;
 use std::path::Path;
 use syn::{
-    Attribute, Expr, Fields, FnArg, ImplItem, Item, ItemFn, ItemMod, Lit, Meta, Pat, ReturnType,
-    Signature, Type, TypePath,
+    Attribute, Expr, Fields, FnArg, ImplItem, Item, ItemFn, ItemMod, Lit, LitStr, Meta, Pat,
+    ReturnType, Signature, Type, TypePath,
 };
 
 /// Maximum recursion depth when expanding type aliases to avoid infinite loops.
@@ -700,6 +700,7 @@ fn parse_pyclass_struct(
     PyClass {
         name: display_name.to_string(),
         rust_name: rust_name_for_impl.to_string(),
+        module: extract_pyclass_module(attrs),
         doc,
         methods,
         source_file: path.to_path_buf(),
@@ -1182,6 +1183,41 @@ pub fn extract_pyo3_name(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
+/// Extract `#[pyclass(module = "abcd.efg")]` from attributes.
+/// Only considers `#[pyclass(...)]` attributes; `#[pyo3(module=...)]` is ignored.
+/// Uses `parse_nested_meta` so string literals (including raw strings) parse correctly.
+pub fn extract_pyclass_module(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("pyclass") {
+            continue;
+        }
+        let mut found: Option<String> = None;
+        if attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("module") {
+                    let value = meta.value()?;
+                    let s: LitStr = value.parse()?;
+                    let v = s.value();
+                    if !v.is_empty() {
+                        found = Some(v);
+                    }
+                    return Ok(());
+                }
+                // `parse_nested_meta` requires each nested item to be fully consumed.
+                if meta.input.peek(syn::token::Eq) {
+                    let _ = meta.value()?.parse::<Expr>()?;
+                }
+                Ok(())
+            })
+            .is_ok()
+            && found.is_some()
+        {
+            return found;
+        }
+    }
+    None
+}
+
 /// Returns true for pyo3 "injected" parameter types that should not appear in the Python stub:
 /// `Python<'_>`, `&Bound<'_, PyModule>`, etc.
 fn is_pyo3_injected_param(ty: &Type) -> bool {
@@ -1318,6 +1354,53 @@ mod tests {
         assert_eq!(
             extract_pyo3_name(&item.attrs),
             Some("PdfDocument".to_string())
+        );
+    }
+
+    // ── extract_pyclass_module ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_pyclass_module_present() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(module = "abcd.efg")]
+            struct Layer {}
+        };
+        assert_eq!(
+            extract_pyclass_module(&item.attrs),
+            Some("abcd.efg".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_pyclass_module_absent() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass]
+            struct Foo {}
+        };
+        assert_eq!(extract_pyclass_module(&item.attrs), None);
+    }
+
+    #[test]
+    fn extract_pyclass_module_with_name() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(name = "MyLayer", module = "abcd.efg")]
+            struct RustLayer {}
+        };
+        assert_eq!(
+            extract_pyclass_module(&item.attrs),
+            Some("abcd.efg".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_pyclass_module_raw_string_literal() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(module = r"abcd.efg")]
+            struct Layer {}
+        };
+        assert_eq!(
+            extract_pyclass_module(&item.attrs),
+            Some("abcd.efg".to_string())
         );
     }
 
@@ -2109,7 +2192,7 @@ impl PyPdfDocument {
 }
 
 #[pymodule]
-fn pdf_oxide(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+fn abcd(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
     m.add_class::<PyPdfDocument>()?;
     Ok(())
 }

@@ -10,8 +10,19 @@ use std::collections::HashMap;
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
-    let policy = config.render_policy();
     let (known_classes, pre_warnings) = collect_class_names(modules);
+    generate_with_known_classes(modules, config, &known_classes, &pre_warnings)
+}
+
+/// Generate .pyi content for the given modules using a pre-computed Rust→Python class name map.
+/// Used when emitting multiple stubs so that cross-module type references resolve correctly.
+pub fn generate_with_known_classes(
+    modules: &[PyModule],
+    config: &Config,
+    known_classes: &HashMap<String, String>,
+    pre_warnings: &[String],
+) -> Result<String> {
+    let policy = config.render_policy();
     let mut ctx = GenCtx {
         config,
         policy,
@@ -21,9 +32,9 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
         needs_path_import: false,
         needs_union: false,
         needs_final: false,
-        warnings: pre_warnings,
+        warnings: pre_warnings.to_vec(),
         current_self_type: None,
-        known_classes,
+        known_classes: known_classes.clone(),
     };
 
     let mut body = String::new();
@@ -461,7 +472,7 @@ impl<'a> GenCtx<'a> {
 ///
 /// If two `#[pyclass]` items in different modules share the same Rust name but map to
 /// different Python names, the first registration wins and a warning is emitted.
-fn collect_class_names(modules: &[PyModule]) -> (HashMap<String, String>, Vec<String>) {
+pub fn collect_class_names(modules: &[PyModule]) -> (HashMap<String, String>, Vec<String>) {
     let mut map = HashMap::new();
     let mut warnings = Vec::new();
     for m in modules {
@@ -598,6 +609,7 @@ mod tests {
         PyClass {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
+            module: None,
             doc: vec![],
             methods: vec![PyMethod {
                 name: method_name.to_string(),
@@ -627,6 +639,28 @@ mod tests {
 
     fn stub_for_config(items: Vec<PyItem>, config: &Config) -> String {
         generate(&[make_module(items)], config).unwrap()
+    }
+
+    /// generate_with_known_classes resolves return types using the provided map,
+    /// so a function in the root stub that returns a class from another stub (e.g. Layer)
+    /// emits the class name, not Any.
+    #[test]
+    fn generate_with_known_classes_resolves_cross_module_class_in_return_type() {
+        let root_module = make_module(vec![PyItem::Function(make_fn(
+            "get_layer",
+            None,
+            vec![],
+            syn::parse_quote! { pyo3::PyResult<Layer> },
+        ))]);
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let stub =
+            generate_with_known_classes(&[root_module], &Config::default(), &known_classes, &[])
+                .unwrap();
+        assert!(
+            stub.contains("-> Layer"),
+            "return type should resolve to Layer from known_classes, not Any; got:\n{stub}"
+        );
     }
 
     // ── split_at_top_level_commas ────────────────────────────────────────────
@@ -961,6 +995,7 @@ mod tests {
         PyClass {
             name: python_name.to_string(),
             rust_name: rust_name.to_string(),
+            module: None,
             doc: vec![],
             methods: vec![],
             source_file: dummy_path(),
@@ -1185,6 +1220,7 @@ mod tests {
         PyClass {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
+            module: None,
             doc: vec![],
             methods,
             source_file: dummy_path(),
