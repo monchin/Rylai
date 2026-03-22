@@ -171,6 +171,15 @@ pub(crate) struct ParseContext<'a> {
     pub pyclass_attrs_map: &'a PyclassAttrsMap,
 }
 
+/// Context for walking `m.add` / `m.add_function` / `m.add_class` in Style B pymodule functions and in
+/// declarative `#[pymodule_init]`.
+struct CollectAddCallsContext<'a> {
+    file_items: &'a [Item],
+    path: &'a Path,
+    pyclass_name_map: &'a HashMap<String, String>,
+    cx: ParseContext<'a>,
+}
+
 /// Extract all `#[pymodule]` items from a parsed file.
 ///
 /// `impl_map` (inside `cx`) must be the **global** map built by [`build_impl_map`] across the
@@ -192,7 +201,7 @@ pub fn extract_modules_from_file(
             // Style A: #[pymodule] mod Foo { ... }
             Item::Mod(m) if has_attr(&m.attrs, "pymodule") => {
                 if cfg_is_active(&m.attrs, &cx.config.features.enabled)
-                    && let Some(module) = parse_mod_style_module(m, path, cx)
+                    && let Some(module) = parse_mod_style_module(m, path, pyclass_name_map, cx)
                 {
                     result.push(module);
                 }
@@ -214,12 +223,17 @@ pub fn extract_modules_from_file(
 
 // ── Style A: inline mod ──────────────────────────────────────────────────────
 
-fn parse_mod_style_module(m: &ItemMod, path: &Path, cx: ParseContext<'_>) -> Option<PyModule> {
+fn parse_mod_style_module(
+    m: &ItemMod,
+    path: &Path,
+    pyclass_name_map: &HashMap<String, String>,
+    cx: ParseContext<'_>,
+) -> Option<PyModule> {
     let (_, items) = m.content.as_ref()?;
     let name = m.ident.to_string();
     let doc = extract_doc(&m.attrs);
 
-    let py_items = collect_items_from_list(items, path, cx);
+    let py_items = collect_items_from_list(items, path, pyclass_name_map, cx);
 
     Some(PyModule {
         name,
@@ -229,7 +243,12 @@ fn parse_mod_style_module(m: &ItemMod, path: &Path, cx: ParseContext<'_>) -> Opt
     })
 }
 
-fn collect_items_from_list(items: &[Item], path: &Path, cx: ParseContext<'_>) -> Vec<PyItem> {
+fn collect_items_from_list(
+    items: &[Item],
+    path: &Path,
+    pyclass_name_map: &HashMap<String, String>,
+    cx: ParseContext<'_>,
+) -> Vec<PyItem> {
     let enabled = &cx.config.features.enabled;
     let mut result = Vec::new();
     for item in items {
@@ -260,9 +279,23 @@ fn collect_items_from_list(items: &[Item], path: &Path, cx: ParseContext<'_>) ->
             // Nested submodule
             Item::Mod(sub) if has_attr(&sub.attrs, "pymodule") => {
                 if cfg_is_active(&sub.attrs, enabled)
-                    && let Some(sub_mod) = parse_mod_style_module(sub, path, cx)
+                    && let Some(sub_mod) = parse_mod_style_module(sub, path, pyclass_name_map, cx)
                 {
                     result.push(PyItem::Module(sub_mod));
+                }
+            }
+            // Declarative `#[pymodule] mod foo { #[pymodule_init] fn init(m) { m.add(...); } }`
+            Item::Fn(f) if has_attr(&f.attrs, "pymodule_init") => {
+                if cfg_is_active(&f.attrs, enabled) {
+                    let ctx = CollectAddCallsContext {
+                        file_items: items,
+                        path,
+                        pyclass_name_map,
+                        cx,
+                    };
+                    for stmt in &f.block.stmts {
+                        collect_add_calls_from_stmt(stmt, &ctx, &mut result);
+                    }
                 }
             }
             _ => {}
@@ -304,13 +337,6 @@ fn parse_fn_style_module(
     })
 }
 
-struct CollectAddCallsContext<'a> {
-    file_items: &'a [Item],
-    path: &'a Path,
-    pyclass_name_map: &'a HashMap<String, String>,
-    cx: ParseContext<'a>,
-}
-
 fn collect_add_calls_from_stmt(
     stmt: &syn::Stmt,
     ctx: &CollectAddCallsContext<'_>,
@@ -337,6 +363,11 @@ fn collect_add_calls_from_expr(
     match expr {
         // m.add_function(...)?  or  m.add_class::<T>()?
         Expr::Try(t) => collect_add_calls_from_expr(&t.expr, ctx, out),
+        Expr::Block(b) => {
+            for stmt in &b.block.stmts {
+                collect_add_calls_from_stmt(stmt, ctx, out);
+            }
+        }
         Expr::MethodCall(mc) => {
             let method = mc.method.to_string();
             match method.as_str() {
@@ -2474,7 +2505,6 @@ mod outer {
     }
 
     // ── Style B: m.add("name", value) → module-level constant ──────────────
-
     #[test]
     fn style_b_add_constant_infers_str_from_env_macro() {
         let file = syn::parse_file(
