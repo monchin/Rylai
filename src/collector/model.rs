@@ -72,6 +72,8 @@ pub struct PyClass {
     /// This is the name that appears in function return-type signatures and is needed
     /// to look up the Python name when the two differ.
     pub rust_name: String,
+    /// If present, from `#[pyclass(module = "...")]`; used to emit the class into a separate .pyi (e.g. abcd.efg).
+    pub module: Option<String>,
     pub doc: Vec<String>,
     pub methods: Vec<PyMethod>,
     /// Source file for diagnostics (reserved for future use)

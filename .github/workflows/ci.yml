@@ -34,10 +34,10 @@ jobs:
           workspaces: . -> target
 
       - name: Build (workspace)
-        run: cargo build --workspace --all-targets
+        run: cargo build --all-targets
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test
 
   lint:
     name: Lint
@@ -57,10 +57,10 @@ jobs:
           workspaces: . -> target
 
       - name: Check (workspace)
-        run: cargo check --workspace
+        run: cargo check
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings

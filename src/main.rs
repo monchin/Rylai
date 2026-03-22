@@ -1,11 +1,13 @@
 mod collector;
 mod config;
 mod generator;
+mod output_layout;
 mod type_map;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser, Debug)]
@@ -20,7 +22,10 @@ struct Cli {
 
     /// Output directory for generated .pyi files (default: crate root).
     /// Created automatically if it does not exist.
-    /// Each top-level #[pymodule] produces one <module_name>.pyi inside this directory.
+    /// Each top-level #[pymodule] produces <name>.pyi under this directory; submodules become
+    /// sibling .pyi files (first module segment is implicit — e.g. `pkg.aaa` → `aaa.pyi`, not `pkg/aaa.pyi`).
+    /// If this path's last component matches the pymodule name (e.g. `-o python/abcd`),
+    /// that directory is the package root — layout paths that start with `abcd/` strip that prefix when joining.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -60,10 +65,38 @@ fn main() -> Result<()> {
         println!("Generated: {}", path.display());
         generated_paths.push(path);
     } else {
-        // One .pyi file per top-level #[pymodule]; name comes from the AST
-        for module in &items {
-            let path = out_dir.join(format!("{}.pyi", module.name));
-            let stub = generator::generate(std::slice::from_ref(module), &config)?;
+        // Resolve layout: one or more (path, PyModule) per top-level pymodule (package mode when
+        // #[pyclass(module = "...")] is used). Functions/constants/unannotated classes use the root stub.
+        let output_specs = output_layout::resolve(items.clone());
+        let (known_classes, pre_warnings) = generator::collect_class_names(&items);
+        let class_defining_modules = output_layout::rust_class_defining_modules(&items);
+        let mut seen_output_paths: HashSet<PathBuf> = HashSet::new();
+        for (idx, (rel_path, stub_module)) in output_specs.into_iter().enumerate() {
+            let path = join_output_path(&out_dir, &rel_path);
+            if !seen_output_paths.insert(path.clone()) {
+                anyhow::bail!(
+                    "duplicate output path: {}\n\
+                     Try pointing `-o` at a parent directory so each stub lands on a distinct path \
+                     (e.g. `-o stubs` instead of `-o stubs/<pymodule>` when layout paths would collide).",
+                    path.display()
+                );
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let empty: &[String] = &[];
+            let warnings = if idx == 0 {
+                pre_warnings.as_slice()
+            } else {
+                empty
+            };
+            let stub = generator::generate_with_known_classes(
+                std::slice::from_ref(&stub_module),
+                &config,
+                &known_classes,
+                warnings,
+                Some((stub_module.name.as_str(), &class_defining_modules)),
+            )?;
             std::fs::write(&path, stub)?;
             println!("Generated: {}", path.display());
             generated_paths.push(path);
@@ -75,6 +108,26 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Combine output directory with a path from [`output_layout::resolve`].
+///
+/// When `-o` already points at the Python **package** directory, layout
+/// paths still begin with the pymodule name. If `out_dir`'s last component equals the
+/// first segment of `rel_path`, that segment is skipped.
+///
+/// If two different layout paths resolve to the same file, [`main`] detects the duplicate and
+/// errors — use `-o` on the **parent** directory when needed so paths stay distinct.
+fn join_output_path(out_dir: &Path, rel_path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components = rel_path.components();
+    match (components.next(), out_dir.file_name()) {
+        (Some(Component::Normal(first)), Some(od)) if first == od => {
+            let rest: PathBuf = components.collect();
+            out_dir.join(rest)
+        }
+        _ => out_dir.join(rel_path),
+    }
 }
 
 /// Run each entry in `format` as a command with all generated .pyi paths appended.
@@ -125,4 +178,44 @@ fn infer_module_name_from_cargo(crate_root: &std::path::Path) -> Option<String> 
         .get("name")?
         .as_str()
         .map(|s| s.replace('-', "_"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_output_path;
+    use std::path::Path;
+
+    #[test]
+    fn join_output_strips_pkg_root_when_out_dir_matches_first_segment() {
+        let out = Path::new("python/abcd");
+        assert_eq!(
+            join_output_path(out, Path::new("abcd.pyi")),
+            Path::new("python/abcd/abcd.pyi")
+        );
+        assert_eq!(
+            join_output_path(out, Path::new("efg.pyi")),
+            Path::new("python/abcd/efg.pyi")
+        );
+        assert_eq!(
+            join_output_path(out, Path::new("abcd/xyz.pyi")),
+            Path::new("python/abcd/xyz.pyi")
+        );
+    }
+
+    #[test]
+    fn join_output_keeps_parent_when_out_dir_is_parent_of_package() {
+        let out = Path::new("stubs");
+        assert_eq!(
+            join_output_path(out, Path::new("abcd.pyi")),
+            Path::new("stubs/abcd.pyi")
+        );
+        assert_eq!(
+            join_output_path(out, Path::new("efg.pyi")),
+            Path::new("stubs/efg.pyi")
+        );
+        assert_eq!(
+            join_output_path(out, Path::new("pkg/aaa.pyi")),
+            Path::new("stubs/pkg/aaa.pyi")
+        );
+    }
 }

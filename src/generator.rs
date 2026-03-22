@@ -5,13 +5,30 @@ use crate::collector::{
 use crate::config::{Config, FallbackStrategy, RenderPolicy};
 use crate::type_map::{self, TypeMapping};
 use anyhow::{Result, bail};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use syn::{ReturnType, Type, TypeParamBound};
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
 pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
-    let policy = config.render_policy();
     let (known_classes, pre_warnings) = collect_class_names(modules);
+    generate_with_known_classes(modules, config, &known_classes, &pre_warnings, None)
+}
+
+/// Generate .pyi content for the given modules using a pre-computed Rust→Python class name map.
+/// Used when emitting multiple stubs so that cross-module type references resolve correctly.
+///
+/// When `cross_import` is `Some((current_stub_module, rust_class_to_defining_module))`, types that
+/// reference `#[pyclass]` types defined in another Python module cause `from ... import ...` lines
+/// to be prepended (after `typing` / `pathlib` imports).
+pub fn generate_with_known_classes(
+    modules: &[PyModule],
+    config: &Config,
+    known_classes: &HashMap<String, String>,
+    pre_warnings: &[String],
+    cross_import: Option<(&str, &HashMap<String, String>)>,
+) -> Result<String> {
+    let policy = config.render_policy();
     let mut ctx = GenCtx {
         config,
         policy,
@@ -21,9 +38,12 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
         needs_path_import: false,
         needs_union: false,
         needs_final: false,
-        warnings: pre_warnings,
+        warnings: pre_warnings.to_vec(),
         current_self_type: None,
-        known_classes,
+        known_classes: known_classes.clone(),
+        current_stub_module: cross_import.map(|(s, _)| s.to_string()),
+        class_rust_to_module: cross_import.map(|(_, m)| (*m).clone()),
+        cross_module_imports: BTreeMap::new(),
     };
 
     let mut body = String::new();
@@ -71,6 +91,19 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
 
     if ctx.needs_path_import {
         out.push_str("from pathlib import Path\n\n");
+    }
+
+    // Same-package imports so referenced classes from other .pyi files resolve under Pyright/mypy.
+    if !ctx.cross_module_imports.is_empty() {
+        for (mod_path, names) in &ctx.cross_module_imports {
+            let mut names: Vec<_> = names.iter().cloned().collect();
+            names.sort();
+            out.push_str(&format!(
+                "from {} import {}\n\n",
+                mod_path,
+                names.join(", ")
+            ));
+        }
     }
 
     out.push_str(&body);
@@ -122,6 +155,12 @@ struct GenCtx<'a> {
     /// (where the Rust struct is `PyPageIterator` but the Python name is `PageIterator`) to
     /// resolve correctly instead of falling back to `Any`.
     known_classes: HashMap<String, String>,
+    /// Dotted Python module for this stub file (e.g. `abcd.ee`); set when emitting a split layout.
+    current_stub_module: Option<String>,
+    /// Rust struct name → dotted module where that class is defined.
+    class_rust_to_module: Option<HashMap<String, String>>,
+    /// Dotted defining module → Python class names to import into this stub.
+    cross_module_imports: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl<'a> GenCtx<'a> {
@@ -138,6 +177,16 @@ impl<'a> GenCtx<'a> {
             &self.known_classes,
         );
         self.absorb_mapping(&mapping, location)?;
+        if let (Some(cur), Some(loc_map)) = (&self.current_stub_module, &self.class_rust_to_module)
+        {
+            collect_pyclass_refs_in_type(
+                &py_type.rust_type,
+                &self.known_classes,
+                loc_map,
+                cur,
+                &mut self.cross_module_imports,
+            );
+        }
         Ok(mapping.py_type)
     }
 
@@ -450,6 +499,287 @@ impl<'a> GenCtx<'a> {
     }
 }
 
+// ── Cross-module `from ... import ...` (split .pyi layout) ─────────────────────
+
+fn segment_generic_args(seg: &syn::PathSegment) -> Vec<&Type> {
+    match &seg.arguments {
+        syn::PathArguments::AngleBracketed(ab) => ab
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                syn::GenericArgument::Type(t) => Some(t),
+                // `Iterator<Item = Layer>` — associated type binding, not a positional type arg.
+                syn::GenericArgument::AssocType(at) => Some(&at.ty),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Walk a Rust type and record cross-module `#[pyclass]` references for import lines.
+fn collect_pyclass_refs_in_type(
+    ty: &Type,
+    known_classes: &HashMap<String, String>,
+    class_rust_to_module: &HashMap<String, String>,
+    current_stub_module: &str,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    match ty {
+        Type::Path(tp) => collect_from_type_path(
+            tp,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Reference(r) => collect_pyclass_refs_in_type(
+            &r.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Slice(s) => collect_pyclass_refs_in_type(
+            &s.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Tuple(t) => {
+            for e in &t.elems {
+                collect_pyclass_refs_in_type(
+                    e,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        Type::Paren(p) => collect_pyclass_refs_in_type(
+            &p.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Group(g) => collect_pyclass_refs_in_type(
+            &g.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Array(a) => collect_pyclass_refs_in_type(
+            &a.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Ptr(p) => collect_pyclass_refs_in_type(
+            &p.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::BareFn(b) => {
+            for arg in &b.inputs {
+                collect_pyclass_refs_in_type(
+                    &arg.ty,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+            match &b.output {
+                ReturnType::Default => {}
+                ReturnType::Type(_, ret_ty) => collect_pyclass_refs_in_type(
+                    ret_ty,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                ),
+            }
+        }
+        Type::ImplTrait(it) => collect_pyclass_refs_in_type_param_bounds(
+            &it.bounds,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::TraitObject(to) => collect_pyclass_refs_in_type_param_bounds(
+            &to.bounds,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        // No nested `Type` inside these variants; `Macro` / `Verbatim` are opaque to static analysis.
+        Type::Never(_) | Type::Infer(_) | Type::Macro(_) | Type::Verbatim(_) => {}
+        // `syn::Type` is `#[non_exhaustive]`
+        _ => {}
+    }
+}
+
+fn collect_pyclass_refs_in_type_param_bounds(
+    bounds: &syn::punctuated::Punctuated<TypeParamBound, syn::token::Plus>,
+    known_classes: &HashMap<String, String>,
+    class_rust_to_module: &HashMap<String, String>,
+    current_stub_module: &str,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for bound in bounds {
+        match bound {
+            TypeParamBound::Trait(tb) => {
+                let tp = syn::TypePath {
+                    qself: None,
+                    path: tb.path.clone(),
+                };
+                collect_from_type_path(
+                    &tp,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+            TypeParamBound::Lifetime(_) | TypeParamBound::Verbatim(_) => {}
+            // `TypeParamBound` is `#[non_exhaustive]`
+            _ => {}
+        }
+    }
+}
+
+fn collect_from_type_path(
+    tp: &syn::TypePath,
+    known_classes: &HashMap<String, String>,
+    class_rust_to_module: &HashMap<String, String>,
+    current_stub_module: &str,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    let Some(last_seg) = tp.path.segments.last() else {
+        return;
+    };
+    let last_ident = last_seg.ident.to_string();
+    let args = segment_generic_args(last_seg);
+
+    match last_ident.as_str() {
+        "Self" => {}
+        "PyResult" | "Result" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "Option" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "Vec" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "HashMap" | "BTreeMap" | "IndexMap" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+            if let Some(t) = args.get(1) {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "HashSet" | "BTreeSet" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "PyRef" | "PyRefMut" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        "Py" | "Bound" | "Borrowed" => {
+            if let Some(t) = args.first() {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+        _ => {
+            if let Some(python_name) = known_classes.get(&last_ident)
+                && let Some(def_mod) = class_rust_to_module.get(&last_ident)
+                && def_mod != current_stub_module
+            {
+                out.entry(def_mod.clone())
+                    .or_default()
+                    .insert(python_name.clone());
+            }
+            for t in args {
+                collect_pyclass_refs_in_type(
+                    t,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Recursively collect all `#[pyclass]` entries from a slice of modules, returning a map
@@ -461,7 +791,7 @@ impl<'a> GenCtx<'a> {
 ///
 /// If two `#[pyclass]` items in different modules share the same Rust name but map to
 /// different Python names, the first registration wins and a warning is emitted.
-fn collect_class_names(modules: &[PyModule]) -> (HashMap<String, String>, Vec<String>) {
+pub fn collect_class_names(modules: &[PyModule]) -> (HashMap<String, String>, Vec<String>) {
     let mut map = HashMap::new();
     let mut warnings = Vec::new();
     for m in modules {
@@ -598,6 +928,7 @@ mod tests {
         PyClass {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
+            module: None,
             doc: vec![],
             methods: vec![PyMethod {
                 name: method_name.to_string(),
@@ -627,6 +958,131 @@ mod tests {
 
     fn stub_for_config(items: Vec<PyItem>, config: &Config) -> String {
         generate(&[make_module(items)], config).unwrap()
+    }
+
+    /// generate_with_known_classes resolves return types using the provided map,
+    /// so a function in the root stub that returns a class from another stub (e.g. Layer)
+    /// emits the class name, not Any.
+    #[test]
+    fn generate_with_known_classes_resolves_cross_module_class_in_return_type() {
+        let root_module = make_module(vec![PyItem::Function(make_fn(
+            "get_layer",
+            None,
+            vec![],
+            syn::parse_quote! { pyo3::PyResult<Layer> },
+        ))]);
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let stub = generate_with_known_classes(
+            &[root_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            stub.contains("-> Layer"),
+            "return type should resolve to Layer from known_classes, not Any; got:\n{stub}"
+        );
+    }
+
+    /// When generating a stub for `abcd.ee` and the return type references a class defined in
+    /// `abcd.ff`, emit `from abcd.ff import Layer`.
+    #[test]
+    fn generate_with_known_classes_emits_cross_module_import() {
+        let ee_module = PyModule {
+            name: "abcd.ee".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "get_layer",
+                None,
+                vec![],
+                syn::parse_quote! { pyo3::PyResult<Layer> },
+            ))],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Layer".to_string(), "abcd.ff".to_string());
+        let stub = generate_with_known_classes(
+            &[ee_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("abcd.ee", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from abcd.ff import Layer"),
+            "expected cross-module import; got:\n{stub}"
+        );
+        assert!(stub.contains("-> Layer"));
+    }
+
+    /// `PyResult<[Layer; N]>` still triggers `from abcd.ff import Layer` (element type walk).
+    #[test]
+    fn generate_with_known_classes_emits_cross_module_import_for_array_elem() {
+        let ee_module = PyModule {
+            name: "abcd.ee".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "layers",
+                None,
+                vec![],
+                syn::parse_quote! { pyo3::PyResult<[Layer; 4]> },
+            ))],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Layer".to_string(), "abcd.ff".to_string());
+        let stub = generate_with_known_classes(
+            &[ee_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("abcd.ee", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from abcd.ff import Layer"),
+            "expected cross-module import for array elem; got:\n{stub}"
+        );
+    }
+
+    /// `impl Iterator<Item = Layer>` walks trait bounds and picks up `Layer` from associated type args.
+    #[test]
+    fn generate_with_known_classes_emits_cross_module_import_for_impl_trait() {
+        let ee_module = PyModule {
+            name: "abcd.ee".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "iter_layers",
+                None,
+                vec![],
+                syn::parse_quote! { impl Iterator<Item = Layer> },
+            ))],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Layer".to_string(), "abcd.ff".to_string());
+        let stub = generate_with_known_classes(
+            &[ee_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("abcd.ee", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from abcd.ff import Layer"),
+            "expected cross-module import for impl trait; got:\n{stub}"
+        );
     }
 
     // ── split_at_top_level_commas ────────────────────────────────────────────
@@ -961,6 +1417,7 @@ mod tests {
         PyClass {
             name: python_name.to_string(),
             rust_name: rust_name.to_string(),
+            module: None,
             doc: vec![],
             methods: vec![],
             source_file: dummy_path(),
@@ -1185,6 +1642,7 @@ mod tests {
         PyClass {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
+            module: None,
             doc: vec![],
             methods,
             source_file: dummy_path(),
