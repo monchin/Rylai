@@ -6,7 +6,7 @@ use crate::config::{Config, FallbackStrategy, RenderPolicy};
 use crate::type_map::{self, TypeMapping};
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use syn::Type;
+use syn::{ReturnType, Type, TypeParamBound};
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
@@ -508,6 +508,8 @@ fn segment_generic_args(seg: &syn::PathSegment) -> Vec<&Type> {
             .iter()
             .filter_map(|a| match a {
                 syn::GenericArgument::Type(t) => Some(t),
+                // `Iterator<Item = Layer>` — associated type binding, not a positional type arg.
+                syn::GenericArgument::AssocType(at) => Some(&at.ty),
                 _ => None,
             })
             .collect(),
@@ -570,7 +572,88 @@ fn collect_pyclass_refs_in_type(
             current_stub_module,
             out,
         ),
+        Type::Array(a) => collect_pyclass_refs_in_type(
+            &a.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::Ptr(p) => collect_pyclass_refs_in_type(
+            &p.elem,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::BareFn(b) => {
+            for arg in &b.inputs {
+                collect_pyclass_refs_in_type(
+                    &arg.ty,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+            match &b.output {
+                ReturnType::Default => {}
+                ReturnType::Type(_, ret_ty) => collect_pyclass_refs_in_type(
+                    ret_ty,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                ),
+            }
+        }
+        Type::ImplTrait(it) => collect_pyclass_refs_in_type_param_bounds(
+            &it.bounds,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        Type::TraitObject(to) => collect_pyclass_refs_in_type_param_bounds(
+            &to.bounds,
+            known_classes,
+            class_rust_to_module,
+            current_stub_module,
+            out,
+        ),
+        // No nested `Type` inside these variants; `Macro` / `Verbatim` are opaque to static analysis.
+        Type::Never(_) | Type::Infer(_) | Type::Macro(_) | Type::Verbatim(_) => {}
+        // `syn::Type` is `#[non_exhaustive]`
         _ => {}
+    }
+}
+
+fn collect_pyclass_refs_in_type_param_bounds(
+    bounds: &syn::punctuated::Punctuated<TypeParamBound, syn::token::Plus>,
+    known_classes: &HashMap<String, String>,
+    class_rust_to_module: &HashMap<String, String>,
+    current_stub_module: &str,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for bound in bounds {
+        match bound {
+            TypeParamBound::Trait(tb) => {
+                let tp = syn::TypePath {
+                    qself: None,
+                    path: tb.path.clone(),
+                };
+                collect_from_type_path(
+                    &tp,
+                    known_classes,
+                    class_rust_to_module,
+                    current_stub_module,
+                    out,
+                );
+            }
+            TypeParamBound::Lifetime(_) | TypeParamBound::Verbatim(_) => {}
+            // `TypeParamBound` is `#[non_exhaustive]`
+            _ => {}
+        }
     }
 }
 
@@ -936,6 +1019,70 @@ mod tests {
             "expected cross-module import; got:\n{stub}"
         );
         assert!(stub.contains("-> Layer"));
+    }
+
+    /// `PyResult<[Layer; N]>` still triggers `from abcd.ff import Layer` (element type walk).
+    #[test]
+    fn generate_with_known_classes_emits_cross_module_import_for_array_elem() {
+        let ee_module = PyModule {
+            name: "abcd.ee".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "layers",
+                None,
+                vec![],
+                syn::parse_quote! { pyo3::PyResult<[Layer; 4]> },
+            ))],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Layer".to_string(), "abcd.ff".to_string());
+        let stub = generate_with_known_classes(
+            &[ee_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("abcd.ee", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from abcd.ff import Layer"),
+            "expected cross-module import for array elem; got:\n{stub}"
+        );
+    }
+
+    /// `impl Iterator<Item = Layer>` walks trait bounds and picks up `Layer` from associated type args.
+    #[test]
+    fn generate_with_known_classes_emits_cross_module_import_for_impl_trait() {
+        let ee_module = PyModule {
+            name: "abcd.ee".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Function(make_fn(
+                "iter_layers",
+                None,
+                vec![],
+                syn::parse_quote! { impl Iterator<Item = Layer> },
+            ))],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Layer".to_string(), "Layer".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Layer".to_string(), "abcd.ff".to_string());
+        let stub = generate_with_known_classes(
+            &[ee_module],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("abcd.ee", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from abcd.ff import Layer"),
+            "expected cross-module import for impl trait; got:\n{stub}"
+        );
     }
 
     // ── split_at_top_level_commas ────────────────────────────────────────────
