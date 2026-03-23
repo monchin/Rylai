@@ -10,7 +10,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]`, `Option<T>` → `T | None`, etc.)
 - Extracts doc comments and emits them as Python docstrings
 - Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits additional sibling `.pyi` files under `-o` (first module segment is implicit) so type checkers and runtime `__module__` agree
-- Python-version-aware output (`T | None` for ≥ 3.10, `Optional[T]` for older; `Self` type for >= 3.11, etc.)
+- Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; `t.Self` for ≥ 3.11; stubs add `import typing as t` when needed)
 - Zero-config by default; optionally configured via `rylai.toml`
 
 ## Why Rylai?
@@ -125,7 +125,7 @@ Example `rylai.toml`:
 format = ["ruff format", "ruff check --select I --fix"]
 
 [output]
-# Target Python version — affects Optional[T] vs T | None syntax (default: "3.10")
+# Target Python version — affects t.Optional[T] vs T | None syntax (default: "3.10")
 python_version = "3.10"
 
 # Prepend auto-generated header comment (default: true)
@@ -133,7 +133,7 @@ add_header = true
 
 [fallback]
 # What to emit when a type cannot be resolved statically:
-#   "any"   — emit Any and print a warning (default)
+#   "any"   — emit t.Any and print a warning (default)
 #   "error" — abort with an error
 #   "skip"  — silently omit the item
 strategy = "any"
@@ -148,9 +148,9 @@ enabled = ["some_feature"]
 "numpy::PyReadonlyArray2" = "numpy.ndarray"
 
 [[override]]
-# Manually written stub for a specific item (takes precedence over generated output)
+# Manually written stub for a specific item (takes precedence over generated output; inserted verbatim)
 item = "my_module::complex_function"
-stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
 ```
 
 The same options can be set in `pyproject.toml` under `[tool.rylai]`:
@@ -167,7 +167,7 @@ strategy = "any"
 
 [[tool.rylai.override]]
 item = "my_module::complex_function"
-stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
 
 [tool.rylai]
 format = ["isort", "black"]
@@ -187,9 +187,9 @@ format = ["isort", "black"]
 | `&[u8]`, `[u8]` | `bytes` |
 | `Vec<u8>` | `bytes` |
 | **Path-like** | |
-| `Path`, `PathBuf` (incl. `std::path::*`) | `Path \| str` / `Union[Path, str]` |
+| `Path`, `PathBuf` (incl. `std::path::*`) | `Path \| str` / `t.Union[Path, str]` |
 | **Containers** | |
-| `Option<T>` | `T \| None` / `Optional[T]` |
+| `Option<T>` | `T \| None` / `t.Optional[T]` |
 | `Vec<T>` | `list[T]` |
 | `(T1, T2, ...)` (non-empty tuple) | `tuple[T1, T2, ...]` |
 | `HashMap<K,V>`, `BTreeMap<K,V>`, `IndexMap<K,V>` | `dict[K, V]` |
@@ -202,11 +202,11 @@ format = ["isort", "black"]
 | `PyByteArray` | `bytearray` |
 | `PyString` | `str` |
 | `PyDict`, `PyList`, `PyTuple`, `PySet` | `dict`, `list`, `tuple`, `set` |
-| `PyAny`, `PyObject` | `Any` |
+| `PyAny`, `PyObject` | `t.Any` |
 | **Other** | |
-| `Self` (in `#[pymethods]`) | `Self` (py ≥ 3.11) or class name |
+| `Self` (in `#[pymethods]`) | `t.Self` (py ≥ 3.11) or class name |
 | `#[pyclass]` structs/enums | Python class name (from crate) |
-| Unknown types | `Any` (configurable via `[fallback]`) |
+| Unknown types | `t.Any` (configurable via `[fallback]`) |
 
 ## Limitation
 

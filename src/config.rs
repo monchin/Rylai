@@ -69,7 +69,7 @@ fn default_fallback_strategy() -> FallbackStrategy {
 
 #[derive(Debug, Deserialize)]
 pub struct OutputConfig {
-    /// Python version string, affects Optional[T] vs T | None syntax
+    /// Python version string, affects `t.Optional[T]` vs `T | None` syntax (and related typing output).
     #[serde(default = "default_python_version")]
     pub python_version: String,
 
@@ -99,7 +99,7 @@ fn default_true() -> bool {
 pub struct OverrideEntry {
     /// Fully-qualified item path, e.g. "my_module::complex_function"
     pub item: String,
-    /// Raw Python stub line, e.g. "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+    /// Raw Python stub line, e.g. "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
     pub stub: String,
 }
 
@@ -110,9 +110,9 @@ pub struct OverrideEntry {
 /// `from_version` — no changes needed elsewhere in the generation pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderPolicy {
-    /// Emit `T | None` (py ≥ 3.10) instead of `Optional[T]` (py < 3.10).
+    /// Emit `T | None` (py ≥ 3.10) instead of `t.Optional[T]` (py < 3.10).
     pub union_optional: bool,
-    /// Emit the native `Self` keyword (py ≥ 3.11, PEP 673) instead of the class name.
+    /// Emit `t.Self` (py ≥ 3.11, PEP 673) instead of the class name in stubs (`import typing as t`).
     /// When `false`, class names are used as forward references and
     /// `from __future__ import annotations` is added to the output.
     pub native_self: bool,
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn render_policy_py39_optional_no_native_self() {
         let p = RenderPolicy::from_version(3, 9);
-        assert!(!p.union_optional, "3.9 uses Optional[T]");
+        assert!(!p.union_optional, "3.9 uses t.Optional[T]");
         assert!(!p.native_self, "3.9 uses class name, not Self");
         assert!(
             p.future_annotations,
@@ -433,7 +433,7 @@ python_version = "3.11"
 
 [[tool.rylai.override]]
 item = "my_module::complex_function"
-stub = "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
 
 [[tool.rylai.override]]
 item = "other::fn"
@@ -449,7 +449,7 @@ stub = "def fn() -> int: ..."
         assert_eq!(config.overrides[0].item, "my_module::complex_function");
         assert_eq!(
             config.overrides[0].stub,
-            "def complex_function(x: Any, **kwargs: Any) -> dict[str, Any]: ..."
+            "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
         );
         assert_eq!(config.overrides[1].item, "other::fn");
         assert_eq!(config.overrides[1].stub, "def fn() -> int: ...");

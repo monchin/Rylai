@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Generated stubs now use `import typing as t` and qualified annotations (`t.Any`, `t.Optional[...]`, `t.Union[...]`, `t.Self`, `t.Final[...]`) instead of `from typing import ...`, so extending typing usage in emitted `.pyi` files stays straightforward.
 - Example `examples/pyo3_sample` now uses a `python/` tree with Maturin `pyproject.toml`, submodule classes `A` / `B` with cross-stub imports, and an unscoped class `C` on the root stub.
 
 ## [0.2.0] - 2026-03-14

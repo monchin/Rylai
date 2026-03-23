@@ -63,15 +63,15 @@ pub fn map_type(
 #[derive(Debug, Clone)]
 pub struct TypeMapping {
     pub py_type: String,
-    /// Whether the result contains `Any` (needs `from typing import Any`)
+    /// Whether the result contains `t.Any` (needs `import typing as t`)
     pub needs_any: bool,
-    /// Whether the result contains `Optional` (needs `from typing import Optional`)
+    /// Whether the result contains `t.Optional` (needs `import typing as t`)
     pub needs_optional: bool,
-    /// Whether the result contains `Self` (needs `from typing import Self`, py ≥ 3.11)
+    /// Whether the result contains `t.Self` (needs `import typing as t`, py ≥ 3.11)
     pub needs_self_import: bool,
     /// Whether the result contains `Path` (needs `from pathlib import Path`)
     pub needs_path_import: bool,
-    /// Whether the result contains `Union[...]` (needs `from typing import Union`, py < 3.10)
+    /// Whether the result contains `t.Union[...]` (needs `import typing as t`, py < 3.10)
     pub needs_union: bool,
     /// True if the type was unresolvable (caller may warn/error/skip based on config)
     pub is_unknown: bool,
@@ -92,7 +92,7 @@ impl TypeMapping {
 
     pub fn self_keyword() -> Self {
         Self {
-            py_type: "Self".to_string(),
+            py_type: "t.Self".to_string(),
             needs_any: false,
             needs_optional: false,
             needs_self_import: true,
@@ -104,7 +104,7 @@ impl TypeMapping {
 
     pub fn unknown() -> Self {
         Self {
-            py_type: "Any".to_string(),
+            py_type: "t.Any".to_string(),
             needs_any: true,
             needs_optional: false,
             needs_self_import: false,
@@ -115,12 +115,12 @@ impl TypeMapping {
     }
 }
 
-/// Rust `std::path::Path` / `PathBuf` (pyo3 accepts str or pathlib.Path) → Path | str or Union[Path, str].
+/// Rust `std::path::Path` / `PathBuf` (pyo3 accepts str or pathlib.Path) → Path | str or t.Union[Path, str].
 fn path_like_mapping(policy: &RenderPolicy) -> TypeMapping {
     let (py_type, needs_union) = if policy.union_optional {
         ("Path | str".to_string(), false)
     } else {
-        ("Union[Path, str]".to_string(), true)
+        ("t.Union[Path, str]".to_string(), true)
     };
     TypeMapping {
         py_type,
@@ -204,14 +204,14 @@ fn map_type_path(
             return TypeMapping::known("None");
         }
 
-        // Option<T> → T | None  or  Optional[T]
+        // Option<T> → T | None  or  t.Optional[T]
         "Option" => {
             if let Some(inner) = args.first() {
                 let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 let py_type = if policy.union_optional {
                     format!("{} | None", inner_mapped.py_type)
                 } else {
-                    format!("Optional[{}]", inner_mapped.py_type)
+                    format!("t.Optional[{}]", inner_mapped.py_type)
                 };
                 return TypeMapping {
                     py_type,
@@ -291,7 +291,7 @@ fn map_type_path(
         // PyAny / PyObject — truly opaque, map to Any
         "PyAny" | "PyObject" => {
             return TypeMapping {
-                py_type: "Any".to_string(),
+                py_type: "t.Any".to_string(),
                 needs_any: true,
                 needs_optional: false,
                 needs_self_import: false,
@@ -488,12 +488,12 @@ mod tests {
         assert_eq!(m.py_type, "list[int]");
     }
 
-    /// Rust `PathBuf` (e.g. pyo3 fn new(path: PathBuf)) maps to `Union[Path, str]` when union_optional is false (py < 3.10).
+    /// Rust `PathBuf` (e.g. pyo3 fn new(path: PathBuf)) maps to `t.Union[Path, str]` when union_optional is false (py < 3.10).
     #[test]
     fn pathbuf_maps_to_union_path_str_py38() {
         let ty = parse_ty("PathBuf");
         let m = map_type(&ty, &p(false), None, &no_classes());
-        assert_eq!(m.py_type, "Union[Path, str]");
+        assert_eq!(m.py_type, "t.Union[Path, str]");
         assert!(m.needs_path_import);
         assert!(m.needs_union);
         assert!(!m.needs_any);
@@ -534,7 +534,7 @@ mod tests {
     fn self_without_context_maps_to_any() {
         let ty = parse_ty("Self");
         let m = map_type(&ty, &p(false), None, &no_classes());
-        assert_eq!(m.py_type, "Any");
+        assert_eq!(m.py_type, "t.Any");
         assert!(m.is_unknown);
     }
 
@@ -564,7 +564,7 @@ mod tests {
     fn self_native_keyword_emitted_for_py311() {
         let ty = parse_ty("Self");
         let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
-        assert_eq!(m.py_type, "Self");
+        assert_eq!(m.py_type, "t.Self");
         assert!(!m.is_unknown);
         assert!(m.needs_self_import, "Self import must be flagged");
     }
@@ -574,7 +574,7 @@ mod tests {
     fn pyresult_self_native_keyword_for_py311() {
         let ty = parse_ty("PyResult<Self>");
         let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
-        assert_eq!(m.py_type, "Self");
+        assert_eq!(m.py_type, "t.Self");
         assert!(m.needs_self_import);
         assert!(!m.needs_any);
     }
@@ -593,7 +593,7 @@ mod tests {
     fn pyref_self_native_keyword_for_py311() {
         let ty = parse_ty("pyo3::PyRef<'_, Self>");
         let m = map_type(&ty, &p_native_self(), Some("PdfDocument"), &no_classes());
-        assert_eq!(m.py_type, "Self");
+        assert_eq!(m.py_type, "t.Self");
         assert!(m.needs_self_import);
     }
 
@@ -606,12 +606,12 @@ mod tests {
         assert!(!m.needs_optional);
     }
 
-    /// `Option<i32>` uses `Optional[X]` syntax when `union_optional` is false.
+    /// `Option<i32>` uses `t.Optional[X]` syntax when `union_optional` is false.
     #[test]
     fn option_uses_optional_syntax_when_disabled() {
         let ty = parse_ty("Option<i32>");
         let m = map_type(&ty, &p(false), None, &no_classes());
-        assert_eq!(m.py_type, "Optional[int]");
+        assert_eq!(m.py_type, "t.Optional[int]");
         assert!(m.needs_optional);
     }
 
@@ -653,7 +653,7 @@ mod tests {
     fn unknown_type_not_in_known_classes_maps_to_any() {
         let ty = parse_ty("SomeUnknownType");
         let m = map_type(&ty, &p(true), None, &no_classes());
-        assert_eq!(m.py_type, "Any");
+        assert_eq!(m.py_type, "t.Any");
         assert!(m.is_unknown);
     }
 
@@ -746,7 +746,7 @@ mod tests {
     fn pyany_maps_to_any_not_unknown() {
         let ty = parse_ty("PyAny");
         let m = map_type(&ty, &p(true), None, &no_classes());
-        assert_eq!(m.py_type, "Any");
+        assert_eq!(m.py_type, "t.Any");
         assert!(m.needs_any);
         assert!(
             !m.is_unknown,
@@ -758,7 +758,7 @@ mod tests {
     fn pyobject_maps_to_any_not_unknown() {
         let ty = parse_ty("PyObject");
         let m = map_type(&ty, &p(true), None, &no_classes());
-        assert_eq!(m.py_type, "Any");
+        assert_eq!(m.py_type, "t.Any");
         assert!(m.needs_any);
         assert!(
             !m.is_unknown,

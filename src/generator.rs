@@ -20,7 +20,7 @@ pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
 ///
 /// When `cross_import` is `Some((current_stub_module, rust_class_to_defining_module))`, types that
 /// reference `#[pyclass]` types defined in another Python module cause `from ... import ...` lines
-/// to be prepended (after `typing` / `pathlib` imports).
+/// to be prepended (after `import typing as t` / `pathlib` imports when needed).
 pub fn generate_with_known_classes(
     modules: &[PyModule],
     config: &Config,
@@ -65,28 +65,13 @@ pub fn generate_with_known_classes(
         out.push_str("from __future__ import annotations\n\n");
     }
 
-    // typing imports
-    let mut typing_parts: Vec<&str> = Vec::new();
-    if ctx.needs_any {
-        typing_parts.push("Any");
-    }
-    if ctx.needs_optional {
-        typing_parts.push("Optional");
-    }
-    if ctx.needs_self_import {
-        typing_parts.push("Self");
-    }
-    if ctx.needs_union {
-        typing_parts.push("Union");
-    }
-    if ctx.needs_final {
-        typing_parts.push("Final");
-    }
-    if !typing_parts.is_empty() {
-        out.push_str(&format!(
-            "from typing import {}\n\n",
-            typing_parts.join(", ")
-        ));
+    let needs_typing = ctx.needs_any
+        || ctx.needs_optional
+        || ctx.needs_self_import
+        || ctx.needs_union
+        || ctx.needs_final;
+    if needs_typing {
+        out.push_str("import typing as t\n\n");
     }
 
     if ctx.needs_path_import {
@@ -142,9 +127,9 @@ struct GenCtx<'a> {
     needs_self_import: bool,
     /// Whether any mapping used pathlib.Path (Rust PathBuf/Path → Path | str).
     needs_path_import: bool,
-    /// Whether any mapping used Union[...] (py < 3.10 style, e.g. Union[Path, str]).
+    /// Whether any mapping used `t.Union[...]` (py < 3.10 style, e.g. t.Union[Path, str]).
     needs_union: bool,
-    /// Whether any module-level constant was emitted (needs `from typing import Final`).
+    /// Whether any module-level constant was emitted (needs `import typing as t` for `t.Final`).
     needs_final: bool,
     warnings: Vec<String>,
     /// Set to the Python class name while generating methods for that class,
@@ -263,11 +248,11 @@ impl<'a> GenCtx<'a> {
 
     // ── Module-level constant (m.add("name", value)) ─────────────────────────
 
-    /// Emits `name: Final[py_type]` and sets `needs_final` so that `from typing import Final` is included.
+    /// Emits `name: t.Final[py_type]` and sets `needs_final` so that `import typing as t` is included.
     fn gen_constant(&mut self, c: &PyConstant, out: &mut String, indent: usize) -> Result<()> {
         self.needs_final = true;
         let pad = "    ".repeat(indent);
-        out.push_str(&format!("{pad}{}: Final[{}]\n", c.name, c.py_type));
+        out.push_str(&format!("{pad}{}: t.Final[{}]\n", c.name, c.py_type));
         Ok(())
     }
 
@@ -356,8 +341,8 @@ impl<'a> GenCtx<'a> {
                     .first()
                     .map(|p| self.resolve_type(&p.ty, &location))
                     .transpose()?
-                    .unwrap_or_else(|| "Any".to_string());
-                if val_type == "Any" {
+                    .unwrap_or_else(|| "t.Any".to_string());
+                if val_type == "t.Any" {
                     self.needs_any = true;
                 }
                 out.push_str(&format!("{pad}@{prop}.setter\n"));
@@ -1227,12 +1212,13 @@ mod tests {
         assert!(stub.contains("page: "), "page must have type, got:\n{stub}");
         assert!(stub.contains("clip: "), "clip must have type, got:\n{stub}");
         assert!(
-            stub.contains("page: int | None = None") || stub.contains("page: Optional[int] = None"),
+            stub.contains("page: int | None = None")
+                || stub.contains("page: t.Optional[int] = None"),
             "got:\n{stub}"
         );
         assert!(
             stub.contains("clip: float | None = None")
-                || stub.contains("clip: Optional[float] = None"),
+                || stub.contains("clip: t.Optional[float] = None"),
             "got:\n{stub}"
         );
         assert!(stub.contains("*args"), "got:\n{stub}");
@@ -1350,13 +1336,13 @@ mod tests {
             "from_bytes param must be bytes, got:\n{stub}"
         );
         assert!(
-            !stub.contains("from typing import Self"),
-            "py 3.9 should not import Self, got:\n{stub}"
+            !stub.contains("t.Self"),
+            "py 3.9 should not use typing.Self, got:\n{stub}"
         );
     }
 
     /// With python_version 3.12 (native_self), stub must NOT add future_annotations,
-    /// must add `from typing import Self`, and return type must be Self.
+    /// must add `import typing as t`, and return type must be `t.Self`.
     #[test]
     fn render_policy_py312_emits_native_self_and_no_future_annotations() {
         let config = config_with_python_version("3.12");
@@ -1367,16 +1353,16 @@ mod tests {
             "py 3.12 with native Self should not emit future annotations, got:\n{stub}"
         );
         assert!(
-            stub.contains("from typing import Self"),
-            "py 3.12 must import Self when used, got:\n{stub}"
+            stub.contains("import typing as t"),
+            "py 3.12 must import typing when Self is used, got:\n{stub}"
         );
         assert!(
-            stub.contains("-> Self:") || stub.contains("-> Self :"),
-            "py 3.12 must use Self as return type, got:\n{stub}"
+            stub.contains("-> t.Self:") || stub.contains("-> t.Self :"),
+            "py 3.12 must use t.Self as return type, got:\n{stub}"
         );
     }
 
-    /// Option param with python_version 3.9 must use Optional[X] syntax.
+    /// Option param with python_version 3.9 must use t.Optional[X] syntax.
     #[test]
     fn render_policy_py39_option_param_uses_optional_syntax() {
         let config = config_with_python_version("3.9");
@@ -1388,10 +1374,10 @@ mod tests {
         );
         let stub = stub_for_config(vec![PyItem::Function(f)], &config);
         assert!(
-            stub.contains("x: Optional[int]"),
-            "py 3.9 must use Optional[int], got:\n{stub}"
+            stub.contains("x: t.Optional[int]"),
+            "py 3.9 must use t.Optional[int], got:\n{stub}"
         );
-        assert!(stub.contains("from typing import Optional"), "got:\n{stub}");
+        assert!(stub.contains("import typing as t"), "got:\n{stub}");
     }
 
     /// Option param with python_version 3.10 must use X | None syntax (default config).
@@ -1529,12 +1515,12 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "complex_fn".to_string(),
-            stub: "def complex_fn(x: Any, **kwargs: Any) -> dict[str, Any]: ...".to_string(),
+            stub: "def complex_fn(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ...".to_string(),
         });
         let f = make_fn("complex_fn", None, vec![], syn::parse_quote! { () });
         let stub = stub_for_config(vec![PyItem::Function(f)], &config);
         assert!(
-            stub.contains("def complex_fn(x: Any, **kwargs: Any) -> dict[str, Any]: ..."),
+            stub.contains("def complex_fn(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."),
             "override stub should appear verbatim, got:\n{stub}"
         );
         assert!(
@@ -1584,12 +1570,12 @@ mod tests {
         };
         let stub = stub_for(vec![PyItem::Constant(c)]);
         assert!(
-            stub.contains("__version__: Final[str]"),
-            "stub should contain Final[str] annotation, got:\n{stub}"
+            stub.contains("__version__: t.Final[str]"),
+            "stub should contain t.Final[str] annotation, got:\n{stub}"
         );
         assert!(
-            stub.contains("from typing import Final"),
-            "stub should import Final when constant is present, got:\n{stub}"
+            stub.contains("import typing as t"),
+            "stub should import typing when constant is present, got:\n{stub}"
         );
     }
 
@@ -1603,10 +1589,10 @@ mod tests {
         let mut config = Config::default();
         config.output.python_version = "3.9".to_string();
         let stub = stub_for_config(vec![PyItem::Constant(c), PyItem::Function(f)], &config);
-        assert!(stub.contains("VERSION: Final[str]"), "got:\n{stub}");
+        assert!(stub.contains("VERSION: t.Final[str]"), "got:\n{stub}");
         assert!(
-            stub.contains("Final") && stub.contains("from typing import"),
-            "typing import line should include Final, got:\n{stub}"
+            stub.contains("t.Final") && stub.contains("import typing as t"),
+            "stub should use t.Final and import typing, got:\n{stub}"
         );
     }
 
