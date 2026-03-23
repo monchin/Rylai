@@ -46,7 +46,9 @@ fn main() -> Result<()> {
     let config = config::Config::load_merged(&rylai_toml_path, &pyproject_path)?;
 
     // Collect all pyo3 items from the crate
-    let items = collector::collect_crate(&cli.crate_root, &config)?;
+    let (items, collector_warnings) = collector::collect_crate(&cli.crate_root, &config)?;
+    let (known_classes, mut pre_warnings) = generator::collect_class_names(&items);
+    pre_warnings.extend(collector_warnings);
 
     // Resolve output directory, create it if necessary
     let out_dir = cli.output.unwrap_or_else(|| cli.crate_root.clone());
@@ -60,7 +62,13 @@ fn main() -> Result<()> {
             .or_else(|| infer_module_name_from_cargo(&cli.crate_root))
             .unwrap_or_else(|| "stub".to_string());
         let path = out_dir.join(format!("{name}.pyi"));
-        let stub = generator::generate(&items, &config)?;
+        let stub = generator::generate_with_known_classes(
+            &items,
+            &config,
+            &known_classes,
+            &pre_warnings,
+            None,
+        )?;
         std::fs::write(&path, stub)?;
         println!("Generated: {}", path.display());
         generated_paths.push(path);
@@ -68,7 +76,6 @@ fn main() -> Result<()> {
         // Resolve layout: one or more (path, PyModule) per top-level pymodule (package mode when
         // #[pyclass(module = "...")] is used). Functions/constants/unannotated classes use the root stub.
         let output_specs = output_layout::resolve(items.clone());
-        let (known_classes, pre_warnings) = generator::collect_class_names(&items);
         let class_defining_modules = output_layout::rust_class_defining_modules(&items);
         let mut seen_output_paths: HashSet<PathBuf> = HashSet::new();
         for (idx, (rel_path, stub_module)) in output_specs.into_iter().enumerate() {

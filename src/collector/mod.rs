@@ -1,16 +1,18 @@
 mod model;
 mod parse;
+mod rename_all;
 
 pub use model::*;
 
 use crate::config::Config;
 use anyhow::Result;
+use std::cell::RefCell;
 use std::path::Path;
 use walkdir::WalkDir;
 
 /// Walk the entire crate (all .rs files under `crate_root/src/`) and collect
 /// every pyo3-exposed item.
-pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>> {
+pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule>, Vec<String>)> {
     let src_root = crate_root.join("src");
     let root = if src_root.exists() {
         src_root
@@ -47,12 +49,14 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
     // Fifth pass: build #[pyclass] type name -> attributes (for docstrings in Style B).
     let pyclass_attrs_map = parse::build_pyclass_attrs_map(&files, enabled_features);
 
+    let parse_warnings = RefCell::new(Vec::new());
     let cx = parse::ParseContext {
         config,
         impl_map: &impl_map,
         struct_fields_map: &struct_fields_map,
         type_alias_map: &type_alias_map,
         pyclass_attrs_map: &pyclass_attrs_map,
+        parse_warnings: Some(&parse_warnings),
     };
 
     let mut modules: Vec<PyModule> = Vec::new();
@@ -61,5 +65,5 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<Vec<PyModule>
         modules.extend(file_modules);
     }
 
-    Ok(modules)
+    Ok((modules, parse_warnings.into_inner()))
 }

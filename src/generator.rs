@@ -10,11 +10,6 @@ use syn::{ReturnType, Type, TypeParamBound};
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-pub fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
-    let (known_classes, pre_warnings) = collect_class_names(modules);
-    generate_with_known_classes(modules, config, &known_classes, &pre_warnings, None)
-}
-
 /// Generate .pyi content for the given modules using a pre-computed Rust→Python class name map.
 /// Used when emitting multiple stubs so that cross-module type references resolve correctly.
 ///
@@ -99,6 +94,16 @@ pub fn generate_with_known_classes(
     }
 
     Ok(out)
+}
+
+/// Test-only helper: [`collect_class_names`] then [`generate_with_known_classes`] without cross-import context.
+///
+/// Must live in `generator` (not in `mod tests`): `collector::parse` tests need `crate::generator::generate`,
+/// and a nested `tests` module is private to this file.
+#[cfg(test)]
+pub(crate) fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
+    let (known_classes, pre_warnings) = collect_class_names(modules);
+    generate_with_known_classes(modules, config, &known_classes, &pre_warnings, None)
 }
 
 // ── Generation context ───────────────────────────────────────────────────────

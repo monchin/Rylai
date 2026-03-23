@@ -1,5 +1,6 @@
 use super::model::*;
 use crate::config::Config;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use syn::{
@@ -169,6 +170,8 @@ pub(crate) struct ParseContext<'a> {
     pub type_alias_map: &'a HashMap<String, Type>,
     /// Attributes of each `#[pyclass]` struct/enum by Rust type name. Used in Style B to restore docstrings.
     pub pyclass_attrs_map: &'a PyclassAttrsMap,
+    /// Optional sink for parse-time warnings (e.g. invalid `rename_all` literals).
+    pub parse_warnings: Option<&'a RefCell<Vec<String>>>,
 }
 
 /// Context for walking `m.add` / `m.add_function` / `m.add_class` in Style B pymodule functions and in
@@ -646,16 +649,25 @@ fn make_field_py_type(
     }
 }
 
-/// Generate [`PyMethod`] stubs for struct fields that carry `#[pyo3(get)]` and/or `#[pyo3(set)]`.
-/// For each such field a getter is emitted first, then (if applicable) a setter.
+/// Generate [`PyMethod`] stubs for struct fields that carry `#[pyo3(get)]` and/or `#[pyo3(set)]`,
+/// or inherit accessors from class-level `#[pyclass(get_all)]` / `#[pyclass(set_all)]` (or the same
+/// flags on `#[pyo3(...)]`).
+///
+/// For each exposed field a getter is emitted first, then (if applicable) a setter.
 fn parse_struct_fields_as_methods(
     fields: &[syn::Field],
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    class_get_all: bool,
+    class_set_all: bool,
+    rename_all: Option<&str>,
+    parse_warnings: Option<&RefCell<Vec<String>>>,
 ) -> Vec<PyMethod> {
     let mut methods = Vec::new();
     for field in fields {
-        let (has_get, has_set) = pyo3_field_flags(&field.attrs);
+        let (field_get, field_set) = pyo3_field_flags(&field.attrs);
+        let has_get = field_get || class_get_all;
+        let has_set = field_set || class_set_all;
         if !has_get && !has_set {
             continue;
         }
@@ -663,7 +675,13 @@ fn parse_struct_fields_as_methods(
             Some(id) => id.to_string(),
             None => continue, // tuple struct field — skip
         };
-        let prop_name = extract_pyo3_name(&field.attrs).unwrap_or_else(|| field_name.clone());
+        let prop_name = extract_pyo3_name(&field.attrs).unwrap_or_else(|| {
+            if let Some(rule) = rename_all {
+                super::rename_all::apply_pyclass_rename_all(&field_name, rule, parse_warnings)
+            } else {
+                field_name.clone()
+            }
+        });
         let doc = extract_doc(&field.attrs);
         let py_type = make_field_py_type(&field.ty, config, type_alias_map);
 
@@ -710,10 +728,35 @@ fn parse_pyclass_struct(
 ) -> PyClass {
     let doc = extract_doc(attrs);
 
-    // Properties from `#[pyo3(get)]` / `#[pyo3(set)]` struct fields come first.
+    let (class_get_all, class_set_all) = extract_pyclass_get_all_set_all(attrs);
+    let rename_all = extract_pyclass_rename_all(attrs);
+    let rename_lit = rename_all.as_deref();
+
+    // Invalid `rename_all` is warned once per class; per-field apply must not repeat the same message.
+    let field_parse_warnings = match rename_lit {
+        Some(rule) if !super::rename_all::is_valid_pyclass_rename_all_rule(rule) => {
+            if let Some(w) = cx.parse_warnings {
+                w.borrow_mut()
+                    .push(super::rename_all::format_invalid_pyclass_rename_all_warning(rule));
+            }
+            None
+        }
+        _ => cx.parse_warnings,
+    };
+
+    // Properties from `#[pyo3(get)]` / `#[pyo3(set)]` struct fields (or `get_all` / `set_all` on the
+    // pyclass) come first.
     let mut methods: Vec<PyMethod> =
         if let Some(fields) = cx.struct_fields_map.get(rust_name_for_impl) {
-            parse_struct_fields_as_methods(fields, cx.config, cx.type_alias_map)
+            parse_struct_fields_as_methods(
+                fields,
+                cx.config,
+                cx.type_alias_map,
+                class_get_all,
+                class_set_all,
+                rename_lit,
+                field_parse_warnings,
+            )
         } else {
             vec![]
         };
@@ -836,7 +879,10 @@ fn extract_attr_string_arg(attr: &Attribute) -> Option<String> {
 pub type ImplMap = std::collections::HashMap<String, Vec<ImplItem>>;
 
 /// Maps Rust struct **simple name** → named fields of that `#[pyclass]` struct.
-/// Used to generate `@property` stubs for fields annotated with `#[pyo3(get)]` / `#[pyo3(set)]`.
+/// Used to generate `@property` stubs for fields annotated with `#[pyo3(get)]` / `#[pyo3(set)]`,
+/// or for all fields when the class uses `get_all` / `set_all` on `#[pyclass]` / `#[pyo3]`.
+/// Python-visible names follow `#[pyo3(name = ...)]` on the field, else `rename_all` on the class,
+/// else the Rust field ident.
 ///
 /// # Known limitation — name collision
 ///
@@ -1249,6 +1295,63 @@ pub fn extract_pyclass_module(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
+/// Returns `(get_all, set_all)` from any `#[pyclass(...)]` or `#[pyo3(...)]` on the pyclass item.
+///
+/// PyO3 allows these flags on either attribute; if either lists `get_all` / `set_all`, the
+/// corresponding side is true.
+pub fn extract_pyclass_get_all_set_all(attrs: &[Attribute]) -> (bool, bool) {
+    let mut get_all = false;
+    let mut set_all = false;
+    for attr in attrs {
+        if !attr.path().is_ident("pyclass") && !attr.path().is_ident("pyo3") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("get_all") {
+                get_all = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("set_all") {
+                set_all = true;
+                return Ok(());
+            }
+            if meta.input.peek(syn::token::Eq) {
+                let _ = meta.value()?.parse::<Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    (get_all, set_all)
+}
+
+/// Last `rename_all = "..."` from any `#[pyclass(...)]` or `#[pyo3(...)]` on the pyclass item.
+///
+/// When both attributes set `rename_all`, the **last** occurrence in source order wins (matching
+/// typical macro “later wins” behavior for duplicate options).
+pub fn extract_pyclass_rename_all(attrs: &[Attribute]) -> Option<String> {
+    let mut last: Option<String> = None;
+    for attr in attrs {
+        if !attr.path().is_ident("pyclass") && !attr.path().is_ident("pyo3") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                if let Ok(v) = meta.value()
+                    && let Ok(s) = v.parse::<LitStr>()
+                {
+                    last = Some(s.value());
+                }
+                return Ok(());
+            }
+            if meta.input.peek(syn::token::Eq) {
+                let _ = meta.value()?.parse::<Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    last
+}
+
 /// Returns true for pyo3 "injected" parameter types that should not appear in the Python stub:
 /// `Python<'_>`, `&Bound<'_, PyModule>`, etc.
 fn is_pyo3_injected_param(ty: &Type) -> bool {
@@ -1312,7 +1415,9 @@ fn type_to_key(ty: &Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::MethodKind;
     use crate::config::{Config, RenderPolicy};
+    use std::cell::RefCell;
     use std::path::Path;
 
     /// Empty enabled features for tests that do not gate on cfg(feature).
@@ -1339,6 +1444,7 @@ mod tests {
             struct_fields_map,
             type_alias_map,
             pyclass_attrs_map,
+            parse_warnings: None,
         }
     }
 
@@ -1432,6 +1538,308 @@ mod tests {
         assert_eq!(
             extract_pyclass_module(&item.attrs),
             Some("abcd.efg".to_string())
+        );
+    }
+
+    // ── extract_pyclass_get_all_set_all ─────────────────────────────────────
+
+    #[test]
+    fn extract_pyclass_get_all_set_all_from_pyclass_list() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(get_all, set_all, name = "Pt")]
+            struct Point {
+                x: i32,
+                y: i32,
+            }
+        };
+        assert_eq!(extract_pyclass_get_all_set_all(&item.attrs), (true, true));
+    }
+
+    #[test]
+    fn extract_pyclass_get_all_set_all_from_pyo3_attr() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(rename_all = "camelCase")]
+            #[pyo3(get_all)]
+            struct Point {
+                x: i32,
+            }
+        };
+        assert_eq!(extract_pyclass_get_all_set_all(&item.attrs), (true, false));
+    }
+
+    #[test]
+    fn pyclass_get_all_set_all_collects_field_properties() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, set_all)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        assert_eq!(class.name, "Point");
+        let getters: Vec<_> = class
+            .methods
+            .iter()
+            .filter(|m| matches!(m.kind, MethodKind::Getter(_)))
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(getters, vec!["x", "y"]);
+        let setters: Vec<_> = class
+            .methods
+            .iter()
+            .filter(|m| matches!(m.kind, MethodKind::Setter(_)))
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(setters, vec!["x", "y"]);
+    }
+
+    // ── extract_pyclass_rename_all / get_all + rename_all ────────────────────
+
+    #[test]
+    fn extract_pyclass_rename_all_from_pyclass() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(rename_all = "camelCase", get_all)]
+            struct Point {
+                x: i32,
+            }
+        };
+        assert_eq!(
+            extract_pyclass_rename_all(&item.attrs).as_deref(),
+            Some("camelCase")
+        );
+    }
+
+    #[test]
+    fn extract_pyclass_rename_all_last_attr_wins() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(rename_all = "camelCase")]
+            #[pyo3(rename_all = "snake_case")]
+            struct Point {}
+        };
+        assert_eq!(
+            extract_pyclass_rename_all(&item.attrs).as_deref(),
+            Some("snake_case")
+        );
+    }
+
+    #[test]
+    fn pyclass_get_all_with_rename_all_collects_camel_property_names() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, rename_all = "camelCase")]
+    struct Point {
+        foo_bar: i32,
+        x: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let getters: Vec<_> = class
+            .methods
+            .iter()
+            .filter(|m| matches!(m.kind, MethodKind::Getter(_)))
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(getters, vec!["fooBar", "x"]);
+    }
+
+    #[test]
+    fn pyo3_field_name_overrides_class_rename_all() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, rename_all = "camelCase")]
+    struct Point {
+        #[pyo3(name = "still_snake")]
+        foo_bar: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let getter = class
+            .methods
+            .iter()
+            .find(|m| matches!(m.kind, MethodKind::Getter(_)))
+            .expect("getter");
+        assert_eq!(getter.name, "still_snake");
+    }
+
+    #[test]
+    fn invalid_rename_all_records_parse_warning_and_keeps_rust_field_name() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, rename_all = "not_a_valid_rule")]
+    struct Point {
+        foo_bar: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let warnings = RefCell::new(Vec::new());
+        let cx = ParseContext {
+            config: &config,
+            impl_map: &impl_map,
+            struct_fields_map: &fields_map,
+            type_alias_map: &type_alias_map,
+            pyclass_attrs_map: &attrs_map,
+            parse_warnings: Some(&warnings),
+        };
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let getter = class
+            .methods
+            .iter()
+            .find(|m| matches!(m.kind, MethodKind::Getter(_)))
+            .expect("getter");
+        assert_eq!(getter.name, "foo_bar");
+        assert_eq!(warnings.borrow().len(), 1);
+        assert!(warnings.borrow()[0].contains("not_a_valid_rule"));
+    }
+
+    #[test]
+    fn invalid_rename_all_single_warning_with_multiple_get_all_fields() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, rename_all = "not_a_valid_rule")]
+    struct Point {
+        foo_bar: i32,
+        baz_qux: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let warnings = RefCell::new(Vec::new());
+        let cx = ParseContext {
+            config: &config,
+            impl_map: &impl_map,
+            struct_fields_map: &fields_map,
+            type_alias_map: &type_alias_map,
+            pyclass_attrs_map: &attrs_map,
+            parse_warnings: Some(&warnings),
+        };
+        let _modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        assert_eq!(warnings.borrow().len(), 1);
+        assert!(warnings.borrow()[0].contains("not_a_valid_rule"));
+    }
+
+    #[test]
+    fn pyclass_rename_all_emits_camel_property_in_generated_stub() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    #[pyclass(get_all, rename_all = "camelCase")]
+    struct Point {
+        foo_bar: i32,
+    }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let path_buf = path.to_path_buf();
+        let config = Config::default();
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let fields_map =
+            build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
+        let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let stub = crate::generator::generate(&modules, &config).expect("stub");
+        assert!(
+            stub.contains("def fooBar(self) -> int:"),
+            "expected camelCase property in stub, got:\n{stub}"
         );
     }
 
