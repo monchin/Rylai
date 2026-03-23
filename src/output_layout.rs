@@ -1,5 +1,13 @@
 //! Resolves output .pyi layout: one file per top-level pymodule, or package layout
 //! when `#[pyclass(module = "...")]` is used.
+//!
+//! The `#[pymodule]` name scopes **collection** (which items belong to this extension). The
+//! `#[pyclass(module = "...")]` string is the Python `__module__` for that class: it may differ
+//! from the pymodule name (e.g. `_pkg` vs `pkg.abc`). Output paths use a hybrid rule
+//! (see [`stub_rel_path`]): when `module` starts with `{pymodule}.`, the first segment is still
+//! implicit under `-o` (backward compatible); otherwise the **public** top-level package segment is
+//! dropped and the remainder is mirrored as directories (`pkg.abc` → `abc.pyi`;
+//! `pkg.cba.foo` → `cba/foo.pyi`).
 
 use crate::collector::{PyItem, PyModule};
 use std::collections::HashMap;
@@ -40,17 +48,19 @@ fn collect_class_modules_recursive(
 pub type OutputSpec = (PathBuf, PyModule);
 
 /// Resolve each top-level `#[pymodule]` into one or more (path, PyModule) pairs.
-/// Single-file mode: one `{name}.pyi` per pymodule when no class has `#[pyclass(module = "...")]`.
-/// Package mode: `{root}.pyi` for the pymodule root and **sibling** `.pyi` files for submodules:
-/// the top-level `#[pymodule]` name is **not** repeated as a directory — `-o` is treated as the
-/// first segment of the Python module path (e.g. `pkg.aaa` → `aaa.pyi` under `-o`, not `pkg/aaa.pyi`).
-/// Deeper paths use folders only after that first segment (e.g. `pkg.pkg.aaa` → `pkg/aaa.pyi`).
+/// Single-file mode: one `{name}.pyi` per pymodule when every class either has no `module = "..."`
+/// or its `module` equals the pymodule root only.
+/// Package mode: `{root}.pyi` for the pymodule root plus additional stubs per distinct class
+/// `module` string. When `module` starts with `{root}.`, the first segment is implicit under `-o`
+/// (e.g. `abcd.efg` → `efg.pyi`; `pkg.pkg.aaa` → `pkg/aaa.pyi`). When it does not (e.g.
+/// `pkg.abc` under pymodule `_pkg`), strip the first dotted segment (public package
+/// name) and mirror the rest (`abc.pyi`, `pkg.cba.x` → `cba/x.pyi`). See
+/// [`stub_rel_path`].
 ///
 /// Stub placement: `#[pyfunction]`, constants, and `#[pyclass]` **without** `module = "..."` use the
-/// top-level `#[pymodule]` name (e.g. `abcd.pyi`). Only `#[pyclass(module = "abcd.sub")]` is emitted
-/// under the corresponding submodule path (runtime `__module__` for that class matches the
-/// annotation). `[tool.maturin] module-name` does not change which `.pyi` file holds functions or
-/// unannotated classes.
+/// top-level `#[pymodule]` name (e.g. `abcd.pyi`). Classes with `#[pyclass(module = "...")]` use
+/// that annotation for both bucket name and (via [`stub_rel_path`]) output path. `[tool.maturin]
+/// module-name` does not change which `.pyi` file holds functions or unannotated classes.
 pub fn resolve(modules: Vec<PyModule>) -> Vec<OutputSpec> {
     let mut out = Vec::new();
     for top in modules {
@@ -88,8 +98,7 @@ fn resolve_one_top_level(module: PyModule) -> Vec<OutputSpec> {
         return vec![(path, stub_module)];
     }
 
-    // Package layout: `{root}.pyi` for the extension root; other modules as siblings under `-o`
-    // (first pymodule segment is implicit — see [`stub_relpath_after_root`]).
+    // Package layout: `{root}.pyi` for the extension root; other modules per [`stub_rel_path`].
     let mut specs = Vec::new();
 
     let root_items = buckets.remove(&root).unwrap_or_default();
@@ -108,7 +117,7 @@ fn resolve_one_top_level(module: PyModule) -> Vec<OutputSpec> {
     submodule_names.sort();
     for sub_name in submodule_names {
         let items = buckets.remove(&sub_name).unwrap_or_default();
-        let path = stub_relpath_after_root(&root, &sub_name);
+        let path = stub_rel_path(&root, &sub_name);
         specs.push((
             path,
             PyModule {
@@ -136,19 +145,13 @@ fn flatten_into_buckets(module: &PyModule, root: &str, buckets: &mut HashMap<Str
     }
 }
 
-/// Target Python module name for the stub file: top-level `#[pymodule]` for functions, constants,
-/// and classes **without** `#[pyclass(module = "...")]`, else the annotated submodule.
+/// Target Python module name for bucketing: top-level `#[pymodule]` for functions, constants, and
+/// classes **without** `#[pyclass(module = "...")]`, else the annotated `module` string as written.
 fn target_output_module(item: &PyItem, root: &str) -> String {
     match item {
         PyItem::Class(c) => {
             if let Some(ref m) = c.module {
-                if m == root || m.starts_with(&format!("{}.", root)) {
-                    return m.clone();
-                }
-                eprintln!(
-                    "warning: #[pyclass(module = \"{}\")] is not under pymodule \"{}\"; emitting class in root",
-                    m, root
-                );
+                return m.clone();
             }
             root.to_string()
         }
@@ -159,24 +162,35 @@ fn target_output_module(item: &PyItem, root: &str) -> String {
     }
 }
 
-/// Dotted Python module → relative path under `-o`, treating the top-level `#[pymodule]` name as
-/// the first segment of the module path (not repeated as a folder).
+/// `full_module` is a dotted child of `root` (`root` or `root.suffix...`), using a segment
+/// boundary match so `root` must not be a mere prefix of the first segment (e.g. `ab` vs `abcd`).
+fn is_child_module_of_root(full_module: &str, root: &str) -> bool {
+    full_module.len() > root.len()
+        && full_module.as_bytes().get(..root.len()) == Some(root.as_bytes())
+        && full_module.as_bytes().get(root.len()) == Some(&b'.')
+}
+
+/// Relative path for the `.pyi` file under `-o` for Python module `full_module`, given top-level
+/// pymodule `root`.
 ///
-/// - `pkg` → `pkg.pyi`
-/// - `pkg.aaa` → `aaa.pyi`
-/// - `pkg._pkg` → `_pkg.pyi`
-/// - `pkg.pkg` → `pkg.pyi` (same file as root — caller merges buckets)
-/// - `pkg.pkg.aaa` → `pkg/aaa.pyi`
-fn stub_relpath_after_root(root: &str, full_module: &str) -> PathBuf {
+/// - `root` → `{root}.pyi`
+/// - `{root}.child...` → strip `root.` then apply [`module_name_to_path`] (legacy layout:
+///   `pkg.aaa` → `aaa.pyi`, `pkg.pkg` → `pkg.pyi`, `pkg.pkg.aaa` → `pkg/aaa.pyi`)
+/// - any other name → drop the first dotted segment (public package), then [`module_name_to_path`]
+///   on the remainder (e.g. `pkg.abc` → `abc.pyi`; `pkg.cba.x` →
+///   `cba/x.pyi`). A single segment (no dot) uses that segment as the file stem.
+fn stub_rel_path(root: &str, full_module: &str) -> PathBuf {
     if full_module == root {
         return PathBuf::from(format!("{}.pyi", root));
     }
-    let prefix = format!("{}.", root);
-    assert!(
-        full_module.starts_with(&prefix),
-        "module {full_module} must be under pymodule {root}"
-    );
-    let rest = &full_module[prefix.len()..];
+    if is_child_module_of_root(full_module, root) {
+        let rest = &full_module[root.len() + 1..];
+        return module_name_to_path(rest);
+    }
+    let rest = full_module
+        .split_once('.')
+        .map(|(_, after)| after)
+        .unwrap_or(full_module);
     module_name_to_path(rest)
 }
 
@@ -184,7 +198,7 @@ fn stub_relpath_after_root(root: &str, full_module: &str) -> PathBuf {
 /// `root` as the defining module so the generator does not emit `from root.child import` for
 /// symbols in the same stub.
 fn layout_emit_module_for_imports(root: &str, full: &str) -> String {
-    let p = stub_relpath_after_root(root, full);
+    let p = stub_rel_path(root, full);
     let root_stub = format!("{}.pyi", root);
     if p == Path::new(&root_stub) {
         root.to_string()
@@ -198,7 +212,7 @@ fn merge_buckets_sharing_root_stub(root: &str, buckets: &mut HashMap<String, Vec
     let root_py = PathBuf::from(format!("{}.pyi", root));
     let to_merge: Vec<String> = buckets
         .keys()
-        .filter(|k| *k != root && stub_relpath_after_root(root, k.as_str()) == root_py)
+        .filter(|k| *k != root && stub_rel_path(root, k.as_str()) == root_py)
         .cloned()
         .collect();
     for k in to_merge {
@@ -292,9 +306,9 @@ mod tests {
         assert!(by_path.contains_key(&PathBuf::from("efg.pyi")));
         let init = by_path.get(&PathBuf::from("abcd.pyi")).unwrap();
         assert_eq!(init.items.len(), 2); // constant + Operator class (no maturin)
-        let layers = by_path.get(&PathBuf::from("efg.pyi")).unwrap();
-        assert_eq!(layers.items.len(), 1);
-        match &layers.items[0] {
+        let efg = by_path.get(&PathBuf::from("efg.pyi")).unwrap();
+        assert_eq!(efg.items.len(), 1);
+        match &efg.items[0] {
             PyItem::Class(c) => assert_eq!(c.name, "Layer"),
             _ => panic!("expected class"),
         }
@@ -345,8 +359,8 @@ mod tests {
         let init = by_path.get(&PathBuf::from("abcd.pyi")).unwrap();
         assert!(init.items.is_empty());
         assert_eq!(init.doc, vec!["Root doc.".to_string()]);
-        let layers = by_path.get(&PathBuf::from("efg.pyi")).unwrap();
-        assert_eq!(layers.items.len(), 1);
+        let efg = by_path.get(&PathBuf::from("efg.pyi")).unwrap();
+        assert_eq!(efg.items.len(), 1);
     }
 
     /// `pkg.pkg.aaa` keeps a `pkg/` directory for the second segment onward.
@@ -418,5 +432,66 @@ mod tests {
         };
         let map = rust_class_defining_modules(std::slice::from_ref(&m));
         assert_eq!(map.get("X").map(String::as_str), Some("abcd"));
+    }
+
+    /// Extension module name (`_pkg`) may differ from public `#[pyclass(module = "pkg.*")]`.
+    #[test]
+    fn pyclass_module_independent_of_pymodule_name() {
+        let m = PyModule {
+            name: "_pkg".to_string(),
+            doc: vec![],
+            items: vec![
+                PyItem::Function(PyFunction {
+                    name: "version".to_string(),
+                    doc: vec![],
+                    signature_override: None,
+                    params: vec![],
+                    return_type: PyType {
+                        rust_type: syn::parse_quote! { () },
+                        override_str: None,
+                    },
+                    source_file: dummy_path(),
+                }),
+                PyItem::Class(make_class("Operator", Some("pkg.abc"))),
+            ],
+            source_file: dummy_path(),
+        };
+        let specs = resolve_one_top_level(m);
+        assert_eq!(specs.len(), 2);
+        let by_path: HashMap<_, _> = specs.into_iter().collect();
+        assert!(by_path.contains_key(&PathBuf::from("_pkg.pyi")));
+        assert!(by_path.contains_key(&PathBuf::from("abc.pyi")));
+        let ext = by_path.get(&PathBuf::from("_pkg.pyi")).unwrap();
+        assert_eq!(ext.items.len(), 1);
+        let op = by_path.get(&PathBuf::from("abc.pyi")).unwrap();
+        assert_eq!(op.name, "pkg.abc");
+        assert_eq!(op.items.len(), 1);
+    }
+
+    #[test]
+    fn rust_class_defining_modules_independent_pyclass_module() {
+        let m = PyModule {
+            name: "_pkg".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Class(make_class("Operator", Some("pkg.abc")))],
+            source_file: dummy_path(),
+        };
+        let map = rust_class_defining_modules(std::slice::from_ref(&m));
+        assert_eq!(map.get("Operator").map(String::as_str), Some("pkg.abc"));
+    }
+
+    #[test]
+    fn pyclass_public_module_strips_only_top_level_package() {
+        let m = PyModule {
+            name: "_pkg".to_string(),
+            doc: vec![],
+            items: vec![PyItem::Class(make_class("X", Some("pkg.cba.abc")))],
+            source_file: dummy_path(),
+        };
+        let specs = resolve_one_top_level(m);
+        assert_eq!(specs.len(), 2);
+        let paths: Vec<_> = specs.iter().map(|(p, _)| p.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("_pkg.pyi")));
+        assert!(paths.contains(&PathBuf::from("cba/abc.pyi")));
     }
 }
