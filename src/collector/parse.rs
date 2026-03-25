@@ -54,7 +54,18 @@ fn collect_type_aliases_from_items(
 }
 
 /// Recursively expand type aliases in `ty` using `map`. Stops at depth limit to avoid cycles.
-fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Type {
+///
+/// When `preserve_alias_idents` contains the alias ident, expansion is skipped so the name is
+/// preserved for [`crate::type_map::map_type`] (via merged `known_classes`) — e.g. `Vec<PyBbox>`
+/// → `list[BBox]` instead of losing `PyBbox` after expanding to a tuple. The set is built from
+/// [`crate::config::type_map_preserve_alias_idents`] so ambiguous `[type_map]` keys do not preserve
+/// the wrong alias.
+fn expand_type_aliases(
+    ty: &Type,
+    map: &HashMap<String, Type>,
+    preserve_alias_idents: &HashSet<String>,
+    depth: u8,
+) -> Type {
     if depth >= MAX_TYPE_ALIAS_DEPTH {
         return ty.clone();
     }
@@ -62,7 +73,10 @@ fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Typ
         Type::Path(tp) if is_single_ident_path(tp) => {
             let name = tp.path.segments.last().unwrap().ident.to_string();
             if let Some(underlying) = map.get(&name) {
-                return expand_type_aliases(underlying, map, depth + 1);
+                if preserve_alias_idents.contains(&name) {
+                    return ty.clone();
+                }
+                return expand_type_aliases(underlying, map, preserve_alias_idents, depth + 1);
             }
             ty.clone()
         }
@@ -73,7 +87,7 @@ fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Typ
             {
                 for arg in ab.args.iter_mut() {
                     if let syn::GenericArgument::Type(t) = arg {
-                        *t = expand_type_aliases(t, map, depth + 1);
+                        *t = expand_type_aliases(t, map, preserve_alias_idents, depth + 1);
                     }
                 }
             }
@@ -82,7 +96,12 @@ fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Typ
         Type::Tuple(t) => {
             let mut elems = syn::punctuated::Punctuated::new();
             for pair in t.elems.pairs() {
-                elems.push_value(expand_type_aliases(pair.value(), map, depth + 1));
+                elems.push_value(expand_type_aliases(
+                    pair.value(),
+                    map,
+                    preserve_alias_idents,
+                    depth + 1,
+                ));
                 if let Some(punct) = pair.punct() {
                     elems.push_punct(**punct);
                 }
@@ -93,7 +112,7 @@ fn expand_type_aliases(ty: &Type, map: &HashMap<String, Type>, depth: u8) -> Typ
             })
         }
         Type::Reference(r) => {
-            let elem = expand_type_aliases(&r.elem, map, depth + 1);
+            let elem = expand_type_aliases(&r.elem, map, preserve_alias_idents, depth + 1);
             Type::Reference(syn::TypeReference {
                 elem: Box::new(elem),
                 ..r.clone()
@@ -178,6 +197,8 @@ pub(crate) struct ParseContext<'a> {
     pub pyclass_enum_rust_names: Option<&'a PyclassEnumRustNames>,
     /// Optional sink for parse-time warnings (e.g. invalid `rename_all` literals).
     pub parse_warnings: Option<&'a RefCell<Vec<String>>>,
+    /// From [`crate::config::type_map_preserve_alias_idents`]; used when expanding `type` aliases.
+    pub type_map_preserve_idents: &'a HashSet<String>,
 }
 
 /// Context for walking `m.add` / `m.add_function` / `m.add_class` in Style B pymodule functions and in
@@ -264,7 +285,13 @@ fn collect_items_from_list(
         match item {
             Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
                 if cfg_is_active(&f.attrs, enabled)
-                    && let Some(func) = parse_pyfunction(f, path, cx.config, cx.type_alias_map)
+                    && let Some(func) = parse_pyfunction(
+                        f,
+                        path,
+                        cx.config,
+                        cx.type_alias_map,
+                        cx.type_map_preserve_idents,
+                    )
                 {
                     result.push(PyItem::Function(func));
                 }
@@ -389,6 +416,7 @@ fn collect_add_calls_from_expr(
                             ctx.path,
                             ctx.cx.config,
                             ctx.cx.type_alias_map,
+                            ctx.cx.type_map_preserve_idents,
                         )
                     {
                         out.push(PyItem::Function(func));
@@ -529,13 +557,14 @@ fn find_pyfunction_by_name(
     path: &Path,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> Option<PyFunction> {
     for item in file_items {
         if let Item::Fn(f) = item
             && f.sig.ident == name
             && has_attr(&f.attrs, "pyfunction")
         {
-            return parse_pyfunction(f, path, config, type_alias_map);
+            return parse_pyfunction(f, path, config, type_alias_map, type_map_preserve_idents);
         }
     }
     None
@@ -548,16 +577,24 @@ pub fn parse_pyfunction(
     path: &Path,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> Option<PyFunction> {
-    // #[pyo3(name = "foo")] overrides the Rust function name
-    let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| f.sig.ident.to_string());
+    // #[pyo3(name = "foo")] overrides the Python-exposed name; keep Rust ident for [[override]] keys.
+    let rust_name = f.sig.ident.to_string();
+    let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| rust_name.clone());
     let doc = extract_doc(&f.attrs);
     let signature_override = extract_pyo3_signature(&f.attrs);
-    let params = parse_params(&f.sig, config, type_alias_map);
-    let return_type = parse_return_type(&f.sig.output, config, type_alias_map);
+    let params = parse_params(&f.sig, config, type_alias_map, type_map_preserve_idents);
+    let return_type = parse_return_type(
+        &f.sig.output,
+        config,
+        type_alias_map,
+        type_map_preserve_idents,
+    );
 
     Some(PyFunction {
         name,
+        rust_name,
         doc,
         signature_override,
         params,
@@ -570,6 +607,7 @@ fn parse_params(
     sig: &Signature,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> Vec<PyParam> {
     let mut params = Vec::new();
     for input in &sig.inputs {
@@ -584,7 +622,8 @@ fn parse_params(
                     Pat::Ident(pi) => pi.ident.to_string(),
                     _ => "_".to_string(),
                 };
-                let rust_type = expand_type_aliases(&pt.ty, type_alias_map, 0);
+                let rust_type =
+                    expand_type_aliases(&pt.ty, type_alias_map, type_map_preserve_idents, 0);
                 let override_str = lookup_type_override(&pt.ty, config)
                     .or_else(|| lookup_type_override(&rust_type, config));
                 params.push(PyParam {
@@ -606,6 +645,7 @@ fn parse_return_type(
     output: &ReturnType,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> PyType {
     match output {
         ReturnType::Default => PyType {
@@ -613,7 +653,7 @@ fn parse_return_type(
             override_str: None,
         },
         ReturnType::Type(_, ty) => {
-            let rust_type = expand_type_aliases(ty, type_alias_map, 0);
+            let rust_type = expand_type_aliases(ty, type_alias_map, type_map_preserve_idents, 0);
             let override_str = lookup_type_override(ty, config)
                 .or_else(|| lookup_type_override(&rust_type, config));
             PyType {
@@ -656,8 +696,9 @@ fn make_field_py_type(
     ty: &Type,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> PyType {
-    let rust_type = expand_type_aliases(ty, type_alias_map, 0);
+    let rust_type = expand_type_aliases(ty, type_alias_map, type_map_preserve_idents, 0);
     let override_str =
         lookup_type_override(ty, config).or_else(|| lookup_type_override(&rust_type, config));
     PyType {
@@ -673,8 +714,7 @@ fn make_field_py_type(
 /// For each exposed field a getter is emitted first, then (if applicable) a setter.
 fn parse_struct_fields_as_methods(
     fields: &[syn::Field],
-    config: &Config,
-    type_alias_map: &HashMap<String, Type>,
+    cx: ParseContext<'_>,
     class_get_all: bool,
     class_set_all: bool,
     rename_all: Option<&str>,
@@ -700,7 +740,12 @@ fn parse_struct_fields_as_methods(
             }
         });
         let doc = extract_doc(&field.attrs);
-        let py_type = make_field_py_type(&field.ty, config, type_alias_map);
+        let py_type = make_field_py_type(
+            &field.ty,
+            cx.config,
+            cx.type_alias_map,
+            cx.type_map_preserve_idents,
+        );
 
         if has_get {
             methods.push(PyMethod {
@@ -788,8 +833,7 @@ fn parse_pyclass_struct(
         if let Some(fields) = cx.struct_fields_map.get(rust_name_for_impl) {
             parse_struct_fields_as_methods(
                 fields,
-                cx.config,
-                cx.type_alias_map,
+                cx,
                 class_get_all,
                 class_set_all,
                 rename_lit,
@@ -806,7 +850,14 @@ fn parse_pyclass_struct(
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|item| parse_pymethod(&item, cx.config, cx.type_alias_map)),
+            .filter_map(|item| {
+                parse_pymethod(
+                    &item,
+                    cx.config,
+                    cx.type_alias_map,
+                    cx.type_map_preserve_idents,
+                )
+            }),
     );
 
     PyClass {
@@ -826,6 +877,7 @@ fn parse_pymethod(
     item: &ImplItem,
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
+    type_map_preserve_idents: &HashSet<String>,
 ) -> Option<PyMethod> {
     let ImplItem::Fn(m) = item else { return None };
 
@@ -834,8 +886,13 @@ fn parse_pymethod(
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| rust_ident.clone());
     let doc = extract_doc(&m.attrs);
     let signature_override = extract_pyo3_signature(&m.attrs);
-    let params = parse_params(&m.sig, config, type_alias_map);
-    let return_type = parse_return_type(&m.sig.output, config, type_alias_map);
+    let params = parse_params(&m.sig, config, type_alias_map, type_map_preserve_idents);
+    let return_type = parse_return_type(
+        &m.sig.output,
+        config,
+        type_alias_map,
+        type_map_preserve_idents,
+    );
     let kind = detect_method_kind(&m.attrs, &name);
 
     Some(PyMethod {
@@ -1578,6 +1635,9 @@ fn lookup_type_override(ty: &Type, config: &Config) -> Option<String> {
     config.type_map.get(&key).cloned()
 }
 
+/// Builds a `[type_map]` lookup key from `ty`. Only [`Type::Path`] (and references to one) produce
+/// a non-empty string; tuples and other shapes return `""`, so literal `(T, U, …)` cannot be keyed
+/// in config — users need a Rust `type` alias (documented in README).
 fn type_to_key(ty: &Type) -> String {
     match ty {
         Type::Path(tp) => tp
@@ -1599,6 +1659,10 @@ mod tests {
     use crate::config::{Config, RenderPolicy};
     use std::cell::RefCell;
     use std::path::Path;
+    use std::sync::LazyLock;
+
+    /// Empty `[type_map]` preserve set for `parse_pyfunction` tests with default config.
+    static EMPTY_TYPE_MAP_PRESERVE: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
 
     /// Empty enabled features for tests that do not gate on cfg(feature).
     fn no_features() -> Vec<String> {
@@ -1618,6 +1682,9 @@ mod tests {
         type_alias_map: &'a HashMap<String, Type>,
         pyclass_attrs_map: &'a PyclassAttrsMap,
     ) -> ParseContext<'a> {
+        let preserve: &'a HashSet<String> = Box::leak(Box::new(
+            crate::config::type_map_preserve_alias_idents(&config.type_map),
+        ));
         ParseContext {
             config,
             impl_map,
@@ -1626,6 +1693,7 @@ mod tests {
             pyclass_attrs_map,
             pyclass_enum_rust_names: None,
             parse_warnings: None,
+            type_map_preserve_idents: preserve,
         }
     }
 
@@ -1929,6 +1997,8 @@ mod my_mod {
             build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
         let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
         let warnings = RefCell::new(Vec::new());
+        let type_map_preserve_idents =
+            crate::config::type_map_preserve_alias_idents(&config.type_map);
         let cx = ParseContext {
             config: &config,
             impl_map: &impl_map,
@@ -1937,6 +2007,7 @@ mod my_mod {
             pyclass_attrs_map: &attrs_map,
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
+            type_map_preserve_idents: &type_map_preserve_idents,
         };
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let class = match &modules[0].items[0] {
@@ -1979,6 +2050,8 @@ mod my_mod {
             build_struct_fields_map(&[(path_buf.clone(), file.clone())], &no_features());
         let attrs_map = build_pyclass_attrs_map(&[(path_buf, file.clone())], &no_features());
         let warnings = RefCell::new(Vec::new());
+        let type_map_preserve_idents =
+            crate::config::type_map_preserve_alias_idents(&config.type_map);
         let cx = ParseContext {
             config: &config,
             impl_map: &impl_map,
@@ -1987,6 +2060,7 @@ mod my_mod {
             pyclass_attrs_map: &attrs_map,
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
+            type_map_preserve_idents: &type_map_preserve_idents,
         };
         let _modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         assert_eq!(warnings.borrow().len(), 1);
@@ -2142,6 +2216,89 @@ mod my_mod {
             mapping.py_type, "list[tuple[float, float, float, float]]",
             "Vec<PyBbox> with type PyBbox = (f32, f32, f32, f32) should map to list[tuple[float, float, float, float]]"
         );
+    }
+
+    /// `[type_map] PyBbox = "BBox"` must apply inside `Vec<PyBbox>`: lookup uses only `Vec` as key,
+    /// and expanding the alias to a tuple would drop `PyBbox` before `map_type` runs.
+    #[test]
+    fn type_map_for_alias_used_under_vec_preserves_name_and_maps_inner() {
+        let file = syn::parse_file(
+            r#"
+type PyBbox = (f32, f32, f32, f32);
+
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn find_all_cells_bboxes() -> Vec<PyBbox> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let mut config = Config::default();
+        config
+            .type_map
+            .insert("PyBbox".to_string(), "BBox".to_string());
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        let policy = RenderPolicy::from_version(3, 10);
+        let mut merged = HashMap::new();
+        merged.insert("PyBbox".to_string(), "BBox".to_string());
+        let mapping =
+            crate::type_map::map_type(&func.return_type.rust_type, &policy, None, &merged);
+        assert_eq!(mapping.py_type, "list[BBox]");
+    }
+
+    /// When two `[type_map]` keys share a last segment but map to different Python types, the alias
+    /// name is not treated as preserved — it expands so stubs stay consistent with an ambiguous config.
+    #[test]
+    fn type_map_ambiguous_last_segment_expands_alias() {
+        let file = syn::parse_file(
+            r#"
+type Foo = (i32, i32);
+
+#[pymodule]
+mod my_mod {
+    #[pyfunction]
+    fn f() -> Vec<Foo> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let mut config = Config::default();
+        config
+            .type_map
+            .insert("a::Foo".to_string(), "X".to_string());
+        config
+            .type_map
+            .insert("b::Foo".to_string(), "Y".to_string());
+        let pyclass_map = HashMap::new();
+        let type_alias_map =
+            build_type_alias_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        let policy = RenderPolicy::from_version(3, 10);
+        let mapping =
+            crate::type_map::map_type(&func.return_type.rust_type, &policy, None, &HashMap::new());
+        assert_eq!(mapping.py_type, "list[tuple[int, int]]");
     }
 
     /// When a #[pyfunction] parameter uses a type alias, it is expanded and maps correctly.
@@ -2335,7 +2492,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn py_find_all_cells_bboxes(a: usize) -> usize { a }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         assert_eq!(func.name, "find_all_cells_bboxes");
     }
 
@@ -2346,7 +2510,14 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             fn sum_as_string(a: usize, b: usize) -> String { String::new() }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         assert_eq!(func.name, "sum_as_string");
     }
 
@@ -2490,6 +2661,8 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let fields_map = StructFieldsMap::new();
         let attrs_map = PyclassAttrsMap::new();
         let warnings = RefCell::new(Vec::new());
+        let type_map_preserve_idents =
+            crate::config::type_map_preserve_alias_idents(&config.type_map);
         let cx = ParseContext {
             config: &config,
             impl_map: &impl_map,
@@ -2498,6 +2671,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             pyclass_attrs_map: &attrs_map,
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
+            type_map_preserve_idents: &type_map_preserve_idents,
         };
         let rust_name = item.ident.to_string();
         let class =
@@ -2543,7 +2717,9 @@ enum E { V }
         };
         let config = Config::default();
         let type_alias_map = HashMap::new();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &type_alias_map).unwrap();
+        let preserve = crate::config::type_map_preserve_alias_idents(&config.type_map);
+        let func =
+            parse_pyfunction(&item, dummy_path(), &config, &type_alias_map, &preserve).unwrap();
         assert_eq!(func.name, "foo");
         assert!(func.signature_override.is_some());
     }
@@ -2558,7 +2734,14 @@ enum E { V }
             fn py_find(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         let sig = func.signature_override.unwrap();
         // Must NOT start with '(' or end with ')'
         assert!(
@@ -2589,7 +2772,14 @@ enum E { V }
             fn py_find_all_cells_bboxes(page: Option<i32>, clip: Option<i32>) -> i32 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         assert_eq!(func.name, "find_all_cells_bboxes");
         let sig = func.signature_override.unwrap();
         assert!(!sig.starts_with('('), "got: {sig}");
@@ -2611,7 +2801,14 @@ enum E { V }
             ) -> Vec<i32> { vec![] }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         let sig = func.signature_override.unwrap();
         assert!(sig.contains("True"), "expected Python True, got: {sig}");
         assert!(
@@ -2638,7 +2835,14 @@ enum E { V }
             fn f(a: i64, b: i64, c: i64) -> i64 { 0 }
         };
         let config = Config::default();
-        let func = parse_pyfunction(&item, dummy_path(), &config, &HashMap::new()).unwrap();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
         let sig = func.signature_override.unwrap();
         // We strip only the single outer pair; result may still end with ')' if nested
         assert!(

@@ -56,6 +56,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
     let pyclass_enum_rust_names = parse::build_pyclass_enum_rust_names(&files, enabled_features);
 
     let parse_warnings = RefCell::new(Vec::new());
+    let type_map_preserve_idents = crate::config::type_map_preserve_alias_idents(&config.type_map);
     let cx = parse::ParseContext {
         config,
         impl_map: &impl_map,
@@ -64,6 +65,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
         pyclass_attrs_map: &pyclass_attrs_map,
         pyclass_enum_rust_names: Some(&pyclass_enum_rust_names),
         parse_warnings: Some(&parse_warnings),
+        type_map_preserve_idents: &type_map_preserve_idents,
     };
 
     let mut modules: Vec<PyModule> = Vec::new();

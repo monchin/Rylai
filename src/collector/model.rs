@@ -36,7 +36,10 @@ pub struct PyConstant {
 
 #[derive(Debug, Clone)]
 pub struct PyFunction {
+    /// Python-visible name (`#[pyo3(name = "...")]` or the Rust `fn` ident when omitted).
     pub name: String,
+    /// Rust `fn` identifier in source (e.g. `py_foo` while `name` is `foo`). Used for `[[override]]` matching.
+    pub rust_name: String,
     pub doc: Vec<String>,
     /// If `#[pyo3(signature = (...))]` is present, this overrides params.
     pub signature_override: Option<String>,

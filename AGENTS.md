@@ -86,7 +86,10 @@ Stub banner text and the `import typing as t` line live in `src/stub_constants.r
 
 ```toml
 [type_map]
-# Override type resolution for specific Rust paths
+# Keys must be Rust path types (ident or a::b::Type). Literal tuples like (u8, u8, u8, u8) are not
+# paths and cannot be keyed — stub becomes tuple[...]; use `type Color = (...);` + map Color here.
+# If a `type` alias is listed below, Rylai keeps that name (no expand) so Vec<Alias> etc. still resolve.
+# Conflicting keys (same last segment, different Python types) → stderr warning; no short-name merge.
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 "pyo3_chrono::NaiveDateTime" = "datetime.datetime"
 

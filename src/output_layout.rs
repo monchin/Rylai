@@ -267,6 +267,7 @@ mod tests {
             items: vec![
                 PyItem::Function(PyFunction {
                     name: "foo".to_string(),
+                    rust_name: "foo".to_string(),
                     doc: vec![],
                     signature_override: None,
                     params: vec![],
@@ -329,6 +330,7 @@ mod tests {
                 }),
                 PyItem::Function(PyFunction {
                     name: "helper".to_string(),
+                    rust_name: "helper".to_string(),
                     doc: vec![],
                     signature_override: None,
                     params: vec![],
@@ -446,6 +448,7 @@ mod tests {
             items: vec![
                 PyItem::Function(PyFunction {
                     name: "version".to_string(),
+                    rust_name: "version".to_string(),
                     doc: vec![],
                     signature_override: None,
                     params: vec![],

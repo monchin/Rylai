@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
-    /// Extra Rust type → Python type overrides (e.g. "numpy::PyReadonlyArray1" = "numpy.ndarray")
+    /// Rust type → Python type overrides. Keys are Rust **path** spellings (e.g. `PyBbox`, `a::Foo`).
+    /// Literal tuple types in source are not paths and cannot be keyed; use a `type` alias and map that name.
+    /// Aliases listed here are preserved (not expanded to their definition) so nested types like `Vec<Alias>` work.
     #[serde(default)]
     pub type_map: HashMap<String, String>,
 
@@ -285,6 +287,91 @@ impl Config {
         let (major, minor) = self.python_version_tuple();
         RenderPolicy::from_version(major, minor)
     }
+}
+
+/// Rust idents for which every `[type_map]` key sharing this last segment maps to the same Python type.
+/// Used when expanding `type` aliases: only then is the alias name kept for [`crate::type_map::map_type`]
+/// (e.g. `Vec<PyBbox>` stays tied to `PyBbox` instead of expanding to a tuple first).
+pub fn type_map_preserve_alias_idents(type_map: &HashMap<String, String>) -> HashSet<String> {
+    let mut by_last: HashMap<String, HashSet<String>> = HashMap::new();
+    for (k, v) in type_map {
+        let last = k.rsplit("::").next().unwrap().to_string();
+        by_last.entry(last).or_default().insert(v.clone());
+    }
+    by_last
+        .into_iter()
+        .filter(|(_, vs)| vs.len() == 1)
+        .map(|(ident, _)| ident)
+        .collect()
+}
+
+/// Merge `[type_map]` entries into the pyclass-derived `known_classes` map used during stub generation.
+/// Inserts full Rust path keys first (deterministic order), then short-name entries only when the
+/// Python target is unambiguous for that last segment. Warns and keeps existing mappings on conflict.
+pub(crate) fn merge_type_map_into_known_classes(
+    known_classes: &HashMap<String, String>,
+    type_map: &HashMap<String, String>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut m = known_classes.clone();
+
+    let mut keys: Vec<String> = type_map.keys().cloned().collect();
+    keys.sort();
+
+    for k in &keys {
+        let v = type_map.get(k).expect("key from sorted list");
+        match m.get(k.as_str()) {
+            None => {
+                m.insert(k.clone(), v.clone());
+            }
+            Some(existing) if existing == v => {}
+            Some(existing) => {
+                warnings.push(format!(
+                    "rylai: [type_map] key `{k}` conflicts with existing Rust→Python mapping (`{existing}` vs `{v}`); keeping existing"
+                ));
+            }
+        }
+    }
+
+    let mut last_groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for k in &keys {
+        let v = type_map.get(k).expect("key from sorted list");
+        let last = k.rsplit("::").next().unwrap().to_string();
+        last_groups
+            .entry(last)
+            .or_default()
+            .push((k.clone(), v.clone()));
+    }
+
+    let mut lasts: Vec<String> = last_groups.keys().cloned().collect();
+    lasts.sort();
+
+    for last in lasts {
+        let entries = last_groups.get(&last).expect("last segment group");
+        let distinct: HashSet<&str> = entries.iter().map(|(_, v)| v.as_str()).collect();
+        if distinct.len() > 1 {
+            let detail: Vec<String> = entries.iter().map(|(k, v)| format!("{k} → {v}")).collect();
+            warnings.push(format!(
+                "rylai: [type_map] ambiguous type name `{last}` (multiple Python targets): {}; not registering short name — use full Rust paths in config or disambiguate",
+                detail.join(", ")
+            ));
+            continue;
+        }
+        let v = &entries[0].1;
+        match m.get(&last) {
+            None => {
+                m.insert(last.clone(), v.clone());
+            }
+            Some(existing) if existing == v => {}
+            Some(existing) => {
+                warnings.push(format!(
+                    "rylai: [type_map] short name `{last}` would map to `{v}` but existing mapping is `{existing}`; keeping existing"
+                ));
+            }
+        }
+    }
+
+    (m, warnings)
 }
 
 #[cfg(test)]
@@ -706,5 +793,48 @@ add_header = false
             config.type_map.get("only::Rylai").map(String::as_str),
             Some("rylai.Only")
         );
+    }
+
+    #[test]
+    fn type_map_preserve_alias_idents_requires_unambiguous_last_segment() {
+        let mut m = HashMap::new();
+        m.insert("a::Foo".to_string(), "X".to_string());
+        m.insert("b::Foo".to_string(), "Y".to_string());
+        let idents = type_map_preserve_alias_idents(&m);
+        assert!(!idents.contains("Foo"));
+
+        let mut m2 = HashMap::new();
+        m2.insert("a::Foo".to_string(), "X".to_string());
+        m2.insert("b::Foo".to_string(), "X".to_string());
+        let idents2 = type_map_preserve_alias_idents(&m2);
+        assert!(idents2.contains("Foo"));
+    }
+
+    #[test]
+    fn merge_type_map_into_known_classes_warns_and_skips_ambiguous_short_name() {
+        let known = HashMap::new();
+        let mut tm = HashMap::new();
+        tm.insert("a::Foo".to_string(), "P".to_string());
+        tm.insert("b::Foo".to_string(), "Q".to_string());
+        tm.insert("crate::Bar".to_string(), "BarT".to_string());
+
+        let (m, w) = merge_type_map_into_known_classes(&known, &tm);
+        assert!(!m.contains_key("Foo"));
+        assert!(w.iter().any(|s| s.contains("ambiguous")));
+        assert_eq!(m.get("a::Foo").map(String::as_str), Some("P"));
+        assert_eq!(m.get("crate::Bar").map(String::as_str), Some("BarT"));
+        assert_eq!(m.get("Bar").map(String::as_str), Some("BarT"));
+    }
+
+    #[test]
+    fn merge_type_map_into_known_classes_keeps_known_class_on_short_name_conflict() {
+        let mut known = HashMap::new();
+        known.insert("Foo".to_string(), "ExistingPy".to_string());
+        let mut tm = HashMap::new();
+        tm.insert("x::Foo".to_string(), "NewT".to_string());
+        let (m, w) = merge_type_map_into_known_classes(&known, &tm);
+        assert_eq!(m.get("Foo").map(String::as_str), Some("ExistingPy"));
+        assert_eq!(m.get("x::Foo").map(String::as_str), Some("NewT"));
+        assert!(w.iter().any(|s| s.contains("short name")));
     }
 }

@@ -150,9 +150,25 @@ enabled = ["some_feature"]
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 "numpy::PyReadonlyArray2" = "numpy.ndarray"
 
+# [type_map] limitations (read this if a mapping seems ignored):
+# - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
+#   (e.g. crate::types::MyHandle). Rylai derives the lookup key from path segments only.
+# - Anonymous tuple types written in source, e.g. (u8, u8, u8, u8), are *not* path types and
+#   cannot appear as keys. They are always stubbed as tuple[...] from their elements. To emit a
+#   single Python name (e.g. PyColor), define `type PyColor = (u8, u8, u8, u8);`, use `PyColor` in
+#   signatures and fields, then add "PyColor" = "Color" under [type_map].
+# - If a Rust `type` alias is listed here, Rylai keeps that alias name when generating stubs
+#   (instead of expanding it), so nested uses like Vec<ThatAlias> still resolve to your Python type.
+# - If two keys share the same last path segment but map to different Python types, Rylai warns on
+#   stderr, omits the ambiguous short-name lookup, and does not preserve that alias name during
+#   expansion (use a single consistent target or disambiguate with a bare key only when unique).
+
 [[override]]
 # Single-line def/class header for a top-level item (Rust `///` doc is copied into the .pyi when present).
 # You do not need a trailing `...`; Rylai adds `    ...` as the body when there is no Rust doc.
+# For `#[pyfunction]`, the last segment of `item` may be the Python-exposed name *or* the Rust `fn` ident
+# (they differ when `#[pyo3(name = "...")]` is set), e.g. `tablers::get_intersections_from_edges` or
+# `tablers::py_get_intersections_from_edges` for the same export.
 item = "my_module::complex_function"
 stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 
@@ -208,6 +224,7 @@ python_version = "3.10"
 strategy = "any"
 
 [tool.rylai.type_map]
+# Same rules as root [type_map] above (Rust paths only; literal tuples need a `type` alias + map).
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 
 [[tool.rylai.override]]

@@ -2,7 +2,9 @@ use crate::collector::{
     ExtendsSpec, MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod,
     PyModule, PyParam, PyType,
 };
-use crate::config::{Config, FallbackStrategy, OverrideEntry, RenderPolicy};
+use crate::config::{
+    Config, FallbackStrategy, OverrideEntry, RenderPolicy, merge_type_map_into_known_classes,
+};
 use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
 use crate::type_map::{self, TypeMapping};
 use anyhow::{Result, bail};
@@ -26,6 +28,10 @@ pub fn generate_with_known_classes(
 ) -> Result<String> {
     let policy = config.render_policy();
     let logical_module = cross_import.map(|(s, _)| s.to_string()).unwrap_or_default();
+    let (known_classes, type_map_warnings) =
+        merge_type_map_into_known_classes(known_classes, &config.type_map);
+    let mut warnings = pre_warnings.to_vec();
+    warnings.extend(type_map_warnings);
     let mut ctx = GenCtx {
         config,
         policy,
@@ -34,9 +40,9 @@ pub fn generate_with_known_classes(
         needs_self_import: false,
         needs_path_import: false,
         needs_union: false,
-        warnings: pre_warnings.to_vec(),
+        warnings,
         current_self_type: None,
-        known_classes: known_classes.clone(),
+        known_classes,
         current_stub_module: cross_import.map(|(s, _)| s.to_string()),
         class_rust_to_module: cross_import.map(|(_, m)| (*m).clone()),
         cross_module_imports: BTreeMap::new(),
@@ -345,9 +351,11 @@ impl<'a> GenCtx<'a> {
 
         for item in &module.items {
             // Check for manual override
-            let override_stub = self.config.overrides.iter().find(|o| {
-                o.item.ends_with(&format!("::{}", item_name(item))) || o.item == item_name(item)
-            });
+            let override_stub = self
+                .config
+                .overrides
+                .iter()
+                .find(|o| module_level_override_matches(&o.item, item));
             if let Some(ov) = override_stub {
                 self.emit_override(ov, item, out, indent)?;
                 continue;
@@ -990,6 +998,24 @@ fn item_name(item: &PyItem) -> &str {
     }
 }
 
+/// `[[override]]` `item` for a top-level pymodule member: `logical_mod::python_name`, suffix `::python_name`,
+/// or bare `python_name`. For `#[pyfunction]`, `#[pyo3(name = "...")]` can differ from the Rust `fn` name,
+/// so we also match `::rust_fn_ident` and bare `rust_fn_ident` (same as [`PyFunction::rust_name`]).
+fn module_level_override_matches(o_item: &str, item: &PyItem) -> bool {
+    match item {
+        PyItem::Function(f) => {
+            o_item.ends_with(&format!("::{}", f.name))
+                || o_item == f.name.as_str()
+                || o_item.ends_with(&format!("::{}", f.rust_name))
+                || o_item == f.rust_name.as_str()
+        }
+        _ => {
+            let n = item_name(item);
+            o_item.ends_with(&format!("::{n}")) || o_item == n
+        }
+    }
+}
+
 /// Split a parameter-list string at top-level commas, respecting nested brackets.
 ///
 /// For example, `"a, b=(1,2), **kwargs"` yields `["a", " b=(1,2)", " **kwargs"]`.
@@ -1056,6 +1082,7 @@ mod tests {
     fn make_fn(name: &str, sig: Option<&str>, params: Vec<PyParam>, ret: syn::Type) -> PyFunction {
         PyFunction {
             name: name.to_string(),
+            rust_name: name.to_string(),
             doc: vec![],
             signature_override: sig.map(str::to_string),
             params,
@@ -1727,6 +1754,30 @@ mod tests {
             "qualified override header must appear, got:\n{stub}"
         );
         assert!(stub.contains("    ...\n"), "got:\n{stub}");
+    }
+
+    /// `#[pyfunction]` with `#[pyo3(name = "...")]` uses a Python name that differs from the Rust `fn` ident;
+    /// `[[override]]` `item` may still use `module::rust_fn_ident`.
+    #[test]
+    fn config_override_module_fn_matches_rust_ident_when_python_name_differs() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::py_get_intersections_from_edges".to_string(),
+            stub: "def get_intersections_from_edges() -> int: ...".to_string(),
+        });
+        let mut f = make_fn(
+            "get_intersections_from_edges",
+            None,
+            vec![],
+            syn::parse_quote! { () },
+        );
+        f.rust_name = "py_get_intersections_from_edges".to_string();
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("def get_intersections_from_edges() -> int:"),
+            "override matched by rust_name must appear, got:\n{stub}"
+        );
     }
 
     /// Override without trailing `...` in TOML: Rust `///` doc becomes the `.pyi` docstring.
