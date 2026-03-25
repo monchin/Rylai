@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
+
 class B:
-    def __init__(self) -> None:
-        ...
-
-
+    def __init__(self) -> None: ...

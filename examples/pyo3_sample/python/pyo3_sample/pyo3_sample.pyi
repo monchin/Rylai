@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+
+from ._typing import KwargsItems
+
+if sys.version_info < (3, 11):
+    from typing_extensions import Unpack
+else:
+    from typing import Unpack
+
 # Module: pyo3_sample
 def sum_as_string(a: int, b: int) -> str:
     """Formats the sum of two numbers as string."""
@@ -9,8 +18,8 @@ def sum_as_string(a: int, b: int) -> str:
 def add(a: int, b: int) -> int:
     """Renamed via #[pyo3(name = "...")]"""
 
+def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
+    """Example of using "add_content" in rylai.toml to show the types of kwargs."""
+
 class C:
-    def __init__(self) -> None:
-        ...
-
-
+    def __init__(self) -> None: ...

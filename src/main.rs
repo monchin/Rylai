@@ -1,7 +1,9 @@
+mod add_content;
 mod collector;
 mod config;
 mod generator;
 mod output_layout;
+mod stub_constants;
 mod type_map;
 
 use anyhow::{Context, Result};
@@ -61,6 +63,8 @@ fn main() -> Result<()> {
         let name = infer_module_name_from_pyproject(&cli.crate_root)
             .or_else(|| infer_module_name_from_cargo(&cli.crate_root))
             .unwrap_or_else(|| "stub".to_string());
+        let rel = PathBuf::from(format!("{name}.pyi"));
+        config::validate_add_content_targets(&config.add_content, std::slice::from_ref(&rel))?;
         let path = out_dir.join(format!("{name}.pyi"));
         let stub = generator::generate_with_known_classes(
             &items,
@@ -69,6 +73,7 @@ fn main() -> Result<()> {
             &pre_warnings,
             None,
         )?;
+        let stub = add_content::apply_add_content(&stub, &rel, &config.add_content)?;
         std::fs::write(&path, stub)?;
         println!("Generated: {}", path.display());
         generated_paths.push(path);
@@ -76,6 +81,9 @@ fn main() -> Result<()> {
         // Resolve layout: one or more (path, PyModule) per top-level pymodule (package mode when
         // #[pyclass(module = "...")] is used). Functions/constants/unannotated classes use the root stub.
         let output_specs = output_layout::resolve(items.clone());
+        let generated_rel_paths: Vec<PathBuf> =
+            output_specs.iter().map(|(p, _)| p.clone()).collect();
+        config::validate_add_content_targets(&config.add_content, &generated_rel_paths)?;
         let class_defining_modules = output_layout::rust_class_defining_modules(&items);
         let mut seen_output_paths: HashSet<PathBuf> = HashSet::new();
         for (idx, (rel_path, stub_module)) in output_specs.into_iter().enumerate() {
@@ -104,6 +112,7 @@ fn main() -> Result<()> {
                 warnings,
                 Some((stub_module.name.as_str(), &class_defining_modules)),
             )?;
+            let stub = add_content::apply_add_content(&stub, &rel_path, &config.add_content)?;
             std::fs::write(&path, stub)?;
             println!("Generated: {}", path.display());
             generated_paths.push(path);

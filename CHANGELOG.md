@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `[[add_content]]` / `[[tool.rylai.add_content]]`: inject raw Python into generated `.pyi` files by output path relative to `-o` (`file`), with `location` = `head` (after the auto-generated banner, or at file start if the banner is off), `after-import-typing`, or `tail`. Every configured `file` must match a stub path produced in the same run (otherwise Rylai errors).
 - Support for `#[pyclass(module = "...")]`: when any class declares a Python submodule, Rylai emits multiple `.pyi` files under `-o` instead of a single flat stub. Layout treats the top-level `#[pymodule]` name as the first segment of the module path (sibling stubs such as `efg.pyi` for `pkg.efg`, with rules for nested paths and merging when a submodule maps to the same file as the root stub). Root stub may be empty except for the pymodule docstring when all classes are routed to submodules.
 - `#[pymodule]` name and `#[pyclass(module = "...")]` may differ (e.g. internal extension module vs public package). Stub paths under `-o` use hybrid rules: when `module` starts with `{pymodule}.`, behavior matches the usual layout; otherwise the leading public package segment is dropped and the remainder is mirrored as files and directories (e.g. `pkg.abc` → `abc.pyi`, `pkg.cba.foo` → `cba/foo.pyi`).
 - Absolute `from ... import ...` lines for cross-stub references: when a signature references a `#[pyclass]` emitted in another generated submodule, the stub prepends the import so Pyright/mypy resolve the type. Cross-module reference collection walks arrays, pointers, `impl Trait` bounds, and common generic wrappers (`Option`, `Vec`, `PyResult`, `Py`/`Bound`, maps/sets, etc.).
@@ -17,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `[[override]]` for a single-line top-level `def` or `class`: Rust doc comments on that item are emitted as the `.pyi` docstring; trailing `...` on the override line is stripped; when there is no Rust doc, Rylai appends `...` as the stub body so formatters stay happy. Multiline overrides and non-function/class items stay mostly verbatim (trimmed, trailing `...` still stripped as a suffix). **Migration:** if you relied on a single-line `def`/`class` override being pasted verbatim (including any `...` body on the same line), re-check those stubs after upgrading—behavior is now “header + doc/body” as above.
+- Every generated stub now includes `import typing as t` (even when the body does not reference `t`), so `add_content` with `location = "after-import-typing"` always has a stable anchor. Remove unused imports with your formatter/linter if desired (e.g. `ruff check --select F401 --fix` — `ruff format` alone does not remove them).
 - Generated stubs now use `import typing as t` and qualified annotations (`t.Any`, `t.Optional[...]`, `t.Union[...]`, `t.Self`, `t.Final[...]`) instead of `from typing import ...`, so extending typing usage in emitted `.pyi` files stays straightforward.
 - Example `examples/pyo3_sample` now uses a `python/` tree with Maturin `pyproject.toml`, submodule classes `A` / `B` with cross-stub imports, and an unscoped class `C` on the root stub.
 

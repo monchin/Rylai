@@ -25,3 +25,8 @@ build-backend = "maturin"
 
 [tool.maturin]
 python-source = "python"
+
+[dependency-groups]
+stub = [
+    "typing-extensions>=4.15.0; python_version < \"3.11\"",
+]
