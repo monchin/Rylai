@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import typing as t
 
 from ._typing import KwargsItems
 
@@ -19,7 +20,8 @@ def add(a: int, b: int) -> int:
     """Renamed via #[pyo3(name = "...")]"""
 
 def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
-    """Example of using "add_content" in rylai.toml to show the types of kwargs."""
+    """Example of using "add_content" and "override" in rylai.toml to show the types of kwargs."""
 
+@t.final
 class C:
     def __init__(self) -> None: ...

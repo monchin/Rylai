@@ -77,6 +77,29 @@ pub struct TypeMapping {
     pub is_unknown: bool,
 }
 
+/// Map the **last path segment** of a concrete PyO3 type (e.g. `PyDict`) to the Python built-in
+/// class name used in annotations and in `#[pyclass(extends = ...)]` stub bases.
+///
+/// Excludes `PyAny` / `PyObject` (opaque → use [`TypeMapping`] with `t.Any` in [`map_type`]).
+pub fn pyo3_builtin_segment_to_python_class(segment: &str) -> Option<&'static str> {
+    match segment {
+        "PyDict" => Some("dict"),
+        "PyList" => Some("list"),
+        "PyTuple" => Some("tuple"),
+        "PySet" => Some("set"),
+        "PyFrozenSet" => Some("frozenset"),
+        "PyString" | "PyStr" => Some("str"),
+        "PyBytes" => Some("bytes"),
+        "PyByteArray" => Some("bytearray"),
+        "PyInt" => Some("int"),
+        "PyFloat" => Some("float"),
+        "PyBool" => Some("bool"),
+        "PyComplex" => Some("complex"),
+        "PySlice" => Some("slice"),
+        _ => None,
+    }
+}
+
 impl TypeMapping {
     pub fn known(s: &str) -> Self {
         Self {
@@ -181,6 +204,10 @@ fn map_type_path(
     let last_ident = last_seg.ident.to_string();
     let args = generic_args(last_seg);
 
+    if let Some(py) = pyo3_builtin_segment_to_python_class(last_ident.as_str()) {
+        return TypeMapping::known(py);
+    }
+
     match last_ident.as_str() {
         // Rust `Self` inside a #[pymethods] block
         "Self" => {
@@ -278,15 +305,6 @@ fn map_type_path(
             }
             return TypeMapping::known("set");
         }
-
-        // PyO3 types with direct Python equivalents
-        "PyBytes" => return TypeMapping::known("bytes"),
-        "PyByteArray" => return TypeMapping::known("bytearray"),
-        "PyString" => return TypeMapping::known("str"),
-        "PyDict" => return TypeMapping::known("dict"),
-        "PyList" => return TypeMapping::known("list"),
-        "PyTuple" => return TypeMapping::known("tuple"),
-        "PySet" => return TypeMapping::known("set"),
 
         // PyAny / PyObject — truly opaque, map to Any
         "PyAny" | "PyObject" => {
@@ -435,6 +453,20 @@ mod tests {
             map_type(&parse_ty("PySet"), &p(false), None, &no_classes()).py_type,
             "set"
         );
+    }
+
+    /// [`pyo3_builtin_segment_to_python_class`] is shared with `#[pyclass]` `extends` stubs.
+    #[test]
+    fn pyo3_builtin_segment_used_by_map_type() {
+        assert_eq!(pyo3_builtin_segment_to_python_class("PyStr"), Some("str"));
+        assert_eq!(pyo3_builtin_segment_to_python_class("PyInt"), Some("int"));
+        assert_eq!(
+            pyo3_builtin_segment_to_python_class("PyFrozenSet"),
+            Some("frozenset")
+        );
+        assert_eq!(pyo3_builtin_segment_to_python_class("Unknown"), None);
+        let ty = parse_ty("PyInt");
+        assert_eq!(map_type(&ty, &p(false), None, &no_classes()).py_type, "int");
     }
 
     /// `&Bound<'_, PyBytes>` (reference stripped, then Bound unwraps to PyBytes) → bytes.

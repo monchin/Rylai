@@ -7,9 +7,11 @@ You can add content after the auto-generated banner.
 
 from __future__ import annotations
 
+import typing as t
 
 from pyo3_sample.bb import B
 
+@t.final
 class A:
     def __init__(self) -> None: ...
     def make_b(self) -> B:

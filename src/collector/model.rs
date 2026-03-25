@@ -64,6 +64,14 @@ pub enum ParamKind {
     Kwargs, // **kwargs (reserved for Phase 3+)
 }
 
+/// `#[pyclass(extends = ...)]` base: either a PyO3 builtin (Python built-in type name) or another
+/// `#[pyclass]` in the crate (Rust struct name for lookup in `known_classes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtendsSpec {
+    Builtin(&'static str),
+    PyClassRustName(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct PyClass {
     /// Python-visible class name (from `#[pyclass(name = "...")]` or the Rust struct name).
@@ -74,6 +82,12 @@ pub struct PyClass {
     pub rust_name: String,
     /// If present, from `#[pyclass(module = "...")]`; used to emit the class into a separate .pyi (e.g. abcd.efg).
     pub module: Option<String>,
+    /// True when `#[pyclass(subclass)]` / `#[pyo3(subclass)]` is set (structs only; PyO3 ignores for enums).
+    pub allows_python_subclass: bool,
+    /// `#[pyclass(extends = Base)]` — structs only; `None` for enums and when omitted (implicit `object`).
+    pub extends: Option<ExtendsSpec>,
+    /// PyO3 `#[pyclass]` on an enum — cannot subclass or extend in Python/Rust per PyO3 rules.
+    pub is_enum: bool,
     pub doc: Vec<String>,
     pub methods: Vec<PyMethod>,
     /// Source file for diagnostics (reserved for future use)

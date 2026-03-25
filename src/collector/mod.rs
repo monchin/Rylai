@@ -12,6 +12,10 @@ use walkdir::WalkDir;
 
 /// Walk the entire crate (all .rs files under `crate_root/src/`) and collect
 /// every pyo3-exposed item.
+///
+/// Builds [`parse::build_pyclass_enum_rust_names`] and passes it into [`parse::ParseContext`] so
+/// Style B `m.add_class::<T>()` can classify enums; do not omit that pass when reusing the parser
+/// for real crates.
 pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule>, Vec<String>)> {
     let src_root = crate_root.join("src");
     let root = if src_root.exists() {
@@ -48,6 +52,8 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
     let struct_fields_map = parse::build_struct_fields_map(&files, enabled_features);
     // Fifth pass: build #[pyclass] type name -> attributes (for docstrings in Style B).
     let pyclass_attrs_map = parse::build_pyclass_attrs_map(&files, enabled_features);
+    // Sixth pass: enum Rust names so Style B `add_class::<T>()` can tell structs from enums.
+    let pyclass_enum_rust_names = parse::build_pyclass_enum_rust_names(&files, enabled_features);
 
     let parse_warnings = RefCell::new(Vec::new());
     let cx = parse::ParseContext {
@@ -56,6 +62,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
         struct_fields_map: &struct_fields_map,
         type_alias_map: &type_alias_map,
         pyclass_attrs_map: &pyclass_attrs_map,
+        pyclass_enum_rust_names: Some(&pyclass_enum_rust_names),
         parse_warnings: Some(&parse_warnings),
     };
 

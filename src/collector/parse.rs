@@ -1,7 +1,7 @@
 use super::model::*;
 use crate::config::Config;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use syn::{
     Attribute, Expr, Fields, FnArg, ImplItem, Item, ItemFn, ItemMod, Lit, LitStr, Meta, Pat,
@@ -170,6 +170,12 @@ pub(crate) struct ParseContext<'a> {
     pub type_alias_map: &'a HashMap<String, Type>,
     /// Attributes of each `#[pyclass]` struct/enum by Rust type name. Used in Style B to restore docstrings.
     pub pyclass_attrs_map: &'a PyclassAttrsMap,
+    /// Rust type names of `#[pyclass]` enums in the crate, from [`build_pyclass_enum_rust_names`].
+    ///
+    /// **Style B:** `m.add_class::<T>()` does not say whether `T` is a struct or enum. Production
+    /// entry points must pass [`Some`] so enum items get correct stub semantics (`@t.final`, no
+    /// `extends`). Unit tests may pass [`None`] to simulate struct-only call sites.
+    pub pyclass_enum_rust_names: Option<&'a PyclassEnumRustNames>,
     /// Optional sink for parse-time warnings (e.g. invalid `rename_all` literals).
     pub parse_warnings: Option<&'a RefCell<Vec<String>>>,
 }
@@ -267,7 +273,7 @@ fn collect_items_from_list(
                 if cfg_is_active(&s.attrs, enabled) {
                     let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
                     let rust_name = s.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx);
+                    let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx, false);
                     result.push(PyItem::Class(class));
                 }
             }
@@ -275,7 +281,7 @@ fn collect_items_from_list(
                 if cfg_is_active(&e.attrs, enabled) {
                     let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
                     let rust_name = e.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx);
+                    let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx, true);
                     result.push(PyItem::Class(class));
                 }
             }
@@ -405,8 +411,19 @@ fn collect_add_calls_from_expr(
                             .get(&rust_name)
                             .map(Vec::as_slice)
                             .unwrap_or(&[]);
-                        let class =
-                            parse_pyclass_struct(&class_name, &rust_name, attrs, ctx.path, ctx.cx);
+                        let is_enum = ctx
+                            .cx
+                            .pyclass_enum_rust_names
+                            .map(|s| s.contains(rust_name.as_str()))
+                            .unwrap_or(false);
+                        let class = parse_pyclass_struct(
+                            &class_name,
+                            &rust_name,
+                            attrs,
+                            ctx.path,
+                            ctx.cx,
+                            is_enum,
+                        );
                         out.push(PyItem::Class(class));
                     }
                 }
@@ -725,8 +742,27 @@ fn parse_pyclass_struct(
     attrs: &[Attribute],
     path: &Path,
     cx: ParseContext<'_>,
+    is_enum: bool,
 ) -> PyClass {
     let doc = extract_doc(attrs);
+
+    let extends_ty = extract_pyclass_extends_type(attrs, cx.parse_warnings);
+    if is_enum
+        && extends_ty.is_some()
+        && let Some(w) = cx.parse_warnings
+    {
+        w.borrow_mut().push(
+            "rylai: #[pyclass] on enum cannot inherit (PyO3); ignoring `extends` for stub"
+                .to_string(),
+        );
+    }
+
+    let allows_python_subclass = !is_enum && extract_pyclass_subclass(attrs);
+    let extends = if is_enum {
+        None
+    } else {
+        extends_ty.as_ref().and_then(extends_spec_from_syn_type)
+    };
 
     let (class_get_all, class_set_all) = extract_pyclass_get_all_set_all(attrs);
     let rename_all = extract_pyclass_rename_all(attrs);
@@ -775,6 +811,9 @@ fn parse_pyclass_struct(
         name: display_name.to_string(),
         rust_name: rust_name_for_impl.to_string(),
         module: extract_pyclass_module(attrs),
+        allows_python_subclass,
+        extends,
+        is_enum,
         doc,
         methods,
         source_file: path.to_path_buf(),
@@ -993,6 +1032,45 @@ fn collect_pyclass_attrs_from_items(
                     && let Some((_, content)) = &m.content
                 {
                     collect_pyclass_attrs_from_items(content, map, enabled_features);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Rust type names of items that are `#[pyclass]` enums (for Style B `m.add_class::<E>()`).
+pub type PyclassEnumRustNames = HashSet<String>;
+
+/// Build [`PyclassEnumRustNames`] from every `.rs` file in the crate.
+pub fn build_pyclass_enum_rust_names(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> PyclassEnumRustNames {
+    let mut set = PyclassEnumRustNames::new();
+    for (_path, file) in files {
+        collect_pyclass_enum_rust_names_from_items(&file.items, &mut set, enabled_features);
+    }
+    set
+}
+
+fn collect_pyclass_enum_rust_names_from_items(
+    items: &[Item],
+    set: &mut PyclassEnumRustNames,
+    enabled_features: &[String],
+) {
+    for item in items {
+        match item {
+            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
+                if cfg_is_active(&e.attrs, enabled_features) {
+                    set.insert(e.ident.to_string());
+                }
+            }
+            Item::Mod(m) => {
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_pyclass_enum_rust_names_from_items(content, set, enabled_features);
                 }
             }
             _ => {}
@@ -1362,6 +1440,94 @@ pub fn extract_pyclass_rename_all(attrs: &[Attribute]) -> Option<String> {
     last
 }
 
+/// `true` when `#[pyclass(subclass)]` or `#[pyo3(subclass)]` is present.
+pub fn extract_pyclass_subclass(attrs: &[Attribute]) -> bool {
+    for attr in attrs {
+        if !attr.path().is_ident("pyclass") && !attr.path().is_ident("pyo3") {
+            continue;
+        }
+        let mut found = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("subclass") {
+                found = true;
+                return Ok(());
+            }
+            if meta.input.peek(syn::token::Eq) {
+                let _ = meta.value()?.parse::<Expr>()?;
+            }
+            Ok(())
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Last `extends = Ty` from `#[pyclass]` / `#[pyo3]` (later occurrence wins).
+///
+/// When a value after `extends =` is not a valid [`Type`], that clause is skipped; if
+/// `parse_warnings` is set, a message is recorded for each failed parse.
+pub fn extract_pyclass_extends_type(
+    attrs: &[Attribute],
+    parse_warnings: Option<&RefCell<Vec<String>>>,
+) -> Option<Type> {
+    let mut last: Option<Type> = None;
+    for attr in attrs {
+        if !attr.path().is_ident("pyclass") && !attr.path().is_ident("pyo3") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("extends") {
+                let value = meta.value()?;
+                match value.parse::<Type>() {
+                    Ok(ty) => last = Some(ty),
+                    Err(_) => {
+                        if let Some(w) = parse_warnings {
+                            w.borrow_mut().push(
+                                "rylai: could not parse `extends` value as a type; omitting that base in the stub"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if meta.input.peek(syn::token::Eq) {
+                let _ = meta.value()?.parse::<Expr>()?;
+            }
+            Ok(())
+        });
+    }
+    last
+}
+
+/// Last segment of a path type (e.g. `PyDict` from `pyo3::types::PyDict`). `extends` resolution
+/// matches PyO3/`known_classes` by Rust **type name**, not full path — use the unqualified name in
+/// `#[pyclass(extends = Base)]` if the base is another `#[pyclass]` in the same crate.
+fn type_path_segment_for_extends(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+        Type::Group(g) => type_path_segment_for_extends(&g.elem),
+        Type::Paren(p) => type_path_segment_for_extends(&p.elem),
+        _ => None,
+    }
+}
+
+/// Maps `extends` type to a Python builtin base or a same-crate `#[pyclass]` by **last path
+/// segment** only (see [`type_path_segment_for_extends`]). Builtin PyO3 bases use
+/// [`crate::type_map::pyo3_builtin_segment_to_python_class`]; `PyAny` yields no explicit base.
+pub fn extends_spec_from_syn_type(ty: &Type) -> Option<ExtendsSpec> {
+    let seg = type_path_segment_for_extends(ty)?;
+    if seg == "PyAny" {
+        return None;
+    }
+    if let Some(b) = crate::type_map::pyo3_builtin_segment_to_python_class(&seg) {
+        return Some(ExtendsSpec::Builtin(b));
+    }
+    Some(ExtendsSpec::PyClassRustName(seg))
+}
+
 /// Returns true for pyo3 "injected" parameter types that should not appear in the Python stub:
 /// `Python<'_>`, `&Bound<'_, PyModule>`, etc.
 fn is_pyo3_injected_param(ty: &Type) -> bool {
@@ -1454,6 +1620,7 @@ mod tests {
             struct_fields_map,
             type_alias_map,
             pyclass_attrs_map,
+            pyclass_enum_rust_names: None,
             parse_warnings: None,
         }
     }
@@ -1764,6 +1931,7 @@ mod my_mod {
             struct_fields_map: &fields_map,
             type_alias_map: &type_alias_map,
             pyclass_attrs_map: &attrs_map,
+            pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
         };
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
@@ -1813,6 +1981,7 @@ mod my_mod {
             struct_fields_map: &fields_map,
             type_alias_map: &type_alias_map,
             pyclass_attrs_map: &attrs_map,
+            pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
         };
         let _modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
@@ -2193,7 +2362,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let rust_name = item.ident.to_string();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
-        let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx);
+        let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx, false);
         assert_eq!(class.name, "Point");
     }
 
@@ -2211,8 +2380,151 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         let rust_name = item.ident.to_string();
         let attrs_map = PyclassAttrsMap::new();
         let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
-        let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx);
+        let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx, false);
         assert_eq!(class.name, "MyType");
+    }
+
+    #[test]
+    fn extract_pyclass_subclass_from_pyclass_and_pyo3() {
+        let s1: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(subclass)]
+            struct Base {}
+        };
+        assert!(extract_pyclass_subclass(&s1.attrs));
+        let s2: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass]
+            #[pyo3(subclass)]
+            struct Base2 {}
+        };
+        assert!(extract_pyclass_subclass(&s2.attrs));
+    }
+    #[test]
+    fn extract_pyclass_extends_pyo3_yields_builtin_dict() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass]
+            #[pyo3(extends = PyDict)]
+            struct MyDict {}
+        };
+        let ty = extract_pyclass_extends_type(&item.attrs, None).expect("extends");
+        assert_eq!(
+            extends_spec_from_syn_type(&ty),
+            Some(ExtendsSpec::Builtin("dict"))
+        );
+    }
+
+    #[test]
+    fn extract_pyclass_extends_unparseable_records_warning() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(extends = 1 + 2)]
+            struct Bad {}
+        };
+        let warnings = RefCell::new(Vec::new());
+        let ty = extract_pyclass_extends_type(&item.attrs, Some(&warnings));
+        assert!(ty.is_none());
+        assert!(
+            warnings
+                .borrow()
+                .iter()
+                .any(|w| w.contains("could not parse `extends`")),
+            "expected parse warning, got {:?}",
+            warnings.borrow()
+        );
+    }
+
+    #[test]
+    fn parse_pyclass_struct_records_extends_rust_base() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(extends = BaseClass)]
+            struct SubClass {}
+        };
+        let impl_map = ImplMap::default();
+        let config = Config::default();
+        let type_alias_map = HashMap::new();
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let name = "SubClass".to_string();
+        let rust_name = item.ident.to_string();
+        let class = parse_pyclass_struct(&name, &rust_name, &item.attrs, dummy_path(), cx, false);
+        assert_eq!(
+            class.extends,
+            Some(ExtendsSpec::PyClassRustName("BaseClass".to_string()))
+        );
+        assert!(!class.allows_python_subclass);
+        assert!(!class.is_enum);
+    }
+
+    #[test]
+    fn parse_pyclass_struct_subclass_flag_disables_final_semantics_in_model() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass(subclass)]
+            struct OpenBase {}
+        };
+        let impl_map = ImplMap::default();
+        let config = Config::default();
+        let type_alias_map = HashMap::new();
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let rust_name = item.ident.to_string();
+        let class =
+            parse_pyclass_struct(&rust_name, &rust_name, &item.attrs, dummy_path(), cx, false);
+        assert!(class.allows_python_subclass);
+    }
+
+    #[test]
+    fn parse_pyclass_enum_ignores_extends_and_warns() {
+        let item: syn::ItemEnum = syn::parse_quote! {
+            #[pyclass(extends = SomeBase)]
+            enum Bad {
+                A,
+            }
+        };
+        let impl_map = ImplMap::default();
+        let config = Config::default();
+        let type_alias_map = HashMap::new();
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let warnings = RefCell::new(Vec::new());
+        let cx = ParseContext {
+            config: &config,
+            impl_map: &impl_map,
+            struct_fields_map: &fields_map,
+            type_alias_map: &type_alias_map,
+            pyclass_attrs_map: &attrs_map,
+            pyclass_enum_rust_names: None,
+            parse_warnings: Some(&warnings),
+        };
+        let rust_name = item.ident.to_string();
+        let class =
+            parse_pyclass_struct(&rust_name, &rust_name, &item.attrs, dummy_path(), cx, true);
+        assert!(class.is_enum);
+        assert!(class.extends.is_none());
+        assert!(
+            warnings
+                .borrow()
+                .iter()
+                .any(|w| w.contains("enum cannot inherit")),
+            "expected warning about enum extends, got {:?}",
+            warnings.borrow()
+        );
+    }
+
+    #[test]
+    fn build_pyclass_enum_rust_names_marks_enums_only() {
+        let file = syn::parse_file(
+            r#"
+#[pyclass]
+struct S {}
+#[pyclass]
+enum E { V }
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let set = build_pyclass_enum_rust_names(&[(path.to_path_buf(), file)], &no_features());
+        assert!(set.contains("E"));
+        assert!(!set.contains("S"));
     }
 
     // ── pyo3(signature) extraction still works alongside name ────────────────

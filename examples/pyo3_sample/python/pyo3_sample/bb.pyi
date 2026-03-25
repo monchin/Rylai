@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import typing as t
 
+@t.final
 class B:
     def __init__(self) -> None: ...

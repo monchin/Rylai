@@ -1,6 +1,6 @@
 use crate::collector::{
-    MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod, PyModule, PyParam,
-    PyType,
+    ExtendsSpec, MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod,
+    PyModule, PyParam, PyType,
 };
 use crate::config::{Config, FallbackStrategy, OverrideEntry, RenderPolicy};
 use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
@@ -33,7 +33,6 @@ pub fn generate_with_known_classes(
         needs_self_import: false,
         needs_path_import: false,
         needs_union: false,
-        needs_final: false,
         warnings: pre_warnings.to_vec(),
         current_self_type: None,
         known_classes: known_classes.clone(),
@@ -131,8 +130,6 @@ struct GenCtx<'a> {
     needs_path_import: bool,
     /// Whether any mapping used `t.Union[...]` (py < 3.10 style, e.g. t.Union[Path, str]).
     needs_union: bool,
-    /// Whether any module-level constant was emitted (needs `import typing as t` for `t.Final`).
-    needs_final: bool,
     warnings: Vec<String>,
     /// Set to the Python class name while generating methods for that class,
     /// so that Rust `Self` return types resolve correctly.
@@ -310,9 +307,8 @@ impl<'a> GenCtx<'a> {
 
     // ── Module-level constant (m.add("name", value)) ─────────────────────────
 
-    /// Emits `name: t.Final[py_type]` and sets `needs_final` so that `import typing as t` is included.
+    /// Emits `name: t.Final[py_type]` (`import typing as t` is always emitted in the stub header).
     fn gen_constant(&mut self, c: &PyConstant, out: &mut String, indent: usize) -> Result<()> {
-        self.needs_final = true;
         let pad = "    ".repeat(indent);
         out.push_str(&format!("{pad}{}: t.Final[{}]\n", c.name, c.py_type));
         Ok(())
@@ -346,7 +342,47 @@ impl<'a> GenCtx<'a> {
 
     fn gen_class(&mut self, c: &PyClass, out: &mut String, indent: usize) -> Result<()> {
         let pad = "    ".repeat(indent);
-        out.push_str(&format!("{pad}class {}:\n", c.name));
+
+        let base_name: Option<String> = if c.is_enum {
+            None
+        } else {
+            match &c.extends {
+                None => None,
+                Some(ExtendsSpec::Builtin(b)) => Some((*b).to_string()),
+                Some(ExtendsSpec::PyClassRustName(rust_base)) => {
+                    if let Some(py) = self.known_classes.get(rust_base) {
+                        if let (Some(cur), Some(map)) =
+                            (&self.current_stub_module, &self.class_rust_to_module)
+                            && let Some(def_mod) = map.get(rust_base.as_str())
+                            && def_mod != cur
+                        {
+                            self.cross_module_imports
+                                .entry(def_mod.clone())
+                                .or_default()
+                                .insert(py.clone());
+                        }
+                        Some(py.clone())
+                    } else {
+                        self.warnings.push(format!(
+                            "extends base `{rust_base}` is not a known #[pyclass] — omitting base in stub for `{}`",
+                            c.name
+                        ));
+                        None
+                    }
+                }
+            }
+        };
+
+        let emit_final = c.is_enum || !c.allows_python_subclass;
+        if emit_final {
+            out.push_str(&format!("{pad}@t.final\n"));
+        }
+
+        let class_line = match &base_name {
+            Some(b) => format!("{pad}class {}({b}):\n", c.name),
+            None => format!("{pad}class {}:\n", c.name),
+        };
+        out.push_str(&class_line);
 
         if !c.doc.is_empty() {
             self.gen_docstring(&c.doc, out, indent + 1);
@@ -923,8 +959,8 @@ fn split_name_default(token: &str) -> (&str, Option<&str>) {
 mod tests {
     use super::*;
     use crate::collector::{
-        MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod, PyModule,
-        PyParam, PyType,
+        ExtendsSpec, MethodKind, ParamKind, PyClass, PyConstant, PyFunction, PyItem, PyMethod,
+        PyModule, PyParam, PyType,
     };
     use crate::config::Config;
     use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
@@ -977,6 +1013,9 @@ mod tests {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
             module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
             doc: vec![],
             methods: vec![PyMethod {
                 name: method_name.to_string(),
@@ -1467,6 +1506,9 @@ mod tests {
             name: python_name.to_string(),
             rust_name: rust_name.to_string(),
             module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
             doc: vec![],
             methods: vec![],
             source_file: dummy_path(),
@@ -1720,6 +1762,9 @@ mod tests {
             name: class_name.to_string(),
             rust_name: class_name.to_string(),
             module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
             doc: vec![],
             methods,
             source_file: dummy_path(),
@@ -1737,9 +1782,131 @@ mod tests {
         let class = make_class_with_methods("Counter", vec![m]);
         let stub = stub_for(vec![PyItem::Class(class)]);
         assert!(
+            stub.contains("@t.final"),
+            "non-subclass pyclass must emit @t.final, got:\n{stub}"
+        );
+        assert!(
             stub.contains("def __init__(self, x: int) -> None:"),
             "#[new] must emit __init__, got:\n{stub}"
         );
+    }
+
+    #[test]
+    fn gen_class_emits_extends_builtin_dict() {
+        let class = PyClass {
+            name: "MyDict".to_string(),
+            rust_name: "MyDict".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: Some(ExtendsSpec::Builtin("dict")),
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(stub.contains("@t.final"), "got:\n{stub}");
+        assert!(stub.contains("class MyDict(dict):"), "got:\n{stub}");
+    }
+
+    #[test]
+    fn gen_class_allows_python_subclass_omits_final() {
+        let class = PyClass {
+            name: "Base".to_string(),
+            rust_name: "Base".to_string(),
+            module: None,
+            allows_python_subclass: true,
+            extends: None,
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            !stub.contains("@t.final"),
+            "subclass-enabled pyclass must not use @t.final, got:\n{stub}"
+        );
+        assert!(stub.contains("class Base:"), "got:\n{stub}");
+    }
+
+    #[test]
+    fn gen_class_extends_known_pyclass_emits_base() {
+        let class = PyClass {
+            name: "Sub".to_string(),
+            rust_name: "Sub".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: Some(ExtendsSpec::PyClassRustName("Base".to_string())),
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Base".to_string(), "Base".to_string());
+        known_classes.insert("Sub".to_string(), "Sub".to_string());
+        let stub = generate_with_known_classes(
+            &[make_module(vec![PyItem::Class(class)])],
+            &Config::default(),
+            &known_classes,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(stub.contains("class Sub(Base):"), "got:\n{stub}");
+    }
+
+    #[test]
+    fn gen_class_extends_base_in_other_stub_emits_import() {
+        let class = PyClass {
+            name: "Sub".to_string(),
+            rust_name: "Sub".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: Some(ExtendsSpec::PyClassRustName("Base".to_string())),
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let mut known_classes = HashMap::new();
+        known_classes.insert("Base".to_string(), "Base".to_string());
+        known_classes.insert("Sub".to_string(), "Sub".to_string());
+        let mut class_mod = HashMap::new();
+        class_mod.insert("Sub".to_string(), "pkg.sub".to_string());
+        class_mod.insert("Base".to_string(), "pkg.base".to_string());
+        let stub = generate_with_known_classes(
+            &[make_module(vec![PyItem::Class(class)])],
+            &Config::default(),
+            &known_classes,
+            &[],
+            Some(("pkg.sub", &class_mod)),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("from pkg.base import Base"),
+            "expected import for extends base; got:\n{stub}"
+        );
+        assert!(stub.contains("class Sub(Base):"), "got:\n{stub}");
+    }
+
+    #[test]
+    fn gen_class_enum_emits_final_without_base() {
+        let class = PyClass {
+            name: "Color".to_string(),
+            rust_name: "Color".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: true,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(stub.contains("@t.final"), "got:\n{stub}");
+        assert!(stub.contains("class Color:"), "got:\n{stub}");
     }
 
     #[test]
