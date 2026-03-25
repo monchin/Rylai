@@ -840,10 +840,20 @@ fn extract_setter_name(attrs: &[Attribute], fn_name: &str) -> Option<String> {
     for attr in attrs {
         if attr.path().is_ident("setter") {
             let rename = extract_attr_string_arg(attr);
-            return Some(rename.unwrap_or_else(|| fn_name.to_string()));
+            return Some(rename.unwrap_or_else(|| infer_pyo3_setter_property_name(fn_name)));
         }
     }
     None
+}
+
+/// PyO3: `#[setter]` without a rename uses the Rust fn name with a leading `set_` stripped when
+/// present (e.g. `set_num` → property `num`).
+fn infer_pyo3_setter_property_name(fn_name: &str) -> String {
+    fn_name
+        .strip_prefix("set_")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fn_name)
+        .to_string()
 }
 
 fn extract_attr_string_arg(attr: &Attribute) -> Option<String> {
@@ -2815,6 +2825,18 @@ impl Edge {
         assert_eq!(
             detect_method_kind(&item.attrs, "value"),
             MethodKind::Setter("value".to_string())
+        );
+    }
+
+    #[test]
+    fn method_kind_setter_strips_set_prefix_like_pyo3() {
+        let item: syn::ImplItemFn = syn::parse_quote! {
+            #[setter]
+            fn set_num(&mut self, number: f64) {}
+        };
+        assert_eq!(
+            detect_method_kind(&item.attrs, "set_num"),
+            MethodKind::Setter("num".to_string())
         );
     }
 
