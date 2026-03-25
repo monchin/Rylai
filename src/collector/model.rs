@@ -97,6 +97,9 @@ pub struct PyClass {
 
 #[derive(Debug, Clone)]
 pub struct PyMethod {
+    /// Rust identifier from the `impl` item (`fn py_new` → `"py_new"`). Used for `[[override]]`
+    /// keys; may differ from [`Self::name`] when `#[pyo3(name = "...")]` is set.
+    pub rust_ident: String,
     pub name: String,
     pub doc: Vec<String>,
     pub kind: MethodKind,

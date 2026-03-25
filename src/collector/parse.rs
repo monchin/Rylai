@@ -704,6 +704,7 @@ fn parse_struct_fields_as_methods(
 
         if has_get {
             methods.push(PyMethod {
+                rust_ident: field_name.clone(),
                 name: prop_name.clone(),
                 doc: doc.clone(),
                 kind: MethodKind::Getter(prop_name.clone()),
@@ -714,6 +715,7 @@ fn parse_struct_fields_as_methods(
         }
         if has_set {
             methods.push(PyMethod {
+                rust_ident: field_name.clone(),
                 name: prop_name.clone(),
                 doc: doc.clone(),
                 kind: MethodKind::Setter(prop_name.clone()),
@@ -827,8 +829,9 @@ fn parse_pymethod(
 ) -> Option<PyMethod> {
     let ImplItem::Fn(m) = item else { return None };
 
+    let rust_ident = m.sig.ident.to_string();
     // #[pyo3(name = "foo")] overrides the Rust method name
-    let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| m.sig.ident.to_string());
+    let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| rust_ident.clone());
     let doc = extract_doc(&m.attrs);
     let signature_override = extract_pyo3_signature(&m.attrs);
     let params = parse_params(&m.sig, config, type_alias_map);
@@ -836,6 +839,7 @@ fn parse_pymethod(
     let kind = detect_method_kind(&m.attrs, &name);
 
     Some(PyMethod {
+        rust_ident,
         name,
         doc,
         kind,

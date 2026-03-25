@@ -156,6 +156,27 @@ enabled = ["some_feature"]
 item = "my_module::complex_function"
 stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 
+# #[pyclass] / #[pymethods] methods: same `[[override]]` mechanism as top-level items.
+# `item` is `{logical_module}::{class}::{method}` — instance methods, @staticmethod, @classmethod,
+# @property / setter, and #[new] when you want a custom __init__ line in the .pyi.
+#
+# `logical_module` (first segment) is the **Python module for the .pyi file where that class is
+# emitted**, not “always the #[pymodule] name”. It matches how Rylai splits output:
+#   - Classes without #[pyclass(module = "...")] (and all module-level functions/constants) use the
+#     top-level #[pymodule] name, e.g. `pkg` for `pkg.pyi`.
+#   - A class with #[pyclass(module = "pkg.abc")] is emitted into that submodule’s stub; use the
+#     **exact** `module = "..."` string as the first segment, e.g. `pkg.abc::MyClass::method`,
+#     not `pkg::...` (unless layout merges that stub into the root file — then the root module name
+#     applies).
+# `class` may be the Rust struct name or the Python #[pyclass(name = "...")] name. `method` is the
+# Rust fn ident or #[pyo3(name = "...")]. For #[new], Rylai already emits `def __init__(...)`;
+# override when you need a different signature (e.g. **kwargs: Unpack[...]). You may match with
+# `...::__init__` as the method segment for #[new] only.
+# Suffix form: `item` may end with `::Class::method` (no bare method name — ambiguous).
+[[override]]
+item = "my_module::Widget::reload"
+stub = "def reload(self, force: bool = False) -> None:"
+
 # Optional: splice raw Python into a generated file (path is relative to -o, use /; must match a stub emitted in this run)
 [[add_content]]
 file = "my_package/sub.pyi"
@@ -164,6 +185,8 @@ content = """
 from my_package._internal import KwargsItems
 """
 ```
+
+For **class-method** overrides, the first segment of `item` is the logical Python module of the **stub file that contains that class**: usually the `#[pymodule]` name for the root `.pyi`, or the full `#[pyclass(module = "...")]` string (e.g. `pkg.abc`) when Rylai emits a separate submodule stub — not the pymodule name in that case.
 
 `location`:
 

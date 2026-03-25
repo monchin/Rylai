@@ -25,6 +25,7 @@ pub fn generate_with_known_classes(
     cross_import: Option<(&str, &HashMap<String, String>)>,
 ) -> Result<String> {
     let policy = config.render_policy();
+    let logical_module = cross_import.map(|(s, _)| s.to_string()).unwrap_or_default();
     let mut ctx = GenCtx {
         config,
         policy,
@@ -39,10 +40,14 @@ pub fn generate_with_known_classes(
         current_stub_module: cross_import.map(|(s, _)| s.to_string()),
         class_rust_to_module: cross_import.map(|(_, m)| (*m).clone()),
         cross_module_imports: BTreeMap::new(),
+        logical_module,
     };
 
     let mut body = String::new();
     for module in modules {
+        if ctx.current_stub_module.is_none() {
+            ctx.logical_module = module.name.clone();
+        }
         ctx.gen_module(module, &mut body, 0)?;
     }
 
@@ -145,6 +150,14 @@ struct GenCtx<'a> {
     class_rust_to_module: Option<HashMap<String, String>>,
     /// Dotted defining module → Python class names to import into this stub.
     cross_module_imports: BTreeMap<String, BTreeSet<String>>,
+    /// Dotted Python module name for **this generated stub file** — same as [`Self::current_stub_module`]
+    /// when the CLI passes cross-import context (always true for normal runs). It is the
+    /// [`PyModule::name`] of the slice passed to [`generate_with_known_classes`]: the `#[pymodule]`
+    /// root (e.g. `pkg`) for `pkg.pyi`, or the **exact** `#[pyclass(module = "...")]` string (e.g.
+    /// `pkg.abc`) when that class is emitted into a separate stub. It is not “always the pymodule”:
+    /// use whichever module owns the `.pyi` where the class appears. When [`Self::current_stub_module`]
+    /// is `None` (tests), this is set from each top-level [`PyModule::name`].
+    logical_module: String,
 }
 
 impl<'a> GenCtx<'a> {
@@ -237,23 +250,37 @@ impl<'a> GenCtx<'a> {
         out: &mut String,
         indent: usize,
     ) -> Result<()> {
+        let merge_rust_doc_on_single_line = matches!(item, PyItem::Function(_) | PyItem::Class(_));
+        let doc: &[String] = match item {
+            PyItem::Function(f) => &f.doc,
+            PyItem::Class(c) => &c.doc,
+            _ => &[],
+        };
+        self.emit_override_stub(ov, doc, out, indent, merge_rust_doc_on_single_line)
+    }
+
+    /// Shared `[[override]]` body emission for top-level items and class methods.
+    ///
+    /// When `merge_rust_doc_on_single_line` is true and `stub` is a single line, Rust `///` docs are
+    /// merged under the header; otherwise the stub block is written verbatim (after normalizing
+    /// trailing `...`).
+    fn emit_override_stub(
+        &self,
+        ov: &OverrideEntry,
+        doc: &[String],
+        out: &mut String,
+        indent: usize,
+        merge_rust_doc_on_single_line: bool,
+    ) -> Result<()> {
         let pad = "    ".repeat(indent);
         let trimmed = ov.stub.trim();
-
-        let rich =
-            matches!(item, PyItem::Function(_) | PyItem::Class(_)) && !trimmed.contains('\n');
+        let rich = merge_rust_doc_on_single_line && !trimmed.contains('\n');
 
         if rich {
             let header = Self::normalize_override_header_line(trimmed);
             out.push_str(&pad);
             out.push_str(&header);
             out.push('\n');
-
-            let doc: &[String] = match item {
-                PyItem::Function(f) => &f.doc,
-                PyItem::Class(c) => &c.doc,
-                _ => &[],
-            };
 
             if !doc.is_empty() {
                 self.gen_docstring(doc, out, indent + 1);
@@ -266,6 +293,45 @@ impl<'a> GenCtx<'a> {
             out.push_str(&format!("{pad}{}\n\n", body));
         }
         Ok(())
+    }
+
+    /// Whether `[[override]]` `item` targets this `#[pymethods]` entry (any kind: instance, static,
+    /// class, getter/setter, or `#[new]`).
+    fn method_override_entry_matches(
+        o_item: &str,
+        logical_mod: &str,
+        class: &PyClass,
+        method: &PyMethod,
+    ) -> bool {
+        let matches_pair = |cls: &str, meth: &str| {
+            let full = format!("{logical_mod}::{cls}::{meth}");
+            o_item == full || o_item.ends_with(&format!("::{cls}::{meth}"))
+        };
+        if matches_pair(&class.rust_name, &method.rust_ident) {
+            return true;
+        }
+        if matches_pair(&class.name, &method.name) {
+            return true;
+        }
+        if matches!(method.kind, MethodKind::New) {
+            if matches_pair(&class.rust_name, "__init__") {
+                return true;
+            }
+            if matches_pair(&class.name, "__init__") {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_method_override<'b>(
+        &'b self,
+        class: &PyClass,
+        method: &PyMethod,
+    ) -> Option<&'b OverrideEntry> {
+        self.config.overrides.iter().find(|o| {
+            Self::method_override_entry_matches(&o.item, &self.logical_module, class, method)
+        })
     }
 
     // ── Module ───────────────────────────────────────────────────────────────
@@ -392,7 +458,7 @@ impl<'a> GenCtx<'a> {
             out.push_str(&format!("{pad}    ...\n"));
         } else {
             for method in &c.methods {
-                self.gen_method(method, &c.name, out, indent + 1)?;
+                self.gen_method(method, c, out, indent + 1)?;
             }
         }
         out.push('\n');
@@ -402,15 +468,21 @@ impl<'a> GenCtx<'a> {
     fn gen_method(
         &mut self,
         m: &PyMethod,
-        class_name: &str,
+        class: &PyClass,
         out: &mut String,
         indent: usize,
     ) -> Result<()> {
-        self.current_self_type = Some(class_name.to_string());
+        self.current_self_type = Some(class.name.clone());
         let _guard =
             RestoreCurrentSelfTypeGuard(&mut self.current_self_type as *mut Option<String>);
         let pad = "    ".repeat(indent);
-        let location = format!("{}::{}", class_name, m.name);
+
+        if let Some(ov) = self.find_method_override(class, m) {
+            self.emit_override_stub(ov, &m.doc, out, indent, true)?;
+            return Ok(());
+        }
+
+        let location = format!("{}::{}", class.name, m.name);
         let ret = self.resolve_type(&m.return_type, &format!("{location}::return"))?;
 
         match &m.kind {
@@ -1018,6 +1090,7 @@ mod tests {
             is_enum: false,
             doc: vec![],
             methods: vec![PyMethod {
+                rust_ident: method_name.to_string(),
                 name: method_name.to_string(),
                 doc: vec![],
                 kind: MethodKind::Static,
@@ -1679,6 +1752,178 @@ mod tests {
         );
     }
 
+    /// `[[override]]` for `#[new]` matches `module::RustClass::rust_fn` and replaces `__init__`.
+    #[test]
+    fn config_override_class_method_new_by_rust_fn_name() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::TfSettings::py_new".to_string(),
+            stub: "def __init__(self, **kwargs: t.Any) -> None:".to_string(),
+        });
+        let m = PyMethod {
+            rust_ident: "py_new".to_string(),
+            name: "py_new".to_string(),
+            doc: vec![],
+            kind: MethodKind::New,
+            signature_override: None,
+            params: vec![],
+            return_type: PyType {
+                rust_type: syn::parse_quote! { () },
+                override_str: None,
+            },
+        };
+        let class = PyClass {
+            name: "TfSettings".to_string(),
+            rust_name: "TfSettings".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
+            doc: vec![],
+            methods: vec![m],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def __init__(self, **kwargs: t.Any) -> None:"),
+            "method override stub must appear, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("def __init__(self) -> None:"),
+            "default #[new] with no params must be replaced, got:\n{stub}"
+        );
+    }
+
+    /// `#[new]` overrides also match `...::__init__` on the class segment.
+    #[test]
+    fn config_override_class_method_new_init_alias() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::Counter::__init__".to_string(),
+            stub: "def __init__(self, x: int) -> None:".to_string(),
+        });
+        let m = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        let class = make_class_with_methods("Counter", vec![m]);
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def __init__(self, x: int) -> None:"),
+            "expected __init__ alias match, got:\n{stub}"
+        );
+    }
+
+    /// Suffix-only item path: must end with `::Class::method`.
+    #[test]
+    fn config_override_class_method_qualified_suffix_matches() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "crate::tablers::TfSettings::py_new".to_string(),
+            stub: "def __init__(self) -> None:".to_string(),
+        });
+        let m = PyMethod {
+            rust_ident: "py_new".to_string(),
+            name: "py_new".to_string(),
+            doc: vec![],
+            kind: MethodKind::New,
+            signature_override: None,
+            params: vec![],
+            return_type: PyType {
+                rust_type: syn::parse_quote! { () },
+                override_str: None,
+            },
+        };
+        let class = make_class_with_methods("TfSettings", vec![m]);
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def __init__(self) -> None:"),
+            "suffix-qualified override must match, got:\n{stub}"
+        );
+    }
+
+    /// When #[pyclass(name = "...")] differs from the Rust struct, both names are valid class keys.
+    #[test]
+    fn config_override_class_method_matches_python_class_name() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::Visible::do_thing".to_string(),
+            stub: "def do_thing(self) -> str:".to_string(),
+        });
+        let m = PyMethod {
+            rust_ident: "do_thing".to_string(),
+            name: "do_thing".to_string(),
+            doc: vec![],
+            kind: MethodKind::Instance,
+            signature_override: None,
+            params: vec![],
+            return_type: PyType {
+                rust_type: syn::parse_quote! { &'static str },
+                override_str: None,
+            },
+        };
+        let class = PyClass {
+            name: "Visible".to_string(),
+            rust_name: "Hidden".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
+            doc: vec![],
+            methods: vec![m],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def do_thing(self) -> str:"),
+            "override by Python class name must match, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn config_override_class_method_matches_rust_struct_name() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::Hidden::do_thing".to_string(),
+            stub: "def do_thing(self) -> bytes:".to_string(),
+        });
+        let m = PyMethod {
+            rust_ident: "do_thing".to_string(),
+            name: "do_thing".to_string(),
+            doc: vec![],
+            kind: MethodKind::Instance,
+            signature_override: None,
+            params: vec![],
+            return_type: PyType {
+                rust_type: syn::parse_quote! { &'static str },
+                override_str: None,
+            },
+        };
+        let class = PyClass {
+            name: "Visible".to_string(),
+            rust_name: "Hidden".to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
+            doc: vec![],
+            methods: vec![m],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def do_thing(self) -> bytes:"),
+            "override by Rust struct name must match, got:\n{stub}"
+        );
+    }
+
     // ── add_header ───────────────────────────────────────────────────────────
 
     #[test]
@@ -1745,6 +1990,7 @@ mod tests {
 
     fn make_method(name: &str, kind: MethodKind, params: Vec<PyParam>, ret: syn::Type) -> PyMethod {
         PyMethod {
+            rust_ident: name.to_string(),
             name: name.to_string(),
             doc: vec![],
             kind,
