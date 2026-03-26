@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-26
+
 ### Added
 
 - `[[override]]` / `[[tool.rylai.override]]`: optional `param_types` and/or `return_type` (mutually exclusive with `stub`) to override parameter and/or return annotations on generated `def` lines; omitted parts still come from Rust. Keys normalize (`kwargs` / `**kwargs`). Applies to module-level functions and class methods; `#[new]` / property setters keep `-> None` regardless of `return_type`.
@@ -14,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#[pyclass(extends = ...)]` / `#[pyo3(extends = ...)]`: stub `class` lines inherit from mapped PyO3 builtins (e.g. `PyDict` → `dict`) or from another `#[pyclass]` in the same crate (Python-visible name; adds `from ... import` when the base lives in another generated submodule). Unknown Rust bases emit a warning and omit the base class in the stub.
 - `@t.final` on generated `#[pyclass]` stubs by default; omitted when the PyO3 **`subclass` flag** is set (`#[pyclass(..., subclass)]` or `#[pyo3(subclass)]`; see [PyO3 `pyclass` docs](https://docs.rs/pyo3/latest/pyo3/attr.pyclass.html)). `#[pyclass]` enums are always emitted as final. Cross-crate `extends` targets are not resolved; use simple type names for same-crate bases (matching is by the last path segment of the `extends` type, not a full module path).
 - `[[add_content]]` / `[[tool.rylai.add_content]]`: inject raw Python into generated `.pyi` files by output path relative to `-o` (`file`), with `location` = `head` (after the auto-generated banner, or at file start if the banner is off), `after-import-typing`, or `tail`. Every configured `file` must match a stub path produced in the same run (otherwise Rylai errors).
-- Support for `#[pyclass(module = "...")]`: when any class declares a Python submodule, Rylai emits multiple `.pyi` files under `-o` instead of a single flat stub. Layout treats the top-level `#[pymodule]` name as the first segment of the module path (sibling stubs such as `efg.pyi` for `pkg.efg`, with rules for nested paths and merging when a submodule maps to the same file as the root stub). Root stub may be empty except for the pymodule docstring when all classes are routed to submodules.
+- Support for `#[pyclass(module = "...")]`: when any class declares a Python submodule, Rylai emits multiple `.pyi` files under `-o` instead of a single flat stub. Layout treats the top-level `#[pymodule]` name as the first segment of the module path (sibling stubs such as `efg.pyi` for `pkg.efg`, with rules for nested paths and merging when a submodule maps to the same file as the root stub). Root stub may be empty except for the pymodule docstring when all classes are routed to submodules.(#1)
 - `#[pymodule]` name and `#[pyclass(module = "...")]` may differ (e.g. internal extension module vs public package). Stub paths under `-o` use hybrid rules: when `module` starts with `{pymodule}.`, behavior matches the usual layout; otherwise the leading public package segment is dropped and the remainder is mirrored as files and directories (e.g. `pkg.abc` → `abc.pyi`, `pkg.cba.foo` → `cba/foo.pyi`).
 - Absolute `from ... import ...` lines for cross-stub references: when a signature references a `#[pyclass]` emitted in another generated submodule, the stub prepends the import so Pyright/mypy resolve the type. Cross-module reference collection walks arrays, pointers, `impl Trait` bounds, and common generic wrappers (`Option`, `Vec`, `PyResult`, `Py`/`Bound`, maps/sets, etc.).
 - Style A `#[pymodule]` modules: collect `m.add` / `m.add_function` / `m.add_class` from `#[pymodule_init]` bodies and from `Expr::Block` wrappers around those calls.
@@ -42,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/monchin/Rylai/releases/tag/v0.3.0
 [0.2.0]: https://github.com/monchin/Rylai/releases/tag/v0.2.0
 [0.1.0]: https://github.com/monchin/Rylai/releases/tag/v0.1.0
