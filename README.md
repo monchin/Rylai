@@ -193,6 +193,18 @@ stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 item = "my_module::Widget::reload"
 stub = "def reload(self, force: bool = False) -> None:"
 
+# Instead of `stub`, you may set `param_types` and/or `return_type` (mutually exclusive with `stub`).
+# `param_types`: table mapping parameter names → full annotation after `:`. `return_type`: one string
+# for the whole return annotation. Rylai still builds `def ...` from Rust and `#[pyo3(signature)]`;
+# parameter types come from Rust except where listed in `param_types`; return type from Rust unless
+# `return_type` is set. Keys use the bare name (`kwargs` / `**kwargs` normalized the same). Only for
+# module-level functions and class methods. Unused `param_types` keys → warning. `#[new]` / setters
+# still emit `-> None` in stubs; `return_type` applies to other methods and to module functions.
+# [[override]]
+# item = "my_module::f"
+# param_types = { "**kwargs" = "Unpack[KwargsItems]" }
+# return_type = "dict[str, t.Any]"
+
 # Optional: splice raw Python into a generated file (path is relative to -o, use /; must match a stub emitted in this run)
 [[add_content]]
 file = "my_package/sub.pyi"

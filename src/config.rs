@@ -101,13 +101,36 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OverrideEntry {
     /// Fully-qualified item path, e.g. "my_module::complex_function"
     pub item: String,
     /// Python header line for a top-level `def` or `class` (single line, usually ending with `:`).
     /// Trailing `...` is optional and stripped; if the Rust item has no `///` doc, Rylai emits `...` as the body.
-    pub stub: String,
+    /// Mutually exclusive with [`Self::param_types`] and [`Self::return_type`]; validated in [`Config::validate_overrides`].
+    #[serde(default)]
+    pub stub: Option<String>,
+    /// Per-parameter Python type strings (full annotations after `:`) merged into the generated
+    /// signature; keys are parameter names (`kwargs` and `**kwargs` normalize to the same key).
+    /// Incompatible with [`Self::stub`]; may be combined with [`Self::return_type`].
+    #[serde(default)]
+    pub param_types: Option<HashMap<String, String>>,
+    /// Full Python return type string for the generated `def` line (replaces Rust-inferred return).
+    /// Incompatible with [`Self::stub`]; may be combined with [`Self::param_types`].
+    #[serde(default)]
+    pub return_type: Option<String>,
+}
+
+/// Normalize a `param_types` config key so `kwargs`, `*args`, and `**kwargs` spellings map to the same bare name.
+pub fn normalize_param_types_key(key: &str) -> String {
+    let s = key.trim();
+    if let Some(rest) = s.strip_prefix("**") {
+        return rest.trim().to_string();
+    }
+    if let Some(rest) = s.strip_prefix('*') {
+        return rest.trim().to_string();
+    }
+    s.to_string()
 }
 
 /// Where to insert [`AddContentEntry::content`] in a generated `.pyi` file.
@@ -265,7 +288,44 @@ impl Config {
         let config: Self = merged
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid config structure: {}", e))?;
+        config.validate_overrides()?;
         Ok(config)
+    }
+
+    /// `[[override]]`: use `stub` alone, **or** at least one of non-empty `param_types` / `return_type`.
+    /// `stub` must not appear together with `param_types` or `return_type`.
+    pub fn validate_overrides(&self) -> Result<()> {
+        use anyhow::bail;
+        for (i, o) in self.overrides.iter().enumerate() {
+            let has_stub = o.stub.as_ref().is_some_and(|s| !s.trim().is_empty());
+            let has_pt = o.param_types.as_ref().is_some_and(|m| !m.is_empty());
+            let has_rt = o.return_type.as_ref().is_some_and(|s| !s.trim().is_empty());
+
+            if has_stub && (has_pt || has_rt) {
+                bail!(
+                    "[[override]] must not combine `stub` with `param_types` or `return_type` (entry index {i})"
+                );
+            }
+            if !has_stub && !has_pt && !has_rt {
+                bail!(
+                    "[[override]] must set `stub`, or non-empty `param_types`, or non-empty `return_type` (entry index {i})"
+                );
+            }
+
+            if has_pt {
+                let mut seen: HashMap<String, String> = HashMap::new();
+                for k in o.param_types.as_ref().expect("has_pt").keys() {
+                    let n = normalize_param_types_key(k);
+                    if let Some(first) = seen.get(&n) {
+                        bail!(
+                            "[[override]] param_types: duplicate keys after normalization (`{k}` and `{first}` → `{n}`) at entry index {i}"
+                        );
+                    }
+                    seen.insert(n, k.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Return the Python version as (major, minor) tuple for comparison.
@@ -473,6 +533,85 @@ mod tests {
     }
 
     #[test]
+    fn validate_overrides_rejects_both_stub_and_param_types() {
+        let mut c = Config::default();
+        c.overrides.push(OverrideEntry {
+            item: "a::b".to_string(),
+            stub: Some("def b(): ...".to_string()),
+            param_types: Some(HashMap::from([("x".to_string(), "int".to_string())])),
+            return_type: None,
+        });
+        let err = c.validate_overrides().unwrap_err();
+        assert!(
+            err.to_string().contains("combine") && err.to_string().contains("stub"),
+            "expected stub+param_types error, got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_overrides_rejects_neither_stub_nor_param_types_nor_return_type() {
+        let mut c = Config::default();
+        c.overrides.push(OverrideEntry {
+            item: "a::b".to_string(),
+            stub: None,
+            param_types: None,
+            return_type: None,
+        });
+        let err = c.validate_overrides().unwrap_err();
+        assert!(
+            err.to_string().contains("return_type") || err.to_string().contains("param_types"),
+            "expected missing-fields error, got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_overrides_rejects_stub_with_return_type() {
+        let mut c = Config::default();
+        c.overrides.push(OverrideEntry {
+            item: "a::b".to_string(),
+            stub: Some("def b(): ...".to_string()),
+            param_types: None,
+            return_type: Some("int".to_string()),
+        });
+        let err = c.validate_overrides().unwrap_err();
+        assert!(
+            err.to_string().contains("stub") && err.to_string().contains("return_type"),
+            "expected stub+return_type error, got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_overrides_accepts_return_type_only() {
+        let mut c = Config::default();
+        c.overrides.push(OverrideEntry {
+            item: "a::b".to_string(),
+            stub: None,
+            param_types: None,
+            return_type: Some("list[str]".to_string()),
+        });
+        c.validate_overrides().expect("return_type alone is valid");
+    }
+
+    #[test]
+    fn validate_overrides_rejects_duplicate_param_types_keys_after_normalization() {
+        let mut c = Config::default();
+        c.overrides.push(OverrideEntry {
+            item: "a::b".to_string(),
+            stub: None,
+            param_types: Some(HashMap::from([
+                ("kwargs".to_string(), "t.Any".to_string()),
+                ("**kwargs".to_string(), "Unpack[X]".to_string()),
+            ])),
+            return_type: None,
+        });
+        let err = c.validate_overrides().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate") || err.to_string().contains("normalization"),
+            "expected duplicate key error, got {err}"
+        );
+    }
+
+    #[test]
     fn load_merged_parses_valid_rylai_toml_only() {
         use std::io::Write;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -515,7 +654,10 @@ stub = "def my_fn() -> int: ..."
         assert!(!config.output.add_header);
         assert_eq!(config.overrides.len(), 1);
         assert_eq!(config.overrides[0].item, "my_module::my_fn");
-        assert_eq!(config.overrides[0].stub, "def my_fn() -> int: ...");
+        assert_eq!(
+            config.overrides[0].stub.as_deref(),
+            Some("def my_fn() -> int: ...")
+        );
     }
 
     #[test]
@@ -626,11 +768,14 @@ stub = "def fn() -> int: ..."
         assert_eq!(config.overrides.len(), 2);
         assert_eq!(config.overrides[0].item, "my_module::complex_function");
         assert_eq!(
-            config.overrides[0].stub,
-            "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ..."
+            config.overrides[0].stub.as_deref(),
+            Some("def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ...")
         );
         assert_eq!(config.overrides[1].item, "other::fn");
-        assert_eq!(config.overrides[1].stub, "def fn() -> int: ...");
+        assert_eq!(
+            config.overrides[1].stub.as_deref(),
+            Some("def fn() -> int: ...")
+        );
     }
 
     #[test]

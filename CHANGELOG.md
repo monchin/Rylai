@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `[[override]]` / `[[tool.rylai.override]]`: optional `param_types` and/or `return_type` (mutually exclusive with `stub`) to override parameter and/or return annotations on generated `def` lines; omitted parts still come from Rust. Keys normalize (`kwargs` / `**kwargs`). Applies to module-level functions and class methods; `#[new]` / property setters keep `-> None` regardless of `return_type`.
+
 - `#[pyclass(extends = ...)]` / `#[pyo3(extends = ...)]`: stub `class` lines inherit from mapped PyO3 builtins (e.g. `PyDict` → `dict`) or from another `#[pyclass]` in the same crate (Python-visible name; adds `from ... import` when the base lives in another generated submodule). Unknown Rust bases emit a warning and omit the base class in the stub.
 - `@t.final` on generated `#[pyclass]` stubs by default; omitted when the PyO3 **`subclass` flag** is set (`#[pyclass(..., subclass)]` or `#[pyo3(subclass)]`; see [PyO3 `pyclass` docs](https://docs.rs/pyo3/latest/pyo3/attr.pyclass.html)). `#[pyclass]` enums are always emitted as final. Cross-crate `extends` targets are not resolved; use simple type names for same-crate bases (matching is by the last path segment of the `extends` type, not a full module path).
 - `[[add_content]]` / `[[tool.rylai.add_content]]`: inject raw Python into generated `.pyi` files by output path relative to `-o` (`file`), with `location` = `head` (after the auto-generated banner, or at file start if the banner is off), `after-import-typing`, or `tail`. Every configured `file` must match a stub path produced in the same run (otherwise Rylai errors).

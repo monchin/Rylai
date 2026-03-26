@@ -4,11 +4,12 @@ use crate::collector::{
 };
 use crate::config::{
     Config, FallbackStrategy, OverrideEntry, RenderPolicy, merge_type_map_into_known_classes,
+    normalize_param_types_key,
 };
 use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
 use crate::type_map::{self, TypeMapping};
 use anyhow::{Result, bail};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use syn::{ReturnType, Type, TypeParamBound};
 
 // ── Public entry point ───────────────────────────────────────────────────────
@@ -127,6 +128,23 @@ impl Drop for RestoreCurrentSelfTypeGuard {
             *self.0 = None;
         }
     }
+}
+
+fn param_types_lookup_map(pt: &HashMap<String, String>) -> HashMap<String, String> {
+    pt.iter()
+        .map(|(k, v)| (normalize_param_types_key(k), v.clone()))
+        .collect()
+}
+
+/// Bundles options for [`GenCtx::emit_method_signature_lines`] so the helper stays within
+/// Clippy's argument count limit.
+struct MethodSignatureEmitOpts<'a> {
+    pad: &'a str,
+    location: &'a str,
+    lookup: Option<&'a HashMap<String, String>>,
+    used: &'a mut HashSet<String>,
+    return_override: Option<&'a str>,
+    touch_discarded_return: bool,
 }
 
 struct GenCtx<'a> {
@@ -262,7 +280,11 @@ impl<'a> GenCtx<'a> {
             PyItem::Class(c) => &c.doc,
             _ => &[],
         };
-        self.emit_override_stub(ov, doc, out, indent, merge_rust_doc_on_single_line)
+        let stub = ov
+            .stub
+            .as_ref()
+            .expect("emit_override requires stub (validated)");
+        self.emit_override_stub(stub, doc, out, indent, merge_rust_doc_on_single_line)
     }
 
     /// Shared `[[override]]` body emission for top-level items and class methods.
@@ -272,14 +294,14 @@ impl<'a> GenCtx<'a> {
     /// trailing `...`).
     fn emit_override_stub(
         &self,
-        ov: &OverrideEntry,
+        stub: &str,
         doc: &[String],
         out: &mut String,
         indent: usize,
         merge_rust_doc_on_single_line: bool,
     ) -> Result<()> {
         let pad = "    ".repeat(indent);
-        let trimmed = ov.stub.trim();
+        let trimmed = stub.trim();
         let rich = merge_rust_doc_on_single_line && !trimmed.contains('\n');
 
         if rich {
@@ -340,6 +362,22 @@ impl<'a> GenCtx<'a> {
         })
     }
 
+    fn warn_unused_param_types(
+        &mut self,
+        pt: &HashMap<String, String>,
+        used: &HashSet<String>,
+        item_label: &str,
+    ) {
+        for k in pt.keys() {
+            let n = normalize_param_types_key(k);
+            if !used.contains(&n) {
+                self.warnings.push(format!(
+                    "rylai: [override] param_types key `{k}` (normalized `{n}`) did not match any parameter in `{item_label}`"
+                ));
+            }
+        }
+    }
+
     // ── Module ───────────────────────────────────────────────────────────────
 
     fn gen_module(&mut self, module: &PyModule, out: &mut String, indent: usize) -> Result<()> {
@@ -357,13 +395,50 @@ impl<'a> GenCtx<'a> {
                 .iter()
                 .find(|o| module_level_override_matches(&o.item, item));
             if let Some(ov) = override_stub {
-                self.emit_override(ov, item, out, indent)?;
+                let has_stub = ov.stub.as_ref().is_some_and(|s| !s.trim().is_empty());
+                if has_stub {
+                    self.emit_override(ov, item, out, indent)?;
+                    continue;
+                }
+                let has_pt = ov.param_types.as_ref().is_some_and(|m| !m.is_empty());
+                match item {
+                    PyItem::Function(f) => {
+                        let lookup = ov
+                            .param_types
+                            .as_ref()
+                            .filter(|m| !m.is_empty())
+                            .map(param_types_lookup_map);
+                        let mut used = HashSet::new();
+                        let lookup_ref = lookup.as_ref();
+                        let return_override = ov.return_type.as_ref().and_then(|s| {
+                            let t = s.trim();
+                            (!t.is_empty()).then_some(t)
+                        });
+                        self.gen_function(f, out, indent, lookup_ref, &mut used, return_override)?;
+                        if has_pt {
+                            self.warn_unused_param_types(
+                                ov.param_types.as_ref().expect("has_pt"),
+                                &used,
+                                &f.name,
+                            );
+                        }
+                    }
+                    _ => {
+                        bail!(
+                            "[[override]] with `param_types` and/or `return_type` only applies to functions and class methods (item `{}`)",
+                            ov.item
+                        );
+                    }
+                }
                 continue;
             }
 
             match item {
                 PyItem::Constant(c) => self.gen_constant(c, out, indent)?,
-                PyItem::Function(f) => self.gen_function(f, out, indent)?,
+                PyItem::Function(f) => {
+                    let mut unused = HashSet::new();
+                    self.gen_function(f, out, indent, None, &mut unused, None)?;
+                }
                 PyItem::Class(c) => self.gen_class(c, out, indent)?,
                 PyItem::Module(m) => {
                     // Submodule: emit a class stub as a namespace approximation
@@ -390,15 +465,27 @@ impl<'a> GenCtx<'a> {
 
     // ── Function ─────────────────────────────────────────────────────────────
 
-    fn gen_function(&mut self, f: &PyFunction, out: &mut String, indent: usize) -> Result<()> {
+    fn gen_function(
+        &mut self,
+        f: &PyFunction,
+        out: &mut String,
+        indent: usize,
+        lookup: Option<&HashMap<String, String>>,
+        used: &mut HashSet<String>,
+        return_override: Option<&str>,
+    ) -> Result<()> {
         let pad = "    ".repeat(indent);
-        let ret = self.resolve_type(&f.return_type, &format!("{}::return", f.name))?;
+        let ret = if let Some(s) = return_override {
+            s.to_string()
+        } else {
+            self.resolve_type(&f.return_type, &format!("{}::return", f.name))?
+        };
 
         let params_str = if let Some(sig) = &f.signature_override {
-            // #[pyo3(signature = (...))] is present: merge signature defaults with Rust types
-            self.merge_sig_with_types(sig, &f.params, &f.name)?
+            // #[pyo3(signature = (...))] is present: merge signature shape with Rust-inferred types
+            self.merge_sig_with_types(sig, &f.params, &f.name, lookup, used)?
         } else {
-            self.gen_params(&f.params, &f.name, false)?
+            self.gen_params(&f.params, &f.name, false, lookup, used)?
         };
 
         out.push_str(&format!("{pad}def {}({params_str}) -> {ret}:\n", f.name));
@@ -473,6 +560,127 @@ impl<'a> GenCtx<'a> {
         Ok(())
     }
 
+    /// Return annotation string for the stub `def` line, or `""` when the stub hard-codes `-> None`
+    /// (`#[new]` / setters). When `return_override` is set (non-empty after trim), it replaces
+    /// Rust-inferred return for all other method kinds.
+    fn method_stub_return_type(
+        &mut self,
+        m: &PyMethod,
+        location: &str,
+        return_override: Option<&str>,
+    ) -> Result<String> {
+        Ok(match &m.kind {
+            MethodKind::New | MethodKind::Setter(_) => String::new(),
+            _ => {
+                if let Some(s) = return_override.filter(|s| !s.trim().is_empty()) {
+                    s.trim().to_string()
+                } else {
+                    self.resolve_type(&m.return_type, &format!("{location}::return"))?
+                }
+            }
+        })
+    }
+
+    /// Value parameter type for a `#[setter]` stub (`value: ...`), with optional `param_types` override.
+    fn setter_value_param_type(
+        &mut self,
+        m: &PyMethod,
+        location: &str,
+        lookup: Option<&HashMap<String, String>>,
+        used: &mut HashSet<String>,
+    ) -> Result<String> {
+        let val_type = if let Some(p) = m.params.first() {
+            if let Some(lu) = lookup {
+                if let Some(ov_ty) = lu.get(p.name.as_str()) {
+                    used.insert(normalize_param_types_key(&p.name));
+                    ov_ty.clone()
+                } else {
+                    self.resolve_type(&p.ty, location)?
+                }
+            } else {
+                self.resolve_type(&p.ty, location)?
+            }
+        } else {
+            "t.Any".to_string()
+        };
+        if val_type == "t.Any" {
+            self.needs_any = true;
+        }
+        Ok(val_type)
+    }
+
+    /// Decorators and `def` line for a `#[pymethods]` entry (no docstring / body line).
+    ///
+    /// When `touch_discarded_return` is true (normal generation), `m.return_type` is still resolved
+    /// for `#[new]` and setters so `resolve_type` side effects (warnings, imports) match legacy
+    /// behavior. When false (`[[override]]` with `param_types` / `return_type` only), that resolution
+    /// is skipped for those kinds.
+    fn emit_method_signature_lines(
+        &mut self,
+        m: &PyMethod,
+        out: &mut String,
+        opts: MethodSignatureEmitOpts<'_>,
+    ) -> Result<()> {
+        let MethodSignatureEmitOpts {
+            pad,
+            location,
+            lookup,
+            used,
+            return_override,
+            touch_discarded_return,
+        } = opts;
+        if touch_discarded_return && matches!(m.kind, MethodKind::New | MethodKind::Setter(_)) {
+            let _ = self.resolve_type(&m.return_type, &format!("{location}::return"))?;
+        }
+        let ret = self.method_stub_return_type(m, location, return_override)?;
+        match &m.kind {
+            MethodKind::New => {
+                let params = self.method_params(m, location, true, lookup, used)?;
+                out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
+            }
+            MethodKind::Static => {
+                out.push_str(&format!("{pad}@staticmethod\n"));
+                let params = self.method_params(m, location, false, lookup, used)?;
+                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+            }
+            MethodKind::Class => {
+                out.push_str(&format!("{pad}@classmethod\n"));
+                let params = self.method_params(m, location, true, lookup, used)?;
+                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+            }
+            MethodKind::Getter(prop) => {
+                out.push_str(&format!("{pad}@property\n"));
+                out.push_str(&format!("{pad}def {prop}(self) -> {ret}:\n"));
+            }
+            MethodKind::Setter(prop) => {
+                let val_type = self.setter_value_param_type(m, location, lookup, used)?;
+                out.push_str(&format!("{pad}@{prop}.setter\n"));
+                out.push_str(&format!(
+                    "{pad}def {prop}(self, value: {val_type}) -> None:\n"
+                ));
+            }
+            MethodKind::Instance => {
+                let params = self.method_params(m, location, true, lookup, used)?;
+                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_method_doc_or_placeholder(
+        &mut self,
+        m: &PyMethod,
+        out: &mut String,
+        pad: &str,
+        indent: usize,
+    ) {
+        if !m.doc.is_empty() {
+            self.gen_docstring(&m.doc, out, indent + 1);
+        } else {
+            out.push_str(&format!("{pad}    ...\n"));
+        }
+    }
+
     fn gen_method(
         &mut self,
         m: &PyMethod,
@@ -485,82 +693,94 @@ impl<'a> GenCtx<'a> {
             RestoreCurrentSelfTypeGuard(&mut self.current_self_type as *mut Option<String>);
         let pad = "    ".repeat(indent);
 
-        if let Some(ov) = self.find_method_override(class, m) {
-            self.emit_override_stub(ov, &m.doc, out, indent, true)?;
+        if let Some(ov) = self.find_method_override(class, m).cloned() {
+            if let Some(stub) = ov.stub.as_ref().filter(|s| !s.trim().is_empty()) {
+                self.emit_override_stub(stub, &m.doc, out, indent, true)?;
+                return Ok(());
+            }
+            let has_pt = ov.param_types.as_ref().is_some_and(|m| !m.is_empty());
+            let lookup = ov
+                .param_types
+                .as_ref()
+                .filter(|m| !m.is_empty())
+                .map(param_types_lookup_map);
+            let mut used = HashSet::new();
+            let location = format!("{}::{}", class.name, m.name);
+            let lookup_ref = lookup.as_ref();
+            let return_override = ov.return_type.as_ref().and_then(|s| {
+                let t = s.trim();
+                (!t.is_empty()).then_some(t)
+            });
+
+            self.emit_method_signature_lines(
+                m,
+                out,
+                MethodSignatureEmitOpts {
+                    pad: &pad,
+                    location: &location,
+                    lookup: lookup_ref,
+                    used: &mut used,
+                    return_override,
+                    touch_discarded_return: false,
+                },
+            )?;
+
+            if has_pt {
+                self.warn_unused_param_types(
+                    ov.param_types.as_ref().expect("has_pt"),
+                    &used,
+                    &location,
+                );
+            }
+            self.emit_method_doc_or_placeholder(m, out, &pad, indent);
+            out.push('\n');
             return Ok(());
         }
 
         let location = format!("{}::{}", class.name, m.name);
-        let ret = self.resolve_type(&m.return_type, &format!("{location}::return"))?;
-
-        match &m.kind {
-            MethodKind::New => {
-                let params = self.method_params(m, &location, true)?;
-                out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
-            }
-            MethodKind::Static => {
-                out.push_str(&format!("{pad}@staticmethod\n"));
-                let params = self.method_params(m, &location, false)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
-            }
-            MethodKind::Class => {
-                out.push_str(&format!("{pad}@classmethod\n"));
-                let params = self.method_params(m, &location, true)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
-            }
-            MethodKind::Getter(prop) => {
-                out.push_str(&format!("{pad}@property\n"));
-                out.push_str(&format!("{pad}def {prop}(self) -> {ret}:\n"));
-            }
-            MethodKind::Setter(prop) => {
-                // setter takes one value param
-                let val_type = m
-                    .params
-                    .first()
-                    .map(|p| self.resolve_type(&p.ty, &location))
-                    .transpose()?
-                    .unwrap_or_else(|| "t.Any".to_string());
-                if val_type == "t.Any" {
-                    self.needs_any = true;
-                }
-                out.push_str(&format!("{pad}@{prop}.setter\n"));
-                out.push_str(&format!(
-                    "{pad}def {prop}(self, value: {val_type}) -> None:\n"
-                ));
-            }
-            MethodKind::Instance => {
-                let params = self.method_params(m, &location, true)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
-            }
-        }
-
-        if !m.doc.is_empty() {
-            self.gen_docstring(&m.doc, out, indent + 1);
-        } else {
-            out.push_str(&format!("{pad}    ...\n"));
-        }
+        let mut unused = HashSet::new();
+        self.emit_method_signature_lines(
+            m,
+            out,
+            MethodSignatureEmitOpts {
+                pad: &pad,
+                location: &location,
+                lookup: None,
+                used: &mut unused,
+                return_override: None,
+                touch_discarded_return: true,
+            },
+        )?;
+        self.emit_method_doc_or_placeholder(m, out, &pad, indent);
         out.push('\n');
         Ok(())
     }
 
     /// Build the parameter list for a method: uses `signature_override` when present,
     /// otherwise `gen_params`. When `with_self` is true, the result includes a leading `self`.
-    fn method_params(&mut self, m: &PyMethod, location: &str, with_self: bool) -> Result<String> {
+    fn method_params(
+        &mut self,
+        m: &PyMethod,
+        location: &str,
+        with_self: bool,
+        lookup: Option<&HashMap<String, String>>,
+        used: &mut HashSet<String>,
+    ) -> Result<String> {
         if let Some(sig) = &m.signature_override {
-            let merged = self.merge_sig_with_types(sig, &m.params, location)?;
+            let merged = self.merge_sig_with_types(sig, &m.params, location, lookup, used)?;
             Ok(if with_self {
                 format!("self, {merged}")
             } else {
                 merged
             })
         } else {
-            self.gen_params(&m.params, location, with_self)
+            self.gen_params(&m.params, location, with_self, lookup, used)
         }
     }
 
     // ── Signature merge ──────────────────────────────────────────────────────
 
-    /// Combine a `#[pyo3(signature = (...))]` string with the Rust param types.
+    /// Combine a `#[pyo3(signature = (...))]` string with Rust-inferred Python types.
     ///
     /// `sig` is the inner content of the signature attribute with outer parens already
     /// stripped, e.g. `"page=None, clip=None, tf_settings=None, **kwargs"`.
@@ -571,6 +791,8 @@ impl<'a> GenCtx<'a> {
         sig: &str,
         params: &[PyParam],
         fn_name: &str,
+        lookup: Option<&HashMap<String, String>>,
+        used: &mut HashSet<String>,
     ) -> Result<String> {
         // Build name → PyParam lookup
         let param_by_name: HashMap<&str, &PyParam> =
@@ -587,21 +809,39 @@ impl<'a> GenCtx<'a> {
 
             if let Some(name) = token.strip_prefix("**") {
                 let name = name.trim(); // proc-macro may emit "** kwargs" with a space
-                // **kwargs are unpacked; no type (Unpack[TypedDict] etc. not supported yet).
-                out_parts.push(format!("**{name}"));
+                let mut out = format!("**{name}");
+                if let Some(lu) = lookup
+                    && let Some(ty) = lu.get(name)
+                {
+                    out = format!("**{name}: {ty}");
+                    used.insert(normalize_param_types_key(name));
+                }
+                out_parts.push(out);
             } else if let Some(name) = token.strip_prefix('*') {
                 let name = name.trim();
                 if name.is_empty() {
                     // bare `*` — keyword-only argument separator
                     out_parts.push("*".to_string());
                 } else {
-                    // *args are unpacked; no type.
-                    out_parts.push(format!("*{name}"));
+                    let mut out = format!("*{name}");
+                    if let Some(lu) = lookup
+                        && let Some(ty) = lu.get(name)
+                    {
+                        out = format!("*{name}: {ty}");
+                        used.insert(normalize_param_types_key(name));
+                    }
+                    out_parts.push(out);
                 }
             } else {
                 let (name, default_opt) = split_name_default(token);
                 if let Some(p) = param_by_name.get(name) {
-                    let ty = self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?;
+                    let mut ty = self.resolve_type(&p.ty, &format!("{fn_name}::{name}"))?;
+                    if let Some(lu) = lookup
+                        && let Some(ov_ty) = lu.get(name)
+                    {
+                        ty = ov_ty.clone();
+                        used.insert(normalize_param_types_key(name));
+                    }
                     match default_opt {
                         Some(default) => out_parts.push(format!("{name}: {ty} = {default}")),
                         None => out_parts.push(format!("{name}: {ty}")),
@@ -623,13 +863,21 @@ impl<'a> GenCtx<'a> {
         params: &[PyParam],
         location: &str,
         with_self: bool,
+        lookup: Option<&HashMap<String, String>>,
+        used: &mut HashSet<String>,
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
         if with_self {
             parts.push("self".to_string());
         }
         for p in params {
-            let ty = self.resolve_type(&p.ty, &format!("{location}::{}", p.name))?;
+            let mut ty = self.resolve_type(&p.ty, &format!("{location}::{}", p.name))?;
+            if let Some(lu) = lookup
+                && let Some(ov_ty) = lu.get(p.name.as_str())
+            {
+                ty = ov_ty.clone();
+                used.insert(normalize_param_types_key(&p.name));
+            }
             let part = match p.kind {
                 ParamKind::Args => format!("*{}: {ty}", p.name),
                 ParamKind::Kwargs => format!("**{}: {ty}", p.name),
@@ -1062,6 +1310,7 @@ mod tests {
     };
     use crate::config::Config;
     use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     // ── Test-data builders ───────────────────────────────────────────────────
@@ -1720,7 +1969,11 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "complex_fn".to_string(),
-            stub: "def complex_fn(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ...".to_string(),
+            stub: Some(
+                "def complex_fn(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]: ...".to_string(),
+            ),
+            param_types: None,
+            return_type: None,
         });
         let f = make_fn("complex_fn", None, vec![], syn::parse_quote! { () });
         let stub = stub_for_config(vec![PyItem::Function(f)], &config);
@@ -1738,6 +1991,124 @@ mod tests {
         );
     }
 
+    /// `param_types` with `#[pyo3(signature)]` supplies types for `**kwargs` / `*args` (full annotation after `:`).
+    #[test]
+    fn config_override_param_types_merges_unpack_on_kwargs() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::f".to_string(),
+            stub: None,
+            param_types: Some(HashMap::from([(
+                "**kwargs".to_string(),
+                "Unpack[KwargsItems]".to_string(),
+            )])),
+            return_type: None,
+        });
+        let f = make_fn(
+            "f",
+            Some("**kwargs"),
+            vec![make_param("kwargs", syn::parse_quote! { pyo3::PyObject })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("**kwargs: Unpack[KwargsItems]"),
+            "expected param_types on kwargs, got:\n{stub}"
+        );
+    }
+
+    /// `param_types` overrides only listed parameters; others keep Rust-inferred types.
+    #[test]
+    fn config_override_param_types_partial_params() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::g".to_string(),
+            stub: None,
+            param_types: Some(HashMap::from([("x".to_string(), "bytes".to_string())])),
+            return_type: None,
+        });
+        let f = make_fn(
+            "g",
+            None,
+            vec![
+                make_param("x", syn::parse_quote! { i32 }),
+                make_param("y", syn::parse_quote! { i32 }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("x: bytes") && stub.contains("y: int"),
+            "expected mixed types, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn config_override_return_type_only_on_function() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::h".to_string(),
+            stub: None,
+            param_types: None,
+            return_type: Some("list[str]".to_string()),
+        });
+        let f = make_fn(
+            "h",
+            None,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("-> list[str]:"),
+            "expected return_type override, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn config_override_return_type_with_param_types() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::i".to_string(),
+            stub: None,
+            param_types: Some(HashMap::from([("x".to_string(), "bytes".to_string())])),
+            return_type: Some("str".to_string()),
+        });
+        let f = make_fn(
+            "i",
+            None,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { bool },
+        );
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("x: bytes") && stub.contains("-> str:"),
+            "expected param_types + return_type, got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn config_override_param_types_on_constant_errors() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "MY_CONST".to_string(),
+            stub: None,
+            param_types: Some(HashMap::from([("x".to_string(), "int".to_string())])),
+            return_type: None,
+        });
+        let c = PyConstant {
+            name: "MY_CONST".to_string(),
+            py_type: "int".to_string(),
+        };
+        let result = generate(&[make_module(vec![PyItem::Constant(c)])], &config);
+        assert!(result.is_err(), "param_types on non-function must error");
+    }
+
     /// A fully-qualified override (`module::item`) must also match.
     #[test]
     fn config_override_qualified_path_matches() {
@@ -1745,7 +2116,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::qualified_fn".to_string(),
-            stub: "def qualified_fn() -> int:".to_string(),
+            stub: Some("def qualified_fn() -> int:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let f = make_fn("qualified_fn", None, vec![], syn::parse_quote! { () });
         let stub = stub_for_config(vec![PyItem::Function(f)], &config);
@@ -1764,7 +2137,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::py_get_intersections_from_edges".to_string(),
-            stub: "def get_intersections_from_edges() -> int: ...".to_string(),
+            stub: Some("def get_intersections_from_edges() -> int: ...".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let mut f = make_fn(
             "get_intersections_from_edges",
@@ -1787,7 +2162,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "g".to_string(),
-            stub: "def g() -> int:".to_string(),
+            stub: Some("def g() -> int:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let mut f = make_fn("g", None, vec![], syn::parse_quote! { () });
         f.doc = vec!["From Rust docs.".to_string()];
@@ -1810,7 +2187,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::TfSettings::py_new".to_string(),
-            stub: "def __init__(self, **kwargs: t.Any) -> None:".to_string(),
+            stub: Some("def __init__(self, **kwargs: t.Any) -> None:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let m = PyMethod {
             rust_ident: "py_new".to_string(),
@@ -1853,7 +2232,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::Counter::__init__".to_string(),
-            stub: "def __init__(self, x: int) -> None:".to_string(),
+            stub: Some("def __init__(self, x: int) -> None:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let m = make_method(
             "new",
@@ -1876,7 +2257,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "crate::tablers::TfSettings::py_new".to_string(),
-            stub: "def __init__(self) -> None:".to_string(),
+            stub: Some("def __init__(self) -> None:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let m = PyMethod {
             rust_ident: "py_new".to_string(),
@@ -1905,7 +2288,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::Visible::do_thing".to_string(),
-            stub: "def do_thing(self) -> str:".to_string(),
+            stub: Some("def do_thing(self) -> str:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let m = PyMethod {
             rust_ident: "do_thing".to_string(),
@@ -1943,7 +2328,9 @@ mod tests {
         let mut config = Config::default();
         config.overrides.push(OverrideEntry {
             item: "m::Hidden::do_thing".to_string(),
-            stub: "def do_thing(self) -> bytes:".to_string(),
+            stub: Some("def do_thing(self) -> bytes:".to_string()),
+            param_types: None,
+            return_type: None,
         });
         let m = PyMethod {
             rust_ident: "do_thing".to_string(),
