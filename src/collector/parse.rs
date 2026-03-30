@@ -199,6 +199,9 @@ pub(crate) struct ParseContext<'a> {
     pub parse_warnings: Option<&'a RefCell<Vec<String>>>,
     /// From [`crate::config::type_map_preserve_alias_idents`]; used when expanding `type` aliases.
     pub type_map_preserve_idents: &'a HashSet<String>,
+    /// Global map of all pyfunctions in the crate, indexed by function name (last segment of path).
+    /// Allows resolving `wrap_pyfunction!(crate::module::foo)` calls.
+    pub pyfunction_map: Option<&'a PyFunctionMap>,
 }
 
 /// Context for walking `m.add` / `m.add_function` / `m.add_class` in Style B pymodule functions and in
@@ -410,14 +413,7 @@ fn collect_add_calls_from_expr(
                 "add_function" => {
                     // m.add_function(wrap_pyfunction!(foo, m)?)
                     if let Some(fn_name) = extract_wrap_pyfunction_name(mc.args.first())
-                        && let Some(func) = find_pyfunction_by_name(
-                            &fn_name,
-                            ctx.file_items,
-                            ctx.path,
-                            ctx.cx.config,
-                            ctx.cx.type_alias_map,
-                            ctx.cx.type_map_preserve_idents,
-                        )
+                        && let Some(func) = find_pyfunction_by_name(&fn_name, ctx)
                     {
                         out.push(PyItem::Function(func));
                     }
@@ -472,22 +468,42 @@ fn collect_add_calls_from_expr(
 }
 
 /// Extract the function name from `wrap_pyfunction!(foo, m)` or `wrap_pyfunction!(foo)`.
+/// Supports both simple names (`foo`) and full paths (`crate::module::foo`).
 fn extract_wrap_pyfunction_name(arg: Option<&Expr>) -> Option<String> {
     let expr = arg?;
+    // Also handle if it was already unwrapped (after `?`)
+    if let Expr::Try(t) = expr {
+        return extract_wrap_pyfunction_name(Some(&t.expr));
+    }
     // The macro call becomes a syn::ExprMacro
     if let Expr::Macro(m) = expr {
         let macro_name = m.mac.path.segments.last()?.ident.to_string();
         if macro_name == "wrap_pyfunction" {
-            // Tokens: `foo , m` — first token is the ident
-            let mut tokens = m.mac.tokens.clone().into_iter();
-            if let Some(proc_macro2::TokenTree::Ident(id)) = tokens.next() {
-                return Some(id.to_string());
+            // Tokens: `foo , m` or `crate::module::foo , m`
+            // Collect all identifiers until we hit a comma
+            let mut path_parts = Vec::new();
+            for token in m.mac.tokens.clone() {
+                match token {
+                    proc_macro2::TokenTree::Ident(id) => {
+                        path_parts.push(id.to_string());
+                    }
+                    proc_macro2::TokenTree::Punct(p) if p.as_char() == ',' => {
+                        // Stop at comma (argument separator)
+                        break;
+                    }
+                    // Ignore other tokens (:: punctuation and whitespace)
+                    _ => {}
+                }
+            }
+            // Validate that we have at least one identifier part
+            if !path_parts.is_empty() {
+                // Ensure all path parts are valid Rust identifiers
+                // Identifiers must start with a letter or underscore, and contain only letters,
+                // digits, and underscores. The syn crate already validates this when parsing
+                // Ident tokens, so we just need to ensure we collected at least one.
+                return Some(path_parts.join("::"));
             }
         }
-    }
-    // Also handle if it was already unwrapped (after `?`)
-    if let Expr::Try(t) = expr {
-        return extract_wrap_pyfunction_name(Some(&t.expr));
     }
     None
 }
@@ -551,22 +567,55 @@ fn extract_turbofish_type_name(
 }
 
 /// Find a `#[pyfunction] fn <name>` in the file's top-level items.
-fn find_pyfunction_by_name(
-    name: &str,
-    file_items: &[Item],
-    path: &Path,
-    config: &Config,
-    type_alias_map: &HashMap<String, Type>,
-    type_map_preserve_idents: &HashSet<String>,
-) -> Option<PyFunction> {
-    for item in file_items {
+fn find_pyfunction_by_name<'a>(name: &str, ctx: &CollectAddCallsContext<'a>) -> Option<PyFunction> {
+    // Extract the last segment (function name) from a potential path like "crate::module::foo"
+    // Note: This approach has limitations. If multiple modules have functions with the same name,
+    // we may resolve to the wrong function. A full semantic analysis would be needed for
+    // precise resolution, but that's beyond AST-level parsing capabilities.
+    let lookup_name = name.rsplit("::").next().unwrap_or(name);
+
+    // First try to find in global pyfunction map (for cross-module references)
+    if let Some(map) = ctx.cx.pyfunction_map
+        && let Some(func) = map.get(lookup_name)
+    {
+        return Some(func.clone());
+    }
+
+    // Fallback to searching in current file
+    for item in ctx.file_items {
         if let Item::Fn(f) = item
-            && f.sig.ident == name
+            && f.sig.ident == lookup_name
             && has_attr(&f.attrs, "pyfunction")
         {
-            return parse_pyfunction(f, path, config, type_alias_map, type_map_preserve_idents);
+            return parse_pyfunction(
+                f,
+                ctx.path,
+                ctx.cx.config,
+                ctx.cx.type_alias_map,
+                ctx.cx.type_map_preserve_idents,
+            );
         }
     }
+
+    // If not found and we have a global map, this might be an alias case
+    // (e.g., `use foo as bar` and `wrap_pyfunction!(bar)`)
+    // or a full path reference that couldn't be resolved.
+    // Unfortunately, AST-level parsing cannot reliably resolve aliases without full
+    // semantic analysis. Users should use the original function name or full path.
+    if let Some(warnings) = ctx.cx.parse_warnings {
+        if name.contains("::") {
+            warnings.borrow_mut().push(format!(
+                "Could not resolve function '{}'. This may be due to aliasing or cross-module reference limitations. Try using the original function name.",
+                name
+            ));
+        } else if ctx.cx.pyfunction_map.is_some() {
+            warnings.borrow_mut().push(format!(
+                "Could not find pyfunction '{}'. Ensure the function has #[pyfunction] attribute and is accessible.",
+                lookup_name
+            ));
+        }
+    }
+
     None
 }
 
@@ -1182,6 +1231,63 @@ fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap, enabled_fea
     }
 }
 
+/// Map from function name (last segment) to PyFunction for cross-module lookup.
+/// When a pyfunction is referenced via path like `crate::module::foo`,
+/// we look it up by the last segment (`foo`) since Rust function identifiers
+/// must be unique within their scope.
+pub type PyFunctionMap = HashMap<String, PyFunction>;
+
+/// Build a global map of all pyfunctions in the crate.
+///
+/// This allows finding pyfunctions referenced via full paths (e.g., `crate::module::foo`)
+/// from `wrap_pyfunction!` macro calls in the `#[pymodule]` function.
+///
+/// Items behind `#[cfg(feature = "...")]` are included only when the feature is in `enabled_features`.
+pub fn build_pyfunction_map(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+) -> PyFunctionMap {
+    let mut map = PyFunctionMap::new();
+    for (path, file) in files {
+        collect_pyfunctions_from_items(&file.items, path, &mut map, enabled_features);
+    }
+    map
+}
+
+fn collect_pyfunctions_from_items(
+    items: &[Item],
+    path: &std::path::Path,
+    map: &mut PyFunctionMap,
+    enabled_features: &[String],
+) {
+    for item in items {
+        match item {
+            Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
+                if cfg_is_active(&f.attrs, enabled_features)
+                    && let Some(func) = parse_pyfunction(
+                        f,
+                        path,
+                        &Config::default(),
+                        &HashMap::new(),
+                        &HashSet::new(),
+                    )
+                {
+                    // Use the rust_name (function identifier) as the key
+                    map.insert(func.rust_name.clone(), func);
+                }
+            }
+            Item::Mod(m) => {
+                if cfg_is_active(&m.attrs, enabled_features)
+                    && let Some((_, content)) = &m.content
+                {
+                    collect_pyfunctions_from_items(content, path, map, enabled_features);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── cfg(feature) evaluation for [features] enabled ──────────────────────────
 
 /// Returns true if the item should be considered active given the configured enabled features.
@@ -1694,6 +1800,7 @@ mod tests {
             pyclass_enum_rust_names: None,
             parse_warnings: None,
             type_map_preserve_idents: preserve,
+            pyfunction_map: None,
         }
     }
 
@@ -2008,6 +2115,7 @@ mod my_mod {
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
             type_map_preserve_idents: &type_map_preserve_idents,
+            pyfunction_map: None,
         };
         let modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         let class = match &modules[0].items[0] {
@@ -2061,6 +2169,7 @@ mod my_mod {
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
             type_map_preserve_idents: &type_map_preserve_idents,
+            pyfunction_map: None,
         };
         let _modules = extract_modules_from_file(&file, path, &pyclass_map, cx);
         assert_eq!(warnings.borrow().len(), 1);
@@ -2672,6 +2781,7 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             pyclass_enum_rust_names: None,
             parse_warnings: Some(&warnings),
             type_map_preserve_idents: &type_map_preserve_idents,
+            pyfunction_map: None,
         };
         let rust_name = item.ident.to_string();
         let class =
@@ -3855,5 +3965,229 @@ enum PyColor { Red, Green, Blue }
             Some(&"Color".to_string()),
             "renamed enum should appear in pyclass name map"
         );
+    }
+
+    // ── extract_wrap_pyfunction_name ─────────────────────────────────────────
+
+    #[test]
+    fn extract_wrap_pyfunction_name_simple() {
+        let expr: syn::Expr = syn::parse_quote! {
+            wrap_pyfunction!(foo, m)
+        };
+        assert_eq!(
+            extract_wrap_pyfunction_name(Some(&expr)),
+            Some("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_full_path() {
+        let expr: syn::Expr = syn::parse_quote! {
+            wrap_pyfunction!(crate::module::foo, m)
+        };
+        assert_eq!(
+            extract_wrap_pyfunction_name(Some(&expr)),
+            Some("crate::module::foo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_without_module_arg() {
+        let expr: syn::Expr = syn::parse_quote! {
+            wrap_pyfunction!(foo)
+        };
+        assert_eq!(
+            extract_wrap_pyfunction_name(Some(&expr)),
+            Some("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_nested_path() {
+        let expr: syn::Expr = syn::parse_quote! {
+            wrap_pyfunction!(crate::a::b::c::function_name, m)
+        };
+        assert_eq!(
+            extract_wrap_pyfunction_name(Some(&expr)),
+            Some("crate::a::b::c::function_name".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_try_expr() {
+        let expr: syn::Expr = syn::parse_quote! {
+            wrap_pyfunction!(foo)?
+        };
+        assert_eq!(
+            extract_wrap_pyfunction_name(Some(&expr)),
+            Some("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_none_for_other_macro() {
+        let expr: syn::Expr = syn::parse_quote! {
+            other_macro!(foo)
+        };
+        assert_eq!(extract_wrap_pyfunction_name(Some(&expr)), None);
+    }
+
+    #[test]
+    fn extract_wrap_pyfunction_name_none_for_non_macro() {
+        let expr: syn::Expr = syn::parse_quote! {
+            foo
+        };
+        assert_eq!(extract_wrap_pyfunction_name(Some(&expr)), None);
+    }
+
+    // ── build_pyfunction_map ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_pyfunction_map_collects_single_function() {
+        let file = syn::parse_file(
+            r#"
+#[pyfunction]
+fn foo(x: i32) -> i32 { x + 1 }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyfunction_map(&[(path, file)], &no_features());
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("foo"));
+        let func = map.get("foo").unwrap();
+        assert_eq!(func.rust_name, "foo");
+    }
+
+    #[test]
+    fn build_pyfunction_map_collects_multiple_functions() {
+        let file = syn::parse_file(
+            r#"
+#[pyfunction]
+fn foo(x: i32) -> i32 { x + 1 }
+
+#[pyfunction]
+fn bar(y: String) -> String { y }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyfunction_map(&[(path, file)], &no_features());
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("foo"));
+        assert!(map.contains_key("bar"));
+    }
+
+    #[test]
+    fn build_pyfunction_map_collects_from_multiple_files() {
+        let file1 = syn::parse_file(
+            r#"
+#[pyfunction]
+fn foo(x: i32) -> i32 { x + 1 }
+"#,
+        )
+        .unwrap();
+        let file2 = syn::parse_file(
+            r#"
+#[pyfunction]
+fn bar(y: String) -> String { y }
+"#,
+        )
+        .unwrap();
+        let path1 = std::path::PathBuf::from("foo.rs");
+        let path2 = std::path::PathBuf::from("bar.rs");
+        let map = build_pyfunction_map(&[(path1, file1), (path2, file2)], &no_features());
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("foo"));
+        assert!(map.contains_key("bar"));
+    }
+
+    #[test]
+    fn build_pyfunction_map_respects_cfg_feature() {
+        let file = syn::parse_file(
+            r#"
+#[cfg(feature = "enabled")]
+#[pyfunction]
+fn enabled_func() -> i32 { 1 }
+
+#[cfg(feature = "disabled")]
+#[pyfunction]
+fn disabled_func() -> i32 { 0 }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let enabled_features = vec!["enabled".to_string()];
+        let map = build_pyfunction_map(&[(path, file)], &enabled_features);
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("enabled_func"));
+        assert!(!map.contains_key("disabled_func"));
+    }
+
+    #[test]
+    fn build_pyfunction_map_collects_from_nested_modules() {
+        let file = syn::parse_file(
+            r#"
+mod inner {
+    #[pyfunction]
+    pub fn inner_func(x: i32) -> i32 { x + 1 }
+}
+
+#[pyfunction]
+fn outer_func() -> i32 { 0 }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyfunction_map(&[(path, file)], &no_features());
+
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("inner_func"));
+        assert!(map.contains_key("outer_func"));
+    }
+
+    #[test]
+    fn build_pyfunction_map_preserves_pyfunction_with_name() {
+        let file = syn::parse_file(
+            r#"
+#[pyfunction]
+#[pyo3(name = "python_name")]
+fn rust_name(x: i32) -> i32 { x + 1 }
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyfunction_map(&[(path, file)], &no_features());
+
+        assert_eq!(map.len(), 1);
+        let func = map.get("rust_name").unwrap();
+        assert_eq!(func.rust_name, "rust_name");
+        assert_eq!(func.name, "python_name");
+    }
+
+    #[test]
+    fn build_pyfunction_map_ignores_non_pyfunction() {
+        let file = syn::parse_file(
+            r#"
+#[pyfunction]
+fn is_pyfunction() -> i32 { 1 }
+
+fn not_pyfunction() -> i32 { 0 }
+
+#[pyclass]
+struct MyClass {}
+"#,
+        )
+        .unwrap();
+        let path = std::path::PathBuf::from("lib.rs");
+        let map = build_pyfunction_map(&[(path, file)], &no_features());
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("is_pyfunction"));
+        assert!(!map.contains_key("not_pyfunction"));
     }
 }

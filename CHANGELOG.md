@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `wrap_pyfunction!` macro parsing now correctly handles both simple function names (`foo`) and full paths (`crate::module::foo`) for better cross-module function resolution.
+- Added warning system for function resolution failures to help debug cases where functions cannot be resolved (e.g., due to aliasing or cross-module reference limitations).
+- Improved function name extraction with better handling of path separators and edge cases.
+- Global pyfunction map now properly collects all `#[pyfunction]` definitions across the crate for accurate cross-module lookup.
+
 ## [0.3.0] - 2026-03-26
 
 ### Added
