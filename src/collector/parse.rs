@@ -12,6 +12,110 @@ use syn::{
 /// Aliases nested deeper than this value are returned unexpanded.
 const MAX_TYPE_ALIAS_DEPTH: u8 = 10;
 
+// ── Utility functions ──────────────────────────────────────────────────────────
+
+/// Runs `collector` over every file's top-level items.
+fn build_map_from_files<M, F>(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+    default: M,
+    mut collector: F,
+) -> M
+where
+    M: Default,
+    F: FnMut(&[Item], &mut M, &[String]),
+{
+    let mut map = default;
+    for (_path, file) in files {
+        collector(&file.items, &mut map, enabled_features);
+    }
+    map
+}
+
+/// Like [`build_map_from_files`] but passes each file path into `collector`.
+fn build_map_from_files_with_ctx<M, F>(
+    files: &[(std::path::PathBuf, syn::File)],
+    enabled_features: &[String],
+    default: M,
+    mut collector: F,
+) -> M
+where
+    M: Default,
+    F: FnMut(&[Item], &Path, &mut M, &[String]),
+{
+    let mut map = default;
+    for (path, file) in files {
+        collector(&file.items, path, &mut map, enabled_features);
+    }
+    map
+}
+
+/// Attributes used for `#[cfg(...)]` filtering while walking the item tree.
+/// Items without a dedicated attribute list here are skipped (same as before: no nested walk).
+fn item_attrs_for_cfg_walk(item: &Item) -> Option<&[Attribute]> {
+    match item {
+        Item::Type(ta) => Some(&ta.attrs),
+        Item::Struct(s) => Some(&s.attrs),
+        Item::Enum(e) => Some(&e.attrs),
+        Item::Mod(m) => Some(&m.attrs),
+        Item::Fn(f) => Some(&f.attrs),
+        Item::Impl(imp) => Some(&imp.attrs),
+        _ => None,
+    }
+}
+
+/// Walks nested modules; respects `#[cfg]` via [`cfg_is_active`]. Callback receives only cfg-active items.
+fn walk_items_with_cfg<F>(items: &[Item], enabled_features: &[String], callback: &mut F)
+where
+    F: FnMut(&Item),
+{
+    for item in items {
+        let Some(attrs) = item_attrs_for_cfg_walk(item) else {
+            continue;
+        };
+
+        if !cfg_is_active(attrs, enabled_features) {
+            continue;
+        }
+
+        callback(item);
+
+        if let Item::Mod(m) = item
+            && let Some((_, content)) = &m.content
+        {
+            walk_items_with_cfg(content, enabled_features, callback);
+        }
+    }
+}
+
+/// [`walk_items_with_cfg`] with extra context per callback (e.g. file path).
+fn walk_items_with_ctx<C: ?Sized, F>(
+    items: &[Item],
+    ctx: &C,
+    enabled_features: &[String],
+    callback: &mut F,
+) where
+    F: FnMut(&Item, &C),
+{
+    for item in items {
+        let Some(attrs) = item_attrs_for_cfg_walk(item) else {
+            continue;
+        };
+
+        if !cfg_is_active(attrs, enabled_features) {
+            continue;
+        }
+
+        callback(item, ctx);
+
+        if let Item::Mod(m) = item
+            && let Some((_, content)) = &m.content
+        {
+            walk_items_with_ctx(content, ctx, enabled_features, callback);
+        }
+    }
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Build a map: Rust type alias name -> underlying `syn::Type` from all `type Foo = ...` in the crate.
@@ -22,11 +126,12 @@ pub fn build_type_alias_map(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> HashMap<String, Type> {
-    let mut map = HashMap::new();
-    for (_path, file) in files {
-        collect_type_aliases_from_items(&file.items, &mut map, enabled_features);
-    }
-    map
+    build_map_from_files(
+        files,
+        enabled_features,
+        HashMap::new(),
+        collect_type_aliases_from_items,
+    )
 }
 
 fn collect_type_aliases_from_items(
@@ -34,23 +139,11 @@ fn collect_type_aliases_from_items(
     map: &mut HashMap<String, Type>,
     enabled_features: &[String],
 ) {
-    for item in items {
-        match item {
-            Item::Type(ta) => {
-                if cfg_is_active(&ta.attrs, enabled_features) {
-                    map.insert(ta.ident.to_string(), (*ta.ty).clone());
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_type_aliases_from_items(content, map, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_cfg(items, enabled_features, &mut |item| {
+        if let Item::Type(ta) = item {
+            map.insert(ta.ident.to_string(), (*ta.ty).clone());
         }
-    }
+    });
 }
 
 /// Recursively expand type aliases in `ty` using `map`. Stops at depth limit to avoid cycles.
@@ -976,20 +1069,27 @@ fn detect_method_kind(attrs: &[Attribute], name: &str) -> MethodKind {
 }
 
 fn extract_getter_name(attrs: &[Attribute], fn_name: &str) -> Option<String> {
-    for attr in attrs {
-        if attr.path().is_ident("getter") {
-            let rename = extract_attr_string_arg(attr);
-            return Some(rename.unwrap_or_else(|| fn_name.to_string()));
-        }
-    }
-    None
+    extract_property_name(attrs, "getter", fn_name, |_| fn_name.to_string())
 }
 
 fn extract_setter_name(attrs: &[Attribute], fn_name: &str) -> Option<String> {
+    extract_property_name(attrs, "setter", fn_name, infer_pyo3_setter_property_name)
+}
+
+/// Reads `#[getter]` / `#[setter]` (optional rename) for pymethod kind detection.
+fn extract_property_name<F>(
+    attrs: &[Attribute],
+    attr_name: &str,
+    fn_name: &str,
+    default_name: F,
+) -> Option<String>
+where
+    F: FnOnce(&str) -> String,
+{
     for attr in attrs {
-        if attr.path().is_ident("setter") {
+        if attr.path().is_ident(attr_name) {
             let rename = extract_attr_string_arg(attr);
-            return Some(rename.unwrap_or_else(|| infer_pyo3_setter_property_name(fn_name)));
+            return Some(rename.unwrap_or_else(|| default_name(fn_name)));
         }
     }
     None
@@ -1064,11 +1164,12 @@ pub fn build_struct_fields_map(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> StructFieldsMap {
-    let mut map = StructFieldsMap::new();
-    for (_path, file) in files {
-        collect_struct_fields_from_items(&file.items, &mut map, enabled_features);
-    }
-    map
+    build_map_from_files(
+        files,
+        enabled_features,
+        StructFieldsMap::new(),
+        collect_struct_fields_from_items,
+    )
 }
 
 fn collect_struct_fields_from_items(
@@ -1076,26 +1177,15 @@ fn collect_struct_fields_from_items(
     map: &mut StructFieldsMap,
     enabled_features: &[String],
 ) {
-    for item in items {
-        match item {
-            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if cfg_is_active(&s.attrs, enabled_features)
-                    && let Fields::Named(named) = &s.fields
-                {
-                    let fields: Vec<syn::Field> = named.named.iter().cloned().collect();
-                    map.insert(s.ident.to_string(), fields);
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_struct_fields_from_items(content, map, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_cfg(items, enabled_features, &mut |item| {
+        if let Item::Struct(s) = item
+            && has_attr(&s.attrs, "pyclass")
+            && let Fields::Named(named) = &s.fields
+        {
+            let fields: Vec<syn::Field> = named.named.iter().cloned().collect();
+            map.insert(s.ident.to_string(), fields);
         }
-    }
+    });
 }
 
 /// Maps Rust `#[pyclass]` type name → its attributes (e.g. for doc comments).
@@ -1113,11 +1203,12 @@ pub fn build_pyclass_attrs_map(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> PyclassAttrsMap {
-    let mut map = PyclassAttrsMap::new();
-    for (_path, file) in files {
-        collect_pyclass_attrs_from_items(&file.items, &mut map, enabled_features);
-    }
-    map
+    build_map_from_files(
+        files,
+        enabled_features,
+        PyclassAttrsMap::new(),
+        collect_pyclass_attrs_from_items,
+    )
 }
 
 fn collect_pyclass_attrs_from_items(
@@ -1125,28 +1216,17 @@ fn collect_pyclass_attrs_from_items(
     map: &mut PyclassAttrsMap,
     enabled_features: &[String],
 ) {
-    for item in items {
-        match item {
-            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if cfg_is_active(&s.attrs, enabled_features) {
-                    map.insert(s.ident.to_string(), s.attrs.clone());
-                }
-            }
-            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                if cfg_is_active(&e.attrs, enabled_features) {
-                    map.insert(e.ident.to_string(), e.attrs.clone());
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_pyclass_attrs_from_items(content, map, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_cfg(items, enabled_features, &mut |item| {
+        if let Item::Struct(s) = item
+            && has_attr(&s.attrs, "pyclass")
+        {
+            map.insert(s.ident.to_string(), s.attrs.clone());
+        } else if let Item::Enum(e) = item
+            && has_attr(&e.attrs, "pyclass")
+        {
+            map.insert(e.ident.to_string(), e.attrs.clone());
         }
-    }
+    });
 }
 
 /// Rust type names of items that are `#[pyclass]` enums (for Style B `m.add_class::<E>()`).
@@ -1157,11 +1237,12 @@ pub fn build_pyclass_enum_rust_names(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> PyclassEnumRustNames {
-    let mut set = PyclassEnumRustNames::new();
-    for (_path, file) in files {
-        collect_pyclass_enum_rust_names_from_items(&file.items, &mut set, enabled_features);
-    }
-    set
+    build_map_from_files(
+        files,
+        enabled_features,
+        PyclassEnumRustNames::new(),
+        collect_pyclass_enum_rust_names_from_items,
+    )
 }
 
 fn collect_pyclass_enum_rust_names_from_items(
@@ -1169,23 +1250,13 @@ fn collect_pyclass_enum_rust_names_from_items(
     set: &mut PyclassEnumRustNames,
     enabled_features: &[String],
 ) {
-    for item in items {
-        match item {
-            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                if cfg_is_active(&e.attrs, enabled_features) {
-                    set.insert(e.ident.to_string());
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_pyclass_enum_rust_names_from_items(content, set, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_cfg(items, enabled_features, &mut |item| {
+        if let Item::Enum(e) = item
+            && has_attr(&e.attrs, "pyclass")
+        {
+            set.insert(e.ident.to_string());
         }
-    }
+    });
 }
 
 /// Build a global ImplMap from every `.rs` file in the crate.
@@ -1200,35 +1271,25 @@ pub fn build_impl_map(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> ImplMap {
-    let mut map = ImplMap::new();
-    for (_path, file) in files {
-        collect_impl_blocks_from_items(&file.items, &mut map, enabled_features);
-    }
-    map
+    build_map_from_files(
+        files,
+        enabled_features,
+        ImplMap::new(),
+        collect_impl_blocks_from_items,
+    )
 }
 
 fn collect_impl_blocks_from_items(items: &[Item], map: &mut ImplMap, enabled_features: &[String]) {
-    for item in items {
-        match item {
-            Item::Impl(imp) if has_attr(&imp.attrs, "pymethods") => {
-                if cfg_is_active(&imp.attrs, enabled_features)
-                    && let Type::Path(tp) = imp.self_ty.as_ref()
-                    && let Some(seg) = tp.path.segments.last()
-                {
-                    let name = seg.ident.to_string();
-                    map.entry(name).or_default().extend(imp.items.clone());
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_impl_blocks_from_items(content, map, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_cfg(items, enabled_features, &mut |item| {
+        if let Item::Impl(imp) = item
+            && has_attr(&imp.attrs, "pymethods")
+            && let Type::Path(tp) = imp.self_ty.as_ref()
+            && let Some(seg) = tp.path.segments.last()
+        {
+            let name = seg.ident.to_string();
+            map.entry(name).or_default().extend(imp.items.clone());
         }
-    }
+    });
 }
 
 /// Map from function name (last segment) to PyFunction for cross-module lookup.
@@ -1247,11 +1308,12 @@ pub fn build_pyfunction_map(
     files: &[(std::path::PathBuf, syn::File)],
     enabled_features: &[String],
 ) -> PyFunctionMap {
-    let mut map = PyFunctionMap::new();
-    for (path, file) in files {
-        collect_pyfunctions_from_items(&file.items, path, &mut map, enabled_features);
-    }
-    map
+    build_map_from_files_with_ctx(
+        files,
+        enabled_features,
+        PyFunctionMap::new(),
+        collect_pyfunctions_from_items,
+    )
 }
 
 fn collect_pyfunctions_from_items(
@@ -1260,32 +1322,20 @@ fn collect_pyfunctions_from_items(
     map: &mut PyFunctionMap,
     enabled_features: &[String],
 ) {
-    for item in items {
-        match item {
-            Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
-                if cfg_is_active(&f.attrs, enabled_features)
-                    && let Some(func) = parse_pyfunction(
-                        f,
-                        path,
-                        &Config::default(),
-                        &HashMap::new(),
-                        &HashSet::new(),
-                    )
-                {
-                    // Use the rust_name (function identifier) as the key
-                    map.insert(func.rust_name.clone(), func);
-                }
-            }
-            Item::Mod(m) => {
-                if cfg_is_active(&m.attrs, enabled_features)
-                    && let Some((_, content)) = &m.content
-                {
-                    collect_pyfunctions_from_items(content, path, map, enabled_features);
-                }
-            }
-            _ => {}
+    walk_items_with_ctx(items, path, enabled_features, &mut |item, path| {
+        if let Item::Fn(f) = item
+            && has_attr(&f.attrs, "pyfunction")
+            && let Some(func) = parse_pyfunction(
+                f,
+                path,
+                &Config::default(),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+        {
+            map.insert(func.rust_name.clone(), func);
         }
-    }
+    });
 }
 
 // ── cfg(feature) evaluation for [features] enabled ──────────────────────────
