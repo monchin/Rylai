@@ -7,12 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-03-30
+
 ### Fixed
 
 - `wrap_pyfunction!` macro parsing now correctly handles both simple function names (`foo`) and full paths (`crate::module::foo`) for better cross-module function resolution.
 - Added warning system for function resolution failures to help debug cases where functions cannot be resolved (e.g., due to aliasing or cross-module reference limitations).
 - Improved function name extraction with better handling of path separators and edge cases.
 - Global pyfunction map now properly collects all `#[pyfunction]` definitions across the crate for accurate cross-module lookup.
+
+### Changed
+
+- Unified configuration-gated (`cfg`) walk and file collection logic.
 
 ## [0.3.0] - 2026-03-26
 
@@ -51,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/monchin/Rylai/releases/tag/v0.3.1
 [0.3.0]: https://github.com/monchin/Rylai/releases/tag/v0.3.0
 [0.2.0]: https://github.com/monchin/Rylai/releases/tag/v0.2.0
 [0.1.0]: https://github.com/monchin/Rylai/releases/tag/v0.1.0
