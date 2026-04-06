@@ -122,9 +122,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # rust-musl-cross images may lag behind; edition 2024 needs a recent stable rustc.
+      # Use fresh `toolchain install` (minimal) instead of `rustup update`: some images have a
+      # broken clippy/docs tree and incremental update fails removing clippy-preview.
       - name: Update Rust (keep image musl link settings)
         run: |
-          rustup update stable
+          rustup set profile minimal
+          rustup toolchain uninstall stable 2>/dev/null || true
+          rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.platform.target }} || true
 

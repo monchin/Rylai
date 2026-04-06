@@ -89,9 +89,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Install fresh stable (minimal) instead of `rustup update`: some rust-musl-cross images
+      # ship a broken clippy/docs layout and `update` fails while removing clippy-preview.
       - name: Update Rust (match release workflow)
         run: |
-          rustup update stable
+          rustup set profile minimal
+          rustup toolchain uninstall stable 2>/dev/null || true
+          rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.platform.target }} || true
 
