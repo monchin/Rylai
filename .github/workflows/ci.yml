@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest, windows-11-arm]
         rust: [stable]
     steps:
       - name: Checkout
@@ -32,6 +32,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          key: ${{ matrix.os }}
 
       - name: Build (workspace)
         run: cargo build --all-targets
@@ -64,3 +65,45 @@ jobs:
 
       - name: Clippy (workspace)
         run: cargo clippy --all-targets -- -D warnings
+
+  # Release also ships linux-musl wheels/binaries (messense/rust-musl-cross); keep CI aligned.
+  build-linux-musl:
+    name: Build & Test (linux-musl ${{ matrix.platform.artifact_suffix }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: x86_64-unknown-linux-musl
+            image_tag: x86_64-musl
+            artifact_suffix: x86_64
+            run_tests: true
+          - target: aarch64-unknown-linux-musl
+            image_tag: aarch64-musl
+            artifact_suffix: aarch64
+            run_tests: false
+    container:
+      image: docker://messense/rust-musl-cross:${{ matrix.platform.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Rust (match release workflow)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.platform.target }} || true
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: musl-${{ matrix.platform.target }}
+
+      - name: Build (rylai crate, musl)
+        run: cargo build -p rylai --all-targets --release --target ${{ matrix.platform.target }}
+
+      - name: Run tests (rylai, native musl runner only)
+        if: matrix.platform.run_tests
+        run: cargo test -p rylai --target ${{ matrix.platform.target }}

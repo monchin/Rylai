@@ -36,6 +36,13 @@ jobs:
             bin_upload_name: bin-x86_64-pc-windows-msvc
             out_file: rylai-x86_64-pc-windows-msvc.zip
             package_kind: windows
+          - os: windows-11-arm
+            artifact_suffix: windows-arm64
+            maturin_args: --release --strip --out dist
+            binary_path: target/release/rylai.exe
+            bin_upload_name: bin-aarch64-pc-windows-msvc
+            out_file: rylai-aarch64-pc-windows-msvc.zip
+            package_kind: windows
           - os: macos-latest
             artifact_suffix: macos-x64
             maturin_args: --release --strip --out dist --target x86_64-apple-darwin
@@ -146,38 +153,6 @@ jobs:
           path: rylai-${{ matrix.platform.target }}.tar.gz
 
   # ==========================
-  # Windows ARM64: one wheel build + Release zip (same compile)
-  # ==========================
-  build-wheels-windows-arm64:
-    name: Wheels + binary (windows-arm64)
-    runs-on: windows-11-arm
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: --release --strip --out dist
-
-      - name: Package standalone binary (same build as wheel)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist-bin | Out-Null
-          Copy-Item "target/release/rylai.exe" -Destination "dist-bin/rylai.exe"
-          Compress-Archive -Path "dist-bin/rylai.exe" -DestinationPath "rylai-aarch64-pc-windows-msvc.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-arm64
-          path: dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bin-aarch64-pc-windows-msvc
-          path: rylai-aarch64-pc-windows-msvc.zip
-
-  # ==========================
   # Create GitHub Release
   # ==========================
   create-release:
@@ -186,7 +161,6 @@ jobs:
     needs:
       - build-wheels
       - build-wheels-linux-musl
-      - build-wheels-windows-arm64
 
     permissions:
       contents: write   # create release and upload assets
