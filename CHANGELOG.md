@@ -7,24 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.3] - 2026-04-09
+## [0.3.4] - 2026-04-09
+
+### Fixed
+
+- Respect **`output.python_version`** for **PEP 585** built-in generics: for Python **3.8**, stubs now emit `t.List[...]`, `t.Dict[...]`, `t.Tuple[...]`, and `t.Set[...]` instead of `list[...]` / `dict[...]` / `tuple[...]` / `set[...]` (those require Python 3.9+). **3.9+** behavior is unchanged.
+
+## [0.3.3] - 2026-04-08
 
 ### Added
 
 - `__all__` is now emitted in every generated stub, listing all top-level public exports in declaration order. Names starting with `_` (including dunder names such as `__version__`) are excluded by default.
 - `output.all_include_private` (`bool`, default `false`): global switch to include `_`-prefixed names in `__all__`.
 - `[[all]]` array table (mirrors `[[add_content]]` path convention): per-file `__all__` customisation with three fields:
-  - `include_private` (`bool`, optional) — overrides the global `all_include_private` for this file only.
-  - `include` (`list[str]`, optional) — names to force into `__all__` regardless of the private filter (only symbols actually emitted in that stub; cannot add missing names).
-  - `exclude` (`list[str]`, optional) — names to always remove from `__all__` (highest priority; beats `include`).
+  - `include_private` (`bool`, optional): overrides the global `all_include_private` for this file only.
+  - `include` (`list[str]`, optional): names to force into `__all__` regardless of the private filter (only symbols actually emitted in that stub; cannot add missing names).
+  - `exclude` (`list[str]`, optional): names to always remove from `__all__` (highest priority; beats `include`).
 
 ### Changed
 
 - `__all__` lists each distinct top-level export at most once (first declaration order wins if duplicates were ever collected).
-
-### Fixed
-
-- Respect **`output.python_version`** for **PEP 585** built-in generics: for Python **3.8**, stubs now emit `t.List[...]`, `t.Dict[...]`, `t.Tuple[...]`, and `t.Set[...]` instead of `list[...]` / `dict[...]` / `tuple[...]` / `set[...]` (those require Python 3.9+). **3.9+** behavior is unchanged.
 
 ## [0.3.2] - 2026-04-06
 
@@ -82,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/monchin/Rylai/releases/tag/v0.3.4
 [0.3.3]: https://github.com/monchin/Rylai/releases/tag/v0.3.3
 [0.3.2]: https://github.com/monchin/Rylai/releases/tag/v0.3.2
 [0.3.1]: https://github.com/monchin/Rylai/releases/tag/v0.3.1
