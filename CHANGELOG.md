@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Respect **`output.python_version`** for **PEP 585** built-in generics: for Python **3.8**, stubs now emit `t.List[...]`, `t.Dict[...]`, `t.Tuple[...]`, and `t.Set[...]` instead of `list[...]` / `dict[...]` / `tuple[...]` / `set[...]` (those require Python 3.9+). **3.9+** behavior is unchanged.
+
 ## [0.3.2] - 2026-04-06
 
 ### Added

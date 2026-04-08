@@ -2,6 +2,16 @@ use crate::config::RenderPolicy;
 use std::collections::HashMap;
 use syn::{Type, TypePath};
 
+/// PEP 585 (Python ≥ 3.9): `list[T]` / `dict[...]` / … — built-in generics.
+/// Python 3.8 and older: `t.List[T]` / `t.Dict[...]` / … (`import typing as t`).
+fn pep585_generic(policy: &RenderPolicy, builtin: &str, typing_name: &str, inner: &str) -> String {
+    if policy.pep585_builtin_generics {
+        format!("{builtin}[{inner}]")
+    } else {
+        format!("t.{typing_name}[{inner}]")
+    }
+}
+
 /// Convert a Rust `syn::Type` to a Python type string.
 ///
 /// `policy`: version-specific rendering decisions (union syntax, native Self, …).
@@ -37,14 +47,12 @@ pub fn map_type(
                 .iter()
                 .map(|e| map_type(e, policy, self_type, known_classes))
                 .collect();
-            let py = format!(
-                "tuple[{}]",
-                mapped
-                    .iter()
-                    .map(|m| m.py_type.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let inner = mapped
+                .iter()
+                .map(|m| m.py_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let py = pep585_generic(policy, "tuple", "Tuple", &inner);
             TypeMapping {
                 py_type: py,
                 needs_any: mapped.iter().any(|m| m.needs_any),
@@ -263,7 +271,7 @@ fn map_type_path(
                 }
                 let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 return TypeMapping {
-                    py_type: format!("list[{}]", inner_mapped.py_type),
+                    py_type: pep585_generic(policy, "list", "List", inner_mapped.py_type.as_str()),
                     ..inner_mapped
                 };
             }
@@ -280,8 +288,9 @@ fn map_type_path(
                 .map(|t| map_type(t, policy, self_type, known_classes));
             match (k, v) {
                 (Some(km), Some(vm)) => {
+                    let inner = format!("{}, {}", km.py_type, vm.py_type);
                     return TypeMapping {
-                        py_type: format!("dict[{}, {}]", km.py_type, vm.py_type),
+                        py_type: pep585_generic(policy, "dict", "Dict", &inner),
                         needs_any: km.needs_any || vm.needs_any,
                         needs_optional: km.needs_optional || vm.needs_optional,
                         needs_self_import: km.needs_self_import || vm.needs_self_import,
@@ -299,7 +308,7 @@ fn map_type_path(
             if let Some(inner) = args.first() {
                 let inner_mapped = map_type(inner, policy, self_type, known_classes);
                 return TypeMapping {
-                    py_type: format!("set[{}]", inner_mapped.py_type),
+                    py_type: pep585_generic(policy, "set", "Set", inner_mapped.py_type.as_str()),
                     ..inner_mapped
                 };
             }
@@ -387,6 +396,7 @@ mod tests {
             union_optional,
             native_self: false,
             future_annotations: true,
+            pep585_builtin_generics: true,
         }
     }
 
@@ -396,6 +406,7 @@ mod tests {
             union_optional: true,
             native_self: true,
             future_annotations: false,
+            pep585_builtin_generics: true,
         }
     }
 
@@ -807,5 +818,33 @@ mod tests {
         let m = map_type(&ty, &p(true), None, &no_classes());
         assert_eq!(m.py_type, "int");
         assert!(!m.needs_any);
+    }
+
+    /// Python 3.8 (before PEP 585): use `t.List`, `t.Dict`, `t.Tuple`, `t.Set`.
+    #[test]
+    fn pep585_off_uses_typing_generics() {
+        let policy = RenderPolicy::from_version(3, 8);
+        assert_eq!(
+            map_type(&parse_ty("Vec<i32>"), &policy, None, &no_classes()).py_type,
+            "t.List[int]"
+        );
+        assert_eq!(
+            map_type(
+                &parse_ty("HashMap<String, i32>"),
+                &policy,
+                None,
+                &no_classes()
+            )
+            .py_type,
+            "t.Dict[str, int]"
+        );
+        assert_eq!(
+            map_type(&parse_ty("HashSet<i32>"), &policy, None, &no_classes()).py_type,
+            "t.Set[int]"
+        );
+        assert_eq!(
+            map_type(&parse_ty("(i32, String)"), &policy, None, &no_classes()).py_type,
+            "t.Tuple[int, str]"
+        );
     }
 }

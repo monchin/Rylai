@@ -7,10 +7,10 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 ## Features
 
 - Parses `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations directly from Rust source
-- Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]`, `Option<T>` → `T | None`, etc.)
+- Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]` or `t.List[T]` depending on `python_version`, `Option<T>` → `T | None` or `t.Optional[T]`, etc.)
 - Extracts doc comments and emits them as Python docstrings
 - Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits additional sibling `.pyi` files under `-o` (first module segment is implicit) so type checkers and runtime `__module__` agree
-- Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
+- Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics `list[T]` / `dict[...]` / … for ≥ 3.9, `t.List` / `t.Dict` / … for 3.8; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
 - Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`
 - Zero-config by default; optionally configured via `rylai.toml`
 
@@ -128,7 +128,8 @@ Example `rylai.toml`:
 format = ["ruff format", "ruff check --select I --fix"]
 
 [output]
-# Target Python version — affects t.Optional[T] vs T | None syntax (default: "3.10")
+# Target Python version — affects t.Optional[T] vs T | None (3.10+), PEP 585 list[T] vs t.List (3.9+),
+# t.Self vs class name (3.11+), and related stub output (default: "3.10")
 python_version = "3.10"
 
 # Prepend auto-generated header comment (default: true)
@@ -154,7 +155,8 @@ enabled = ["some_feature"]
 # - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
 #   (e.g. crate::types::MyHandle). Rylai derives the lookup key from path segments only.
 # - Anonymous tuple types written in source, e.g. (u8, u8, u8, u8), are *not* path types and
-#   cannot appear as keys. They are always stubbed as tuple[...] from their elements. To emit a
+#   cannot appear as keys. They are always stubbed as tuple[...] (or t.Tuple[...] when python_version
+#   is below 3.9) from their elements. To emit a
 #   single Python name (e.g. PyColor), define `type PyColor = (u8, u8, u8, u8);`, use `PyColor` in
 #   signatures and fields, then add "PyColor" = "Color" under [type_map].
 # - If a Rust `type` alias is listed here, Rylai keeps that alias name when generating stubs
@@ -230,6 +232,7 @@ The same options can be set in `pyproject.toml` under `[tool.rylai]`:
 
 ```toml
 [tool.rylai.output]
+# Same semantics as [output] python_version in rylai.toml (Optional, PEP 585 vs typing, Self, …).
 python_version = "3.10"
 
 [tool.rylai.fallback]
@@ -254,6 +257,8 @@ format = ["isort", "black"]
 
 ## Supported Type Mappings
 
+For **`[output] python_version`**: generic containers follow [PEP 585](https://peps.python.org/pep-0585/) only on **Python ≥ 3.9** (`list[T]`, `dict[K, V]`, `tuple[...]`, `set[T]`). On **3.8**, Rylai emits the equivalent **`typing`** forms with the usual stub alias: `t.List[T]`, `t.Dict[K, V]`, `t.Tuple[...]`, `t.Set[T]` (stubs use `import typing as t`). Bare `list` / `dict` / `set` without type parameters stay as built-in names.
+
 | Rust type | Python type |
 |---|---|
 | **Scalars** | |
@@ -269,10 +274,10 @@ format = ["isort", "black"]
 | `Path`, `PathBuf` (incl. `std::path::*`) | `Path \| str` / `t.Union[Path, str]` |
 | **Containers** | |
 | `Option<T>` | `T \| None` / `t.Optional[T]` |
-| `Vec<T>` | `list[T]` |
-| `(T1, T2, ...)` (non-empty tuple) | `tuple[T1, T2, ...]` |
-| `HashMap<K,V>`, `BTreeMap<K,V>`, `IndexMap<K,V>` | `dict[K, V]` |
-| `HashSet<T>`, `BTreeSet<T>` | `set[T]` |
+| `Vec<T>` | `list[T]` (3.9+) / `t.List[T]` (3.8) |
+| `(T1, T2, ...)` (non-empty tuple) | `tuple[...]` (3.9+) / `t.Tuple[...]` (3.8) |
+| `HashMap<K,V>`, `BTreeMap<K,V>`, `IndexMap<K,V>` | `dict[K, V]` (3.9+) / `t.Dict[K, V]` (3.8) |
+| `HashSet<T>`, `BTreeSet<T>` | `set[T]` (3.9+) / `t.Set[T]` (3.8) |
 | **PyO3 types** | |
 | `PyResult<T>`, `Result<T, E>` | `T` (errors become Python exceptions) |
 | `Py<T>`, `Bound<T>`, `Borrowed<T>` | recurse into `T` |

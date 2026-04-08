@@ -231,6 +231,9 @@ pub struct RenderPolicy {
     /// Prepend `from __future__ import annotations` to the generated file.
     /// Needed when using class names as forward references (i.e. when `!native_self`).
     pub future_annotations: bool,
+    /// Use PEP 585 style `list[T]`, `dict[K, V]`, `tuple[...]`, `set[T]` (py ≥ 3.9).
+    /// When `false` (e.g. Python 3.8), emit `t.List`, `t.Dict`, `t.Tuple`, `t.Set` instead.
+    pub pep585_builtin_generics: bool,
 }
 
 impl RenderPolicy {
@@ -242,6 +245,7 @@ impl RenderPolicy {
             native_self,
             // forward-reference class names require lazy annotation evaluation
             future_annotations: !native_self,
+            pep585_builtin_generics: v >= (3, 9),
         }
     }
 }
@@ -447,6 +451,16 @@ mod tests {
             p.future_annotations,
             "3.9 needs future annotations for forward refs"
         );
+        assert!(
+            p.pep585_builtin_generics,
+            "3.9 has PEP 585 builtin generics"
+        );
+    }
+
+    #[test]
+    fn render_policy_py38_pep585_disabled() {
+        let p = RenderPolicy::from_version(3, 8);
+        assert!(!p.pep585_builtin_generics, "3.8 must use t.List etc.");
     }
 
     #[test]
@@ -503,6 +517,7 @@ mod tests {
         let p = config.render_policy();
         assert!(!p.union_optional);
         assert!(p.future_annotations);
+        assert!(p.pep585_builtin_generics);
 
         config.output.python_version = "3.12".to_string();
         let p = config.render_policy();

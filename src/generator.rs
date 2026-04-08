@@ -1848,6 +1848,18 @@ mod tests {
         );
     }
 
+    /// Python 3.8 (before PEP 585): `Vec<T>` maps to `t.List[...]`, not `list[...]`.
+    #[test]
+    fn render_policy_py38_vec_uses_t_list() {
+        let config = config_with_python_version("3.8");
+        let f = make_fn("get_nums", None, vec![], syn::parse_quote! { Vec<i32> });
+        let stub = stub_for_config(vec![PyItem::Function(f)], &config);
+        assert!(
+            stub.contains("-> t.List[int]:") || stub.contains("-> t.List[int] :"),
+            "py 3.8 must use t.List[int], got:\n{stub}"
+        );
+    }
+
     // ── collect_class_names ──────────────────────────────────────────────────
 
     fn make_class(rust_name: &str, python_name: &str) -> PyClass {
