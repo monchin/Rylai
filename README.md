@@ -11,6 +11,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Extracts doc comments and emits them as Python docstrings
 - Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits additional sibling `.pyi` files under `-o` (first module segment is implicit) so type checkers and runtime `__module__` agree
 - Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
+- Generates `__all__` in every stub listing public top-level exports; names starting with `_` are excluded by default; configurable globally and per file via `[[all]]`
 - Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`
 - Zero-config by default; optionally configured via `rylai.toml`
 
@@ -89,6 +90,11 @@ you get `pyo3_sample.pyi` (top-level functions) together with `aa.pyi` and `bb.p
 ```python
 from pyo3_sample.bb import B
 
+__all__ = [
+    "A",
+]
+
+@t.final
 class A:
     def make_b(self) -> B: ...
 ```
@@ -114,7 +120,7 @@ You can configure rylai in either (or both) of these places:
 - **`rylai.toml`** in the crate root
 - **`[tool.rylai]`** in `pyproject.toml`
 
-When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
+When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, `[[all]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
 
 Example `rylai.toml`:
 
@@ -133,6 +139,10 @@ python_version = "3.10"
 
 # Prepend auto-generated header comment (default: true)
 add_header = true
+
+# Include names that start with `_` (private / dunder) in __all__ (default: false).
+# Can be overridden per file with [[all]].
+all_include_private = false
 
 [fallback]
 # What to emit when a type cannot be resolved statically:
@@ -205,6 +215,18 @@ stub = "def reload(self, force: bool = False) -> None:"
 # param_types = { "**kwargs" = "Unpack[KwargsItems]" }
 # return_type = "dict[str, t.Any]"
 
+# Optional: per-file __all__ rules (path is relative to -o, use /, same convention as add_content).
+# Multiple [[all]] entries for the same file are merged (include/exclude sets are unioned;
+# the last matching include_private wins).
+[[all]]
+file = "my_package.pyi"
+# Override the global all_include_private for this file only (optional).
+include_private = true
+# Force these already-emitted top-level names into __all__ even if they start with `_` (optional).
+include = ["_special_export"]
+# Always remove these names from __all__ — highest priority, beats include (optional).
+exclude = ["InternalHelper"]
+
 # Optional: splice raw Python into a generated file (path is relative to -o, use /; must match a stub emitted in this run)
 [[add_content]]
 file = "my_package/sub.pyi"
@@ -225,6 +247,24 @@ For **class-method** overrides, the first segment of `item` is the logical Pytho
 If `file` does not match any `.pyi` path produced in that run, Rylai exits with an error. Omit the `.pyi` suffix only when the last path segment has no extension; otherwise use the same relative names as under `-o` (e.g. `pkg/aaa.pyi`).
 
 For each `[[add_content]]` entry, if `content` does not already end with a newline, Rylai appends one so you do not need to write a trailing `\n` in TOML (you may still include it if you prefer).
+
+### `__all__` generation
+
+Every generated stub includes an `__all__` list of all top-level public exports. The list is emitted after any import lines and before the first `def` / `class` / constant declaration.
+
+**Default behaviour:** names whose Python identifier starts with `_` (including dunder names such as `__version__`) are excluded from `__all__`. All other top-level symbols — functions, classes, constants, and inline sub-modules — are included in declaration order.
+
+**Priority rules (highest first):**
+
+1. Per-file `exclude` — name is always absent from `__all__`.
+2. Per-file `include` — for a top-level name **that Rylai already emitted in this stub**, keep it in `__all__` even when it would be dropped by the `_` filter (does not invent entries for symbols that were not generated).
+3. Per-file `include_private` — overrides the global `all_include_private` for that file only.
+4. Global `output.all_include_private`.
+5. Default (`false`): `_`-prefixed names are excluded.
+
+`[[all]]` entries follow the same `file` path convention as `[[add_content]]` (relative to `-o`, forward slashes, optional `.pyi` suffix). Multiple entries for the same file are merged: `include`/`exclude` sets are unioned; the last matching `include_private` wins.
+
+Names added via `[[add_content]]` are **not** automatically added to `__all__` — manage those yourself (e.g. by appending to `__all__` in a `tail` snippet).
 
 The same options can be set in `pyproject.toml` under `[tool.rylai]`:
 
@@ -247,6 +287,10 @@ stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 file = "mymod.pyi"
 location = "tail"
 content = "X: t.TypeAlias = int"
+
+[[tool.rylai.all]]
+file = "mymod.pyi"
+exclude = ["InternalHelper"]
 
 [tool.rylai]
 format = ["isort", "black"]

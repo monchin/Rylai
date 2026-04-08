@@ -11,6 +11,10 @@ import typing as t
 
 from pyo3_sample.bb import B
 
+__all__ = [
+    "A",
+]
+
 @t.final
 class A:
     def __init__(self) -> None: ...

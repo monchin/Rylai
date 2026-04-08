@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import typing as t
 
+__all__ = [
+    "B",
+]
+
 @t.final
 class B:
     def __init__(self) -> None: ...

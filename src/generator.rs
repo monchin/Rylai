@@ -3,8 +3,8 @@ use crate::collector::{
     PyModule, PyParam, PyType,
 };
 use crate::config::{
-    Config, FallbackStrategy, OverrideEntry, RenderPolicy, merge_type_map_into_known_classes,
-    normalize_param_types_key,
+    Config, FallbackStrategy, OverrideEntry, RenderPolicy, ResolvedAllConfig,
+    merge_type_map_into_known_classes, normalize_param_types_key, resolve_all_config,
 };
 use crate::stub_constants::{AUTO_GENERATED_BANNER, TYPING_IMPORT_LINE};
 use crate::type_map::{self, TypeMapping};
@@ -20,12 +20,16 @@ use syn::{ReturnType, Type, TypeParamBound};
 /// When `cross_import` is `Some((current_stub_module, rust_class_to_defining_module))`, types that
 /// reference `#[pyclass]` types defined in another Python module cause `from ... import ...` lines
 /// to be prepended after `import typing as t` and optional `from pathlib import Path` when needed.
+///
+/// `stub_rel_path` is the output-relative path of the stub being generated (e.g. `pkg.pyi`).
+/// It is used to resolve per-file `[[all]]` rules; pass `None` in tests to use global defaults only.
 pub fn generate_with_known_classes(
     modules: &[PyModule],
     config: &Config,
     known_classes: &HashMap<String, String>,
     pre_warnings: &[String],
     cross_import: Option<(&str, &HashMap<String, String>)>,
+    stub_rel_path: Option<&std::path::Path>,
 ) -> Result<String> {
     let policy = config.render_policy();
     let logical_module = cross_import.map(|(s, _)| s.to_string()).unwrap_or_default();
@@ -48,6 +52,7 @@ pub fn generate_with_known_classes(
         class_rust_to_module: cross_import.map(|(_, m)| (*m).clone()),
         cross_module_imports: BTreeMap::new(),
         logical_module,
+        export_names: Vec::new(),
     };
 
     let mut body = String::new();
@@ -94,6 +99,44 @@ pub fn generate_with_known_classes(
         }
     }
 
+    // `__all__`: resolve per-file rules and emit the export list.
+    let all_cfg: ResolvedAllConfig = match stub_rel_path {
+        Some(p) => resolve_all_config(config, p)?,
+        None => ResolvedAllConfig {
+            include_private: config.output.all_include_private,
+            include: Default::default(),
+            exclude: Default::default(),
+        },
+    };
+    // Deduplicate while preserving declaration order (first occurrence wins).
+    let mut seen_in_all = HashSet::new();
+    let final_exports: Vec<&str> = ctx
+        .export_names
+        .iter()
+        .filter_map(|name| {
+            if all_cfg.exclude.contains(name.as_str()) {
+                return None;
+            }
+            if all_cfg.include.contains(name.as_str()) {
+                return Some(name.as_str());
+            }
+            if name.starts_with('_') && !all_cfg.include_private {
+                return None;
+            }
+            Some(name.as_str())
+        })
+        .filter(|&n| seen_in_all.insert(n))
+        .collect();
+    if final_exports.is_empty() {
+        out.push_str("__all__ = []\n\n");
+    } else {
+        out.push_str("__all__ = [\n");
+        for name in &final_exports {
+            out.push_str(&format!("    \"{name}\",\n"));
+        }
+        out.push_str("]\n\n");
+    }
+
     out.push_str(&body);
 
     // Print warnings to stderr
@@ -111,7 +154,7 @@ pub fn generate_with_known_classes(
 #[cfg(test)]
 pub(crate) fn generate(modules: &[PyModule], config: &Config) -> Result<String> {
     let (known_classes, pre_warnings) = collect_class_names(modules);
-    generate_with_known_classes(modules, config, &known_classes, &pre_warnings, None)
+    generate_with_known_classes(modules, config, &known_classes, &pre_warnings, None, None)
 }
 
 // ── Generation context ───────────────────────────────────────────────────────
@@ -182,6 +225,8 @@ struct GenCtx<'a> {
     /// use whichever module owns the `.pyi` where the class appears. When [`Self::current_stub_module`]
     /// is `None` (tests), this is set from each top-level [`PyModule::name`].
     logical_module: String,
+    /// All top-level Python names emitted in declaration order (unfiltered). Used to build `__all__`.
+    export_names: Vec<String>,
 }
 
 impl<'a> GenCtx<'a> {
@@ -398,6 +443,9 @@ impl<'a> GenCtx<'a> {
                 let has_stub = ov.stub.as_ref().is_some_and(|s| !s.trim().is_empty());
                 if has_stub {
                     self.emit_override(ov, item, out, indent)?;
+                    if indent == 0 {
+                        self.export_names.push(item_name(item).to_string());
+                    }
                     continue;
                 }
                 let has_pt = ov.param_types.as_ref().is_some_and(|m| !m.is_empty());
@@ -415,6 +463,9 @@ impl<'a> GenCtx<'a> {
                             (!t.is_empty()).then_some(t)
                         });
                         self.gen_function(f, out, indent, lookup_ref, &mut used, return_override)?;
+                        if indent == 0 {
+                            self.export_names.push(f.name.clone());
+                        }
                         if has_pt {
                             self.warn_unused_param_types(
                                 ov.param_types.as_ref().expect("has_pt"),
@@ -434,17 +485,33 @@ impl<'a> GenCtx<'a> {
             }
 
             match item {
-                PyItem::Constant(c) => self.gen_constant(c, out, indent)?,
+                PyItem::Constant(c) => {
+                    self.gen_constant(c, out, indent)?;
+                    if indent == 0 {
+                        self.export_names.push(c.name.clone());
+                    }
+                }
                 PyItem::Function(f) => {
                     let mut unused = HashSet::new();
                     self.gen_function(f, out, indent, None, &mut unused, None)?;
+                    if indent == 0 {
+                        self.export_names.push(f.name.clone());
+                    }
                 }
-                PyItem::Class(c) => self.gen_class(c, out, indent)?,
+                PyItem::Class(c) => {
+                    self.gen_class(c, out, indent)?;
+                    if indent == 0 {
+                        self.export_names.push(c.name.clone());
+                    }
+                }
                 PyItem::Module(m) => {
                     // Submodule: emit a class stub as a namespace approximation
                     out.push_str(&format!("{pad}class {}:\n", m.name));
                     if !m.doc.is_empty() {
                         self.gen_docstring(&m.doc, out, indent + 1);
+                    }
+                    if indent == 0 {
+                        self.export_names.push(m.name.clone());
                     }
                     self.gen_module(m, out, indent + 1)?;
                     out.push('\n');
@@ -1415,6 +1482,7 @@ mod tests {
             &known_classes,
             &[],
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1448,6 +1516,7 @@ mod tests {
             &known_classes,
             &[],
             Some(("abcd.ee", &class_mod)),
+            None,
         )
         .unwrap();
         assert!(
@@ -1481,6 +1550,7 @@ mod tests {
             &known_classes,
             &[],
             Some(("abcd.ee", &class_mod)),
+            None,
         )
         .unwrap();
         assert!(
@@ -1513,6 +1583,7 @@ mod tests {
             &known_classes,
             &[],
             Some(("abcd.ee", &class_mod)),
+            None,
         )
         .unwrap();
         assert!(
@@ -2536,6 +2607,7 @@ mod tests {
             &known_classes,
             &[],
             None,
+            None,
         )
         .unwrap();
         assert!(stub.contains("class Sub(Base):"), "got:\n{stub}");
@@ -2566,6 +2638,7 @@ mod tests {
             &known_classes,
             &[],
             Some(("pkg.sub", &class_mod)),
+            None,
         )
         .unwrap();
         assert!(
@@ -2750,6 +2823,255 @@ mod tests {
         assert!(
             !stub.contains("\"\"\"First line.\"\"\""),
             "multi-line must not use inline format, got:\n{stub}"
+        );
+    }
+
+    // ── __all__ generation ───────────────────────────────────────────────────
+
+    fn make_constant(name: &str) -> PyConstant {
+        PyConstant {
+            name: name.to_string(),
+            py_type: "str".to_string(),
+        }
+    }
+
+    fn make_simple_class(name: &str) -> PyClass {
+        PyClass {
+            name: name.to_string(),
+            rust_name: name.to_string(),
+            module: None,
+            allows_python_subclass: false,
+            extends: None,
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        }
+    }
+
+    #[test]
+    fn all_contains_public_names_in_order() {
+        let items = vec![
+            PyItem::Function(make_fn("do_work", None, vec![], syn::parse_quote! { () })),
+            PyItem::Class(make_simple_class("MyClass")),
+            PyItem::Constant(make_constant("VERSION")),
+        ];
+        let stub = stub_for(items);
+        assert!(stub.contains("\"do_work\""), "got:\n{stub}");
+        assert!(stub.contains("\"MyClass\""), "got:\n{stub}");
+        assert!(stub.contains("\"VERSION\""), "got:\n{stub}");
+        // Order: function → class → constant
+        let pos_fn = stub.find("\"do_work\"").unwrap();
+        let pos_cl = stub.find("\"MyClass\"").unwrap();
+        let pos_co = stub.find("\"VERSION\"").unwrap();
+        assert!(
+            pos_fn < pos_cl && pos_cl < pos_co,
+            "order mismatch; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_excludes_underscore_names_by_default() {
+        let items = vec![
+            PyItem::Function(make_fn("public_fn", None, vec![], syn::parse_quote! { () })),
+            PyItem::Function(make_fn(
+                "_private_fn",
+                None,
+                vec![],
+                syn::parse_quote! { () },
+            )),
+            PyItem::Constant(make_constant("__version__")),
+        ];
+        let stub = stub_for(items);
+        assert!(
+            stub.contains("\"public_fn\""),
+            "public name missing; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("\"_private_fn\""),
+            "_private_fn should be excluded; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("\"__version__\""),
+            "__version__ should be excluded; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_include_private_global_true_includes_underscore_names() {
+        let items = vec![
+            PyItem::Function(make_fn("public_fn", None, vec![], syn::parse_quote! { () })),
+            PyItem::Function(make_fn(
+                "_private_fn",
+                None,
+                vec![],
+                syn::parse_quote! { () },
+            )),
+        ];
+        let mut config = Config::default();
+        config.output.all_include_private = true;
+        let stub = stub_for_config(items, &config);
+        assert!(stub.contains("\"public_fn\""), "got:\n{stub}");
+        assert!(
+            stub.contains("\"_private_fn\""),
+            "_private_fn should be included when all_include_private=true; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_empty_module_emits_empty_list() {
+        let stub = stub_for(vec![]);
+        assert!(
+            stub.contains("__all__ = []"),
+            "empty module must have __all__ = []; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_per_file_include_forces_private_name_in() {
+        use crate::config::AllEntry;
+        use std::path::Path;
+
+        let items = vec![
+            PyItem::Function(make_fn("public_fn", None, vec![], syn::parse_quote! { () })),
+            PyItem::Function(make_fn("_secret", None, vec![], syn::parse_quote! { () })),
+        ];
+        // global: exclude private; per-file: force _secret in
+        let config = Config {
+            all: vec![AllEntry {
+                file: "m.pyi".to_string(),
+                include_private: None,
+                include: vec!["_secret".to_string()],
+                exclude: vec![],
+            }],
+            ..Default::default()
+        };
+        let (known_classes, pre_warnings) = collect_class_names(&[make_module(items)]);
+        let stub = generate_with_known_classes(
+            &[make_module(vec![
+                PyItem::Function(make_fn("public_fn", None, vec![], syn::parse_quote! { () })),
+                PyItem::Function(make_fn("_secret", None, vec![], syn::parse_quote! { () })),
+            ])],
+            &config,
+            &known_classes,
+            &pre_warnings,
+            None,
+            Some(Path::new("m.pyi")),
+        )
+        .unwrap();
+        assert!(stub.contains("\"public_fn\""), "got:\n{stub}");
+        assert!(
+            stub.contains("\"_secret\""),
+            "_secret should be force-included; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_per_file_exclude_removes_public_name() {
+        use crate::config::AllEntry;
+        use std::path::Path;
+
+        let items = vec![
+            PyItem::Function(make_fn("public_fn", None, vec![], syn::parse_quote! { () })),
+            PyItem::Function(make_fn("internal", None, vec![], syn::parse_quote! { () })),
+        ];
+        let config = Config {
+            all: vec![AllEntry {
+                file: "m.pyi".to_string(),
+                include_private: None,
+                include: vec![],
+                exclude: vec!["internal".to_string()],
+            }],
+            ..Default::default()
+        };
+        let (known_classes, pre_warnings) = collect_class_names(&[make_module(items.clone())]);
+        let stub = generate_with_known_classes(
+            &[make_module(items)],
+            &config,
+            &known_classes,
+            &pre_warnings,
+            None,
+            Some(Path::new("m.pyi")),
+        )
+        .unwrap();
+        assert!(stub.contains("\"public_fn\""), "got:\n{stub}");
+        assert!(
+            !stub.contains("\"internal\""),
+            "internal should be excluded; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_per_file_exclude_beats_include() {
+        // When a name is in both include and exclude, exclude wins.
+        use crate::config::AllEntry;
+        use std::path::Path;
+
+        let items = vec![PyItem::Function(make_fn(
+            "contested",
+            None,
+            vec![],
+            syn::parse_quote! { () },
+        ))];
+        let config = Config {
+            all: vec![AllEntry {
+                file: "m.pyi".to_string(),
+                include_private: None,
+                include: vec!["contested".to_string()],
+                exclude: vec!["contested".to_string()],
+            }],
+            ..Default::default()
+        };
+        let (known_classes, pre_warnings) = collect_class_names(&[make_module(items.clone())]);
+        let stub = generate_with_known_classes(
+            &[make_module(items)],
+            &config,
+            &known_classes,
+            &pre_warnings,
+            None,
+            Some(Path::new("m.pyi")),
+        )
+        .unwrap();
+        assert!(
+            !stub.contains("\"contested\""),
+            "exclude must beat include; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn all_per_file_include_private_overrides_global() {
+        use crate::config::AllEntry;
+        use std::path::Path;
+
+        let items = vec![PyItem::Function(make_fn(
+            "_hidden",
+            None,
+            vec![],
+            syn::parse_quote! { () },
+        ))];
+        // global default excludes private; per-file overrides to include
+        let config = Config {
+            all: vec![AllEntry {
+                file: "m.pyi".to_string(),
+                include_private: Some(true),
+                include: vec![],
+                exclude: vec![],
+            }],
+            ..Default::default()
+        };
+        let (known_classes, pre_warnings) = collect_class_names(&[make_module(items.clone())]);
+        let stub = generate_with_known_classes(
+            &[make_module(items)],
+            &config,
+            &known_classes,
+            &pre_warnings,
+            None,
+            Some(Path::new("m.pyi")),
+        )
+        .unwrap();
+        assert!(
+            stub.contains("\"_hidden\""),
+            "per-file include_private=true should override global false; got:\n{stub}"
         );
     }
 }
