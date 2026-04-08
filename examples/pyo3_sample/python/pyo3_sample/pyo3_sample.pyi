@@ -12,6 +12,13 @@ if sys.version_info < (3, 11):
 else:
     from typing import Unpack
 
+__all__ = [
+    "sum_as_string",
+    "add",
+    "show_kwargs",
+    "C",
+]
+
 # Module: pyo3_sample
 def sum_as_string(a: int, b: int) -> str:
     """Formats the sum of two numbers as string."""

@@ -72,6 +72,7 @@ fn main() -> Result<()> {
             &known_classes,
             &pre_warnings,
             None,
+            Some(&rel),
         )?;
         let stub = add_content::apply_add_content(&stub, &rel, &config.add_content)?;
         std::fs::write(&path, stub)?;
@@ -111,6 +112,7 @@ fn main() -> Result<()> {
                 &known_classes,
                 warnings,
                 Some((stub_module.name.as_str(), &class_defining_modules)),
+                Some(&rel_path),
             )?;
             let stub = add_content::apply_add_content(&stub, &rel_path, &config.add_content)?;
             std::fs::write(&path, stub)?;
