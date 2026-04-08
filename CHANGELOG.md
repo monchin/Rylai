@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-04-08
+
 ### Added
 
 - `__all__` is now emitted in every generated stub, listing all top-level public exports in declaration order. Names starting with `_` (including dunder names such as `__version__`) are excluded by default.
@@ -76,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/monchin/Rylai/releases/tag/v0.3.3
 [0.3.2]: https://github.com/monchin/Rylai/releases/tag/v0.3.2
 [0.3.1]: https://github.com/monchin/Rylai/releases/tag/v0.3.1
 [0.3.0]: https://github.com/monchin/Rylai/releases/tag/v0.3.0
