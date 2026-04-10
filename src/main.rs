@@ -2,6 +2,7 @@ mod add_content;
 mod collector;
 mod config;
 mod generator;
+mod macro_expand;
 mod output_layout;
 mod stub_constants;
 mod type_map;

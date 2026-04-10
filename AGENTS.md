@@ -132,6 +132,15 @@ file = "subdir/mod.pyi"
 file = "subdir/mod.pyi"
 location = "after-import-typing"   # head (after banner) | tail | after-import-typing
 content = "from subdir._internal import X"
+
+[[macro_expand]]
+# Expand macro invocations before `syn` parsing so wrapped add_class/add_function calls are visible.
+# Either provide both `from` and `to`, or provide only `name` for auto-discovery from source.
+# Auto-discovery is best-effort; if the same macro name exists in multiple files, the first match
+# wins and a warning is recorded. Files that syn cannot parse are skipped for discovery (warning).
+name = "register_classes"
+# from = '$m:expr, [$($cls:ty),* $(,)?]'
+# to = '{ $( $m.add_class::<$cls>()?; )* Ok::<_, pyo3::PyErr>(()) }'
 ```
 
 ---

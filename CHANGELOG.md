@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Macro expansion pre-pass for declarative macros: configure `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` so Rylai expands matched macro invocations before `syn` parsing, allowing wrapped `add_class` / `add_function` registrations to be collected.
+
 ## [0.3.4] - 2026-04-09
 
 ### Fixed
@@ -20,9 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `__all__` is now emitted in every generated stub, listing all top-level public exports in declaration order. Names starting with `_` (including dunder names such as `__version__`) are excluded by default.
 - `output.all_include_private` (`bool`, default `false`): global switch to include `_`-prefixed names in `__all__`.
 - `[[all]]` array table (mirrors `[[add_content]]` path convention): per-file `__all__` customisation with three fields:
-  - `include_private` (`bool`, optional): overrides the global `all_include_private` for this file only.
-  - `include` (`list[str]`, optional): names to force into `__all__` regardless of the private filter (only symbols actually emitted in that stub; cannot add missing names).
-  - `exclude` (`list[str]`, optional): names to always remove from `__all__` (highest priority; beats `include`).
+  - `include_private` (`bool`, optional) — overrides the global `all_include_private` for this file only.
+  - `include` (`list[str]`, optional) — names to force into `__all__` regardless of the private filter (only symbols actually emitted in that stub; cannot add missing names).
+  - `exclude` (`list[str]`, optional) — names to always remove from `__all__` (highest priority; beats `include`).
 
 ### Changed
 

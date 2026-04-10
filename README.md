@@ -13,6 +13,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics `list[T]` / `dict[...]` / … for ≥ 3.9, `t.List` / `t.Dict` / … for 3.8; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
 - Generates `__all__` in every stub listing public top-level exports; names starting with `_` are excluded by default; configurable globally and per file via `[[all]]`
 - Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`
+- Optional `[[macro_expand]]`: expand configured `macro_rules!` invocations before AST parsing so wrapped `add_class` / `add_function` calls can be collected
 - Zero-config by default; optionally configured via `rylai.toml`
 
 ## Why Rylai?
@@ -120,7 +121,7 @@ You can configure rylai in either (or both) of these places:
 - **`rylai.toml`** in the crate root
 - **`[tool.rylai]`** in `pyproject.toml`
 
-When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, `[[all]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
+When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, `[[all]]`, `[[macro_expand]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
 
 Example `rylai.toml`:
 
@@ -160,6 +161,21 @@ enabled = ["some_feature"]
 # Custom Rust type → Python type overrides
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 "numpy::PyReadonlyArray2" = "numpy.ndarray"
+
+# Optional: expand custom macro_rules invocations before syn parsing.
+# Use this when pyo3 registration calls are wrapped in declarative macros.
+#
+# Mode A: explicit matcher/transcriber (macro-rules-rt Rule::new)
+[[macro_expand]]
+name = "add_pymodule"
+from = '$py:expr, $parent:expr, $name:expr, [$($cls:ty),* $(,)?]'
+to = '{ let sub = pyo3::types::PyModule::new($py, $name)?; $(sub.add_class::<$cls>()?;)* $parent.add_submodule(&sub)?; Ok::<_, pyo3::PyErr>(()) }'
+#
+# Mode B: auto-discover macro_rules! definition from Rust source by name
+[[macro_expand]]
+name = "register_classes"
+# Mode B is best-effort; duplicate macro names across files use the first match (warning). Unparsable
+# .rs files are skipped when searching for the definition (warning).
 
 # [type_map] limitations (read this if a mapping seems ignored):
 # - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
@@ -286,6 +302,9 @@ strategy = "any"
 item = "my_module::complex_function"
 stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 
+[[tool.rylai.macro_expand]]
+name = "register_classes"
+
 [[tool.rylai.add_content]]
 file = "mymod.pyi"
 location = "tail"
@@ -342,7 +361,7 @@ Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfuncti
 
 For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
 
-For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). In that case, avoid Python-related PyO3 code that is hard to analyze without compilation — for example **declarative macros** that expand at compile time and inject `#[pyfunction]` / `#[pyclass]`; Rylai cannot see those statically and may not generate the corresponding stubs correctly.
+For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). For declarative macros that wrap binding registration calls, you can now use `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` to expand specific macros before parsing. Coverage is still opt-in and pattern-driven: unsupported macro patterns or unconfigured macros may still be missed.
 
 Related support is planned, but Rylai cannot generate stubs for all possible PyO3 code.
 
