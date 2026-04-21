@@ -170,6 +170,19 @@ enabled = ["some_feature"]
 # Custom Rust type → Python type overrides
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 "numpy::PyReadonlyArray2" = "numpy.ndarray"
+# Limitations (read this if a mapping seems ignored):
+# - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
+#   (e.g. crate::types::MyHandle). Rylai derives the lookup key from path segments only.
+# - Anonymous tuple types written in source, e.g. (u8, u8, u8, u8), are *not* path types and
+#   cannot appear as keys. They are always stubbed as tuple[...] (or t.Tuple[...] when python_version
+#   is below 3.9) from their elements. To emit a
+#   single Python name (e.g. PyColor), define `type PyColor = (u8, u8, u8, u8);`, use `PyColor` in
+#   signatures and fields, then add "PyColor" = "Color" under [type_map].
+# - If a Rust `type` alias is listed here, Rylai keeps that alias name when generating stubs
+#   (instead of expanding it), so nested uses like Vec<ThatAlias> still resolve to your Python type.
+# - If two keys share the same last path segment but map to different Python types, Rylai warns on
+#   stderr, omits the ambiguous short-name lookup, and does not preserve that alias name during
+#   expansion (use a single consistent target or disambiguate with a bare key only when unique).
 
 # Optional: expand custom macro_rules invocations before syn parsing.
 # Use this when pyo3 registration calls are wrapped in declarative macros.
@@ -185,20 +198,6 @@ to = '{ let sub = pyo3::types::PyModule::new($py, $name)?; $(sub.add_class::<$cl
 name = "register_classes"
 # Mode B is best-effort; duplicate macro names across files use the first match (warning). Unparsable
 # .rs files are skipped when searching for the definition (warning).
-
-# [type_map] limitations (read this if a mapping seems ignored):
-# - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
-#   (e.g. crate::types::MyHandle). Rylai derives the lookup key from path segments only.
-# - Anonymous tuple types written in source, e.g. (u8, u8, u8, u8), are *not* path types and
-#   cannot appear as keys. They are always stubbed as tuple[...] (or t.Tuple[...] when python_version
-#   is below 3.9) from their elements. To emit a
-#   single Python name (e.g. PyColor), define `type PyColor = (u8, u8, u8, u8);`, use `PyColor` in
-#   signatures and fields, then add "PyColor" = "Color" under [type_map].
-# - If a Rust `type` alias is listed here, Rylai keeps that alias name when generating stubs
-#   (instead of expanding it), so nested uses like Vec<ThatAlias> still resolve to your Python type.
-# - If two keys share the same last path segment but map to different Python types, Rylai warns on
-#   stderr, omits the ambiguous short-name lookup, and does not preserve that alias name during
-#   expansion (use a single consistent target or disambiguate with a bare key only when unique).
 
 [[override]]
 # Single-line def/class header for a top-level item (Rust `///` doc is copied into the .pyi when present).
@@ -366,9 +365,16 @@ For **`[output] python_version`**: generic containers follow [PEP 585](https://p
 
 ## Limitation
 
-Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. declarative macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
+Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. procedural macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
 
-For **`create_exception!`**, parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
+### Current limitations
+
+- **Same-name items.** Rylai keys most internal lookups (functions, classes, type aliases, impl blocks, struct fields) by bare identifier. If two items in different modules share the same Rust name (e.g. two `struct Foo`), the last one parsed silently wins — fields, methods, and attributes from earlier definitions are lost. Use unique names or `#[pyclass(name = "...")]` to disambiguate.
+- **`use … as …` renamed imports.** Rylai does not resolve import aliases. Code like `use pyo3::prelude::PyResult as MyResult;` followed by `-> MyResult<T>` will cause `MyResult` to be treated as an unknown type (falling back to `t.Any`). Use the original name or add a `type` alias + `[type_map]` entry instead.
+- **`create_exception!` parsing.** Parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
+- **`[[macro_expand]]` repetition blocks.** Due to a `macro_rules_rt` limitation, `$(...)*` blocks can only contain repeating variables (e.g. `$cls`). Non-repeating metavariables inside a repetition are not expanded. The standard workaround is to bind non-repeating variables outside the repetition with a `let` (see the `macro_expand_sample` example).
+
+### When to use a build-based tool instead
 
 For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
 
