@@ -564,21 +564,19 @@ fn collect_items_from_list(
                     result.push(PyItem::Function(func));
                 }
             }
-            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if cfg_is_active(&s.attrs, enabled) {
-                    let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
-                    let rust_name = s.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx, false);
-                    result.push(PyItem::Class(class));
-                }
+            Item::Struct(s)
+                if has_attr(&s.attrs, "pyclass") && cfg_is_active(&s.attrs, enabled) =>
+            {
+                let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
+                let rust_name = s.ident.to_string();
+                let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx, false);
+                result.push(PyItem::Class(class));
             }
-            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                if cfg_is_active(&e.attrs, enabled) {
-                    let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
-                    let rust_name = e.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx, true);
-                    result.push(PyItem::Class(class));
-                }
+            Item::Enum(e) if has_attr(&e.attrs, "pyclass") && cfg_is_active(&e.attrs, enabled) => {
+                let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
+                let rust_name = e.ident.to_string();
+                let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx, true);
+                result.push(PyItem::Class(class));
             }
             // Nested submodule
             Item::Mod(sub) if has_attr(&sub.attrs, "pymodule") => {
@@ -590,17 +588,17 @@ fn collect_items_from_list(
                 }
             }
             // Declarative `#[pymodule] mod foo { #[pymodule_init] fn init(m) { m.add(...); } }`
-            Item::Fn(f) if has_attr(&f.attrs, "pymodule_init") => {
-                if cfg_is_active(&f.attrs, enabled) {
-                    let ctx = CollectAddCallsContext {
-                        file_items: items,
-                        path,
-                        pyclass_name_map,
-                        cx,
-                    };
-                    for stmt in &f.block.stmts {
-                        collect_add_calls_from_stmt(stmt, &ctx, &mut result);
-                    }
+            Item::Fn(f)
+                if has_attr(&f.attrs, "pymodule_init") && cfg_is_active(&f.attrs, enabled) =>
+            {
+                let ctx = CollectAddCallsContext {
+                    file_items: items,
+                    path,
+                    pyclass_name_map,
+                    cx,
+                };
+                for stmt in &f.block.stmts {
+                    collect_add_calls_from_stmt(stmt, &ctx, &mut result);
                 }
             }
             Item::Macro(mac) => {
