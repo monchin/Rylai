@@ -577,6 +577,7 @@ impl<'a> GenCtx<'a> {
             match &c.extends {
                 None => None,
                 Some(ExtendsSpec::Builtin(b)) => Some((*b).to_string()),
+                Some(ExtendsSpec::CreateExceptionBase(b)) => Some(b.clone()),
                 Some(ExtendsSpec::PyClassRustName(rust_base)) => {
                     if let Some(py) = self.known_classes.get(rust_base) {
                         if let (Some(cur), Some(map)) =
@@ -2574,6 +2575,30 @@ mod tests {
         let stub = stub_for(vec![PyItem::Class(class)]);
         assert!(stub.contains("@t.final"), "got:\n{stub}");
         assert!(stub.contains("class MyDict(dict):"), "got:\n{stub}");
+    }
+
+    #[test]
+    fn gen_class_create_exception_base_emits_class_line() {
+        let class = PyClass {
+            name: "CustomError".to_string(),
+            rust_name: "CustomError".to_string(),
+            module: None,
+            allows_python_subclass: true,
+            extends: Some(ExtendsSpec::CreateExceptionBase("ValueError".to_string())),
+            is_enum: false,
+            doc: vec![],
+            methods: vec![],
+            source_file: dummy_path(),
+        };
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            !stub.contains("@t.final"),
+            "create_exception-style class allows subclass; got:\n{stub}"
+        );
+        assert!(
+            stub.contains("class CustomError(ValueError):"),
+            "got:\n{stub}"
+        );
     }
 
     #[test]

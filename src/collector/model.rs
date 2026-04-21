@@ -67,11 +67,20 @@ pub enum ParamKind {
     Kwargs, // **kwargs (reserved for Phase 3+)
 }
 
-/// `#[pyclass(extends = ...)]` base: either a PyO3 builtin (Python built-in type name) or another
-/// `#[pyclass]` in the crate (Rust struct name for lookup in `known_classes`).
+/// Base class for stubs: `#[pyclass(extends = ...)]`, or `create_exception!` (see [`ExtendsSpec::CreateExceptionBase`]).
+///
+/// Values are either a PyO3 builtin mapping (Python type name), a `create_exception!` base (see
+/// [`ExtendsSpec::CreateExceptionBase`]), or another `#[pyclass]` in the crate (Rust struct name
+/// for lookup in `known_classes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtendsSpec {
     Builtin(&'static str),
+    /// Python exception base name for `create_exception!` stubs (`class Name(` … `):`).
+    ///
+    /// Known `pyo3::exceptions::Py*` segments map to the stdlib name (e.g. `PyValueError` →
+    /// `ValueError`). User-defined bases (chained `create_exception!(m, Child, BaseError)`) use
+    /// the last segment verbatim (e.g. `BaseError`).
+    CreateExceptionBase(String),
     PyClassRustName(String),
 }
 

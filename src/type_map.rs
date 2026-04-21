@@ -108,6 +108,115 @@ pub fn pyo3_builtin_segment_to_python_class(segment: &str) -> Option<&'static st
     }
 }
 
+/// Look up the last path segment of a `pyo3::exceptions::Py*` struct against the set of built-in
+/// wrappers shipped with PyO3 (maintained for pyo3 0.22+; extend this `match` when PyO3 adds new
+/// exception types).
+///
+/// Returns `Some(python_name)` when the segment is a known PyO3 built-in exception wrapper, or
+/// `None` when it is unrecognised (e.g. a user-defined exception from `create_exception!` or
+/// `import_exception!`, or a **new** official `PySomething` not yet added here).
+///
+/// If `None`, [`pyo3_exception_segment_to_python_builtin`] uses the segment unchanged. That is
+/// correct for user-defined names; for a new official `PyNewThing` missing from the table, stubs
+/// would incorrectly show `PyNewThing` as the base until this map is updated.
+///
+/// Using an explicit table instead of stripping a `Py` prefix prevents false positives for
+/// user-defined Rust types whose names happen to start with `Py`
+/// (e.g. `create_exception!(m, ChildError, PyCustomBase)` should not strip the prefix).
+pub fn pyo3_builtin_exception_segment(segment: &str) -> Option<&'static str> {
+    match segment {
+        // BaseException hierarchy
+        "PyBaseException" => Some("BaseException"),
+        "PyBaseExceptionGroup" => Some("BaseExceptionGroup"),
+        "PyException" => Some("Exception"),
+        "PyGeneratorExit" => Some("GeneratorExit"),
+        "PyKeyboardInterrupt" => Some("KeyboardInterrupt"),
+        "PySystemExit" => Some("SystemExit"),
+        // ArithmeticError
+        "PyArithmeticError" => Some("ArithmeticError"),
+        "PyFloatingPointError" => Some("FloatingPointError"),
+        "PyOverflowError" => Some("OverflowError"),
+        "PyZeroDivisionError" => Some("ZeroDivisionError"),
+        // LookupError
+        "PyLookupError" => Some("LookupError"),
+        "PyIndexError" => Some("IndexError"),
+        "PyKeyError" => Some("KeyError"),
+        // OSError (and its aliases / subclasses)
+        "PyOSError" => Some("OSError"),
+        "PyEnvironmentError" => Some("EnvironmentError"),
+        "PyIOError" => Some("IOError"),
+        "PyBlockingIOError" => Some("BlockingIOError"),
+        "PyBrokenPipeError" => Some("BrokenPipeError"),
+        "PyChildProcessError" => Some("ChildProcessError"),
+        "PyConnectionError" => Some("ConnectionError"),
+        "PyConnectionAbortedError" => Some("ConnectionAbortedError"),
+        "PyConnectionRefusedError" => Some("ConnectionRefusedError"),
+        "PyConnectionResetError" => Some("ConnectionResetError"),
+        "PyFileExistsError" => Some("FileExistsError"),
+        "PyFileNotFoundError" => Some("FileNotFoundError"),
+        "PyInterruptedError" => Some("InterruptedError"),
+        "PyIsADirectoryError" => Some("IsADirectoryError"),
+        "PyNotADirectoryError" => Some("NotADirectoryError"),
+        "PyPermissionError" => Some("PermissionError"),
+        "PyProcessLookupError" => Some("ProcessLookupError"),
+        "PyTimeoutError" => Some("TimeoutError"),
+        // Other standard exceptions
+        "PyAssertionError" => Some("AssertionError"),
+        "PyAttributeError" => Some("AttributeError"),
+        "PyBufferError" => Some("BufferError"),
+        "PyEOFError" => Some("EOFError"),
+        "PyImportError" => Some("ImportError"),
+        "PyModuleNotFoundError" => Some("ModuleNotFoundError"),
+        "PyMemoryError" => Some("MemoryError"),
+        "PyNameError" => Some("NameError"),
+        "PyUnboundLocalError" => Some("UnboundLocalError"),
+        "PyNotImplementedError" => Some("NotImplementedError"),
+        "PyRecursionError" => Some("RecursionError"),
+        "PyReferenceError" => Some("ReferenceError"),
+        "PyRuntimeError" => Some("RuntimeError"),
+        "PyStopAsyncIteration" => Some("StopAsyncIteration"),
+        "PyStopIteration" => Some("StopIteration"),
+        "PySyntaxError" => Some("SyntaxError"),
+        "PyIndentationError" => Some("IndentationError"),
+        "PyTabError" => Some("TabError"),
+        "PySystemError" => Some("SystemError"),
+        "PyTypeError" => Some("TypeError"),
+        "PyUnicodeError" => Some("UnicodeError"),
+        "PyUnicodeDecodeError" => Some("UnicodeDecodeError"),
+        "PyUnicodeEncodeError" => Some("UnicodeEncodeError"),
+        "PyUnicodeTranslateError" => Some("UnicodeTranslateError"),
+        "PyValueError" => Some("ValueError"),
+        // Warning hierarchy
+        "PyWarning" => Some("Warning"),
+        "PyBytesWarning" => Some("BytesWarning"),
+        "PyDeprecationWarning" => Some("DeprecationWarning"),
+        "PyEncodingWarning" => Some("EncodingWarning"),
+        "PyFutureWarning" => Some("FutureWarning"),
+        "PyImportWarning" => Some("ImportWarning"),
+        "PyPendingDeprecationWarning" => Some("PendingDeprecationWarning"),
+        "PyResourceWarning" => Some("ResourceWarning"),
+        "PyRuntimeWarning" => Some("RuntimeWarning"),
+        "PySyntaxWarning" => Some("SyntaxWarning"),
+        "PyUnicodeWarning" => Some("UnicodeWarning"),
+        "PyUserWarning" => Some("UserWarning"),
+        _ => None,
+    }
+}
+
+/// Map the last path segment of a PyO3 exception type to the Python class name used in stubs
+/// for `create_exception!`.
+///
+/// Delegates to [`pyo3_builtin_exception_segment`] for known PyO3 built-in wrappers and falls
+/// back to `segment` itself when the table has no entry (user-defined bases, or an unlisted
+/// official `Py*` wrapper — see [`pyo3_builtin_exception_segment`]). For example, chained
+/// `create_exception!(m, ChildError, BaseError)` must emit `class ChildError(BaseError):`, not
+/// `(Exception):`.
+pub fn pyo3_exception_segment_to_python_builtin(segment: &str) -> String {
+    pyo3_builtin_exception_segment(segment)
+        .map(str::to_string)
+        .unwrap_or_else(|| segment.to_string())
+}
+
 impl TypeMapping {
     pub fn known(s: &str) -> Self {
         Self {
@@ -846,5 +955,69 @@ mod tests {
             map_type(&parse_ty("(i32, String)"), &policy, None, &no_classes()).py_type,
             "t.Tuple[int, str]"
         );
+    }
+
+    #[test]
+    fn pyo3_exception_segment_maps_to_python_builtin_name() {
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("PyValueError"),
+            "ValueError"
+        );
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("PyException"),
+            "Exception"
+        );
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("PyUnicodeDecodeError"),
+            "UnicodeDecodeError"
+        );
+        // User-defined exception names have no `Py` prefix; they must be returned as-is so that
+        // chained `create_exception!` stubs emit `class ChildError(BaseError):` not `(Exception):`.
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("BaseError"),
+            "BaseError"
+        );
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("CustomExc"),
+            "CustomExc"
+        );
+        // A user-defined name that starts with "Py" must NOT be stripped — the old heuristic
+        // would have incorrectly returned "CustomBase" if written as "PyCustomBase".
+        assert_eq!(
+            pyo3_exception_segment_to_python_builtin("PyCustomBase"),
+            "PyCustomBase",
+            "unknown Py-prefixed name must be kept verbatim, not treated as a built-in"
+        );
+    }
+
+    #[test]
+    fn pyo3_builtin_exception_segment_covers_complete_pyo3_set() {
+        // Spot-check every major branch of the lookup table.
+        assert_eq!(
+            pyo3_builtin_exception_segment("PyBaseException"),
+            Some("BaseException")
+        );
+        assert_eq!(pyo3_builtin_exception_segment("PyOSError"), Some("OSError"));
+        assert_eq!(pyo3_builtin_exception_segment("PyIOError"), Some("IOError"));
+        assert_eq!(
+            pyo3_builtin_exception_segment("PyEnvironmentError"),
+            Some("EnvironmentError")
+        );
+        assert_eq!(
+            pyo3_builtin_exception_segment("PyEOFError"),
+            Some("EOFError")
+        );
+        assert_eq!(pyo3_builtin_exception_segment("PyWarning"), Some("Warning"));
+        assert_eq!(
+            pyo3_builtin_exception_segment("PyEncodingWarning"),
+            Some("EncodingWarning")
+        );
+        assert_eq!(
+            pyo3_builtin_exception_segment("PyBaseExceptionGroup"),
+            Some("BaseExceptionGroup")
+        );
+        // Unknown segment → None
+        assert_eq!(pyo3_builtin_exception_segment("PyCustomError"), None);
+        assert_eq!(pyo3_builtin_exception_segment("CustomError"), None);
     }
 }

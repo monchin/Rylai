@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`**: macros (file-level or inside `#[pymodule]`) are collected and emitted as Python exception classes in the matching stub.
+
 ## [0.3.4] - 2026-04-09
 
 ### Fixed
