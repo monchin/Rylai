@@ -36,6 +36,32 @@ pub struct Config {
     /// Each entry is a command string, e.g. "ruff format", "black", "ruff check --select I --fix".
     #[serde(default)]
     pub format: Vec<String>,
+
+    /// Macro expansion rules: expand custom macros before syn parsing so that
+    /// `add_class` / `add_function` calls wrapped in macros are visible to the collector.
+    #[serde(default)]
+    pub macro_expand: Vec<MacroExpandEntry>,
+}
+
+/// A single macro expansion rule for `[[macro_expand]]` in rylai.toml.
+///
+/// If only `name` is given, rylai searches the crate sources for `macro_rules! <name> { ... }`
+/// and auto-extracts its arms (best-effort token walk; unusual formatting may require explicit
+/// `from` / `to`). If the same macro name appears in multiple files with extractable arms, the
+/// first match in walk order is used and a warning is recorded. If `from` and `to` are both
+/// given, they are used directly as the macro-rules-rt Matcher / Transcriber (the macro name
+/// and `!()` delimiter are prepended automatically, so `from` should contain only the inner
+/// argument pattern).
+#[derive(Debug, Deserialize)]
+pub struct MacroExpandEntry {
+    /// Macro name, e.g. `"add_pymodule"`.
+    pub name: String,
+    /// Inner argument pattern for macro-rules-rt Matcher (without the macro name or `!()`).
+    /// Must be set together with `to`; omit both to auto-discover from source.
+    pub from: Option<String>,
+    /// Transcriber body for macro-rules-rt (the replacement text).
+    /// Must be set together with `from`; omit both to auto-discover from source.
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,7 +391,25 @@ impl Config {
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid config structure: {}", e))?;
         config.validate_overrides()?;
+        config.validate_macro_expand()?;
         Ok(config)
+    }
+
+    /// `[[macro_expand]]`: `from` and `to` must both be present or both absent.
+    fn validate_macro_expand(&self) -> Result<()> {
+        use anyhow::bail;
+        for (i, m) in self.macro_expand.iter().enumerate() {
+            match (m.from.as_ref(), m.to.as_ref()) {
+                (Some(_), None) | (None, Some(_)) => {
+                    bail!(
+                        "[[macro_expand]] entry {i} (name = {:?}): `from` and `to` must both be present or both absent",
+                        m.name
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// `[[override]]`: use `stub` alone, **or** at least one of non-empty `param_types` / `return_type`.

@@ -5,6 +5,7 @@ mod rename_all;
 pub use model::*;
 
 use crate::config::Config;
+use crate::macro_expand;
 use anyhow::Result;
 use std::cell::RefCell;
 use std::path::Path;
@@ -24,9 +25,8 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
         crate_root.to_path_buf()
     };
 
-    // Collect all .rs paths and parsed files up front; subsequent passes operate over this slice.
-    // All parsed ASTs are held in memory; for very large crates consider streaming or lazy parsing in the future.
-    let mut files: Vec<(std::path::PathBuf, syn::File)> = Vec::new();
+    // Step 1: read all .rs files as raw text so we can optionally expand macros before parsing.
+    let mut sources: Vec<(std::path::PathBuf, String)> = Vec::new();
     for entry in WalkDir::new(&root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -34,9 +34,30 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
     {
         let path = entry.path().to_path_buf();
         let source = std::fs::read_to_string(&path)?;
-        let file = syn::parse_file(&source)
+        sources.push((path, source));
+    }
+
+    // Step 2: if [[macro_expand]] is configured, build expansion rules and pre-process every file.
+    let mut macro_expand_warnings: Vec<String> = Vec::new();
+    if !config.macro_expand.is_empty() {
+        let macro_w = RefCell::new(Vec::new());
+        let rules =
+            macro_expand::build_macro_rules(&config.macro_expand, &sources, Some(&macro_w))?;
+        macro_expand_warnings = macro_w.into_inner();
+        if !rules.is_empty() {
+            for (_path, source) in &mut sources {
+                *source = macro_expand::expand_source(source, &rules)?;
+            }
+        }
+    }
+
+    // Step 3: parse all (possibly expanded) sources with syn.
+    // All parsed ASTs are held in memory; for very large crates consider streaming or lazy parsing in the future.
+    let mut files: Vec<(std::path::PathBuf, syn::File)> = Vec::new();
+    for (path, source) in &sources {
+        let file = syn::parse_file(source)
             .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
-        files.push((path, file));
+        files.push((path.clone(), file));
     }
 
     let enabled_features = &config.features.enabled;
@@ -77,5 +98,7 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
         modules.extend(file_modules);
     }
 
-    Ok((modules, parse_warnings.into_inner()))
+    let mut all_warnings = macro_expand_warnings;
+    all_warnings.extend(parse_warnings.into_inner());
+    Ok((modules, all_warnings))
 }

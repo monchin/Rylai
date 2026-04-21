@@ -14,6 +14,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Generates `__all__` in every stub listing public top-level exports; names starting with `_` are excluded by default; configurable globally and per file via `[[all]]`
 - Parses **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`** ([PyO3 custom exceptions](https://pyo3.rs/main/exception)): emits matching `class Name(Base): ...` stubs in the pymodule file; the first macro argument must be the pymodule’s Python-visible name (`#[pymodule(name = "...")]`, `#[pyo3(name = "...")]`, or the Rust identifier). Builtin `pyo3::exceptions::Py*` bases map to stdlib exception names; chaining another `create_exception!` type uses that class name as the base
 - Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`
+- Optional `[[macro_expand]]`: expand configured `macro_rules!` invocations before AST parsing so wrapped `add_class` / `add_function` calls can be collected
 - Zero-config by default; optionally configured via `rylai.toml`
 
 ## Why Rylai?
@@ -129,7 +130,7 @@ You can configure rylai in either (or both) of these places:
 - **`rylai.toml`** in the crate root
 - **`[tool.rylai]`** in `pyproject.toml`
 
-When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, `[[all]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
+When both exist, duplicate keys are resolved in favor of `rylai.toml`; all other options from both files apply. Array tables (e.g. `[[override]]`, `[[add_content]]`, `[[all]]`, `[[macro_expand]]`, and their `[[tool.rylai.*]]` forms) are replaced as a whole by the same key in `rylai.toml`, not merged item-by-item. All sections are optional.
 
 Example `rylai.toml`:
 
@@ -169,8 +170,7 @@ enabled = ["some_feature"]
 # Custom Rust type → Python type overrides
 "numpy::PyReadonlyArray1" = "numpy.ndarray"
 "numpy::PyReadonlyArray2" = "numpy.ndarray"
-
-# [type_map] limitations (read this if a mapping seems ignored):
+# Limitations (read this if a mapping seems ignored):
 # - Keys must be Rust *path* types: a single identifier (e.g. PyBbox, PyColor) or a qualified path
 #   (e.g. crate::types::MyHandle). Rylai derives the lookup key from path segments only.
 # - Anonymous tuple types written in source, e.g. (u8, u8, u8, u8), are *not* path types and
@@ -183,6 +183,21 @@ enabled = ["some_feature"]
 # - If two keys share the same last path segment but map to different Python types, Rylai warns on
 #   stderr, omits the ambiguous short-name lookup, and does not preserve that alias name during
 #   expansion (use a single consistent target or disambiguate with a bare key only when unique).
+
+# Optional: expand custom macro_rules invocations before syn parsing.
+# Use this when pyo3 registration calls are wrapped in declarative macros.
+#
+# Mode A: explicit matcher/transcriber (macro-rules-rt Rule::new)
+[[macro_expand]]
+name = "add_pymodule"
+from = '$py:expr, $parent:expr, $name:expr, [$($cls:ty),* $(,)?]'
+to = '{ let sub = pyo3::types::PyModule::new($py, $name)?; $(sub.add_class::<$cls>()?;)* $parent.add_submodule(&sub)?; Ok::<_, pyo3::PyErr>(()) }'
+#
+# Mode B: auto-discover macro_rules! definition from Rust source by name
+[[macro_expand]]
+name = "register_classes"
+# Mode B is best-effort; duplicate macro names across files use the first match (warning). Unparsable
+# .rs files are skipped when searching for the definition (warning).
 
 [[override]]
 # Single-line def/class header for a top-level item (Rust `///` doc is copied into the .pyi when present).
@@ -295,6 +310,9 @@ strategy = "any"
 item = "my_module::complex_function"
 stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 
+[[tool.rylai.macro_expand]]
+name = "register_classes"
+
 [[tool.rylai.add_content]]
 file = "mymod.pyi"
 location = "tail"
@@ -347,13 +365,20 @@ For **`[output] python_version`**: generic containers follow [PEP 585](https://p
 
 ## Limitation
 
-Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. declarative macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
+Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. procedural macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
 
-For **`create_exception!`**, parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
+### Current limitations
+
+- **Same-name items.** Rylai keys most internal lookups (functions, classes, type aliases, impl blocks, struct fields) by bare identifier. If two items in different modules share the same Rust name (e.g. two `struct Foo`), the last one parsed silently wins — fields, methods, and attributes from earlier definitions are lost. Use unique names or `#[pyclass(name = "...")]` to disambiguate.
+- **`use … as …` renamed imports.** Rylai does not resolve import aliases. Code like `use pyo3::prelude::PyResult as MyResult;` followed by `-> MyResult<T>` will cause `MyResult` to be treated as an unknown type (falling back to `t.Any`). Use the original name or add a `type` alias + `[type_map]` entry instead.
+- **`create_exception!` parsing.** Parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
+- **`[[macro_expand]]` repetition blocks.** Due to a `macro_rules_rt` limitation, `$(...)*` blocks can only contain repeating variables (e.g. `$cls`). Non-repeating metavariables inside a repetition are not expanded. The standard workaround is to bind non-repeating variables outside the repetition with a `let` (see the `macro_expand_sample` example).
+
+### When to use a build-based tool instead
 
 For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
 
-For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). In that case, avoid Python-related PyO3 code that is hard to analyze without compilation — for example **declarative macros** that expand at compile time and inject `#[pyfunction]` / `#[pyclass]`; Rylai cannot see those statically and may not generate the corresponding stubs correctly.
+For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). For declarative macros that wrap binding registration calls, you can now use `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` to expand specific macros before parsing. Coverage is still opt-in and pattern-driven: unsupported macro patterns or unconfigured macros may still be missed.
 
 Related support is planned, but Rylai cannot generate stubs for all possible PyO3 code.
 
