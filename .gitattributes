@@ -1,0 +1,28 @@
+# Auto detect text files and normalize to LF
+* text=auto eol=lf
+
+# Rust
+*.rs text eol=lf
+
+# Python
+*.py text eol=lf
+*.pyi text eol=lf
+
+# TOML
+*.toml text eol=lf
+
+# Markdown
+*.md text eol=lf
+
+# YAML
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Config / lock files
+Cargo.lock text eol=lf
+
+# Binary files (no normalization)
+*.ico binary
+*.png binary
+*.jpg binary
+*.woff2 binary
