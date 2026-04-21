@@ -12,6 +12,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 - Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits additional sibling `.pyi` files under `-o` (first module segment is implicit) so type checkers and runtime `__module__` agree
 - Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics `list[T]` / `dict[...]` / … for ≥ 3.9, `t.List` / `t.Dict` / … for 3.8; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
 - Generates `__all__` in every stub listing public top-level exports; names starting with `_` are excluded by default; configurable globally and per file via `[[all]]`
+- Parses **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`** ([PyO3 custom exceptions](https://pyo3.rs/main/exception)): emits matching `class Name(Base): ...` stubs in the pymodule file; the first macro argument must be the pymodule’s Python-visible name (`#[pymodule(name = "...")]`, `#[pyo3(name = "...")]`, or the Rust identifier). Builtin `pyo3::exceptions::Py*` bases map to stdlib exception names; chaining another `create_exception!` type uses that class name as the base
 - Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`
 - Optional `[[macro_expand]]`: expand configured `macro_rules!` invocations before AST parsing so wrapped `add_class` / `add_function` calls can be collected
 - Zero-config by default; optionally configured via `rylai.toml`
@@ -21,7 +22,7 @@ Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-anno
 Compared with other tools that generate `.pyi` stubs for PyO3 projects, Rylai offers:
 
 - **No compilation** — Rylai parses Rust source code directly (via [syn](https://github.com/dtolnay/syn)). You don’t need to build the crate or depend on compiled artifacts, so stub generation is fast and works even when the project doesn’t compile (e.g. missing native deps or wrong toolchain).
-- **No code changes** — No need to add build scripts, `#[cfg]` blocks, or extra annotations to your Rust code. Point Rylai at your crate root and it reads existing `#[pymodule]` / `#[pyfunction]` / `#[pyclass]` as-is.
+- **No code changes** — No need to add build scripts, `#[cfg]` blocks, or extra annotations to your Rust code. Point Rylai at your crate root and it reads existing `#[pymodule]` / `#[pyfunction]` / `#[pyclass]` and `create_exception!` macros as-is.
 - **No Python version lock-in** — Stubs are plain text. You generate them once and use them with any Python version; there’s no dependency on a specific Python interpreter or ABI, so you avoid “built for Python 3.x” issues and cross-version workflows stay simple.
 
 Together, this makes Rylai easy to integrate into CI, docs, or local dev without touching your PyO3 code or your Python environment.
@@ -101,6 +102,14 @@ class A:
 ```
 
 See `examples/pyo3_sample/src/lib.rs` for the full Rust source.
+
+The sample also declares `pyo3::create_exception!(pyo3_sample, SampleError, PyValueError)` at crate scope and re-exports it from the pymodule; the generated `pyo3_sample.pyi` includes:
+
+```python
+class SampleError(ValueError): ...
+```
+
+alongside `__all__` and the other symbols. Generated exception classes are not marked `@t.final` so they stay subclassable in stubs.
 
 ### Multi-module stubs (`#[pyclass(module = "...")]`)
 
@@ -358,6 +367,8 @@ For **`[output] python_version`**: generic containers follow [PEP 585](https://p
 ## Limitation
 
 Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]`, etc., and does not run the compiler. It is therefore **not a good fit** for cases where concrete information is only known after compilation (e.g. declarative macros that generate Python bindings at compile time, or types/signatures that only exist in compiled artifacts).
+
+For **`create_exception!`**, parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
 
 For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
 

@@ -17,6 +17,7 @@ __all__ = [
     "add",
     "show_kwargs",
     "C",
+    "SampleError",
 ]
 
 # Module: pyo3_sample
@@ -32,3 +33,5 @@ def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
 @t.final
 class C:
     def __init__(self) -> None: ...
+
+class SampleError(ValueError): ...

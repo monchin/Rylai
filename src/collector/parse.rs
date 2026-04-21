@@ -1,5 +1,6 @@
 use super::model::*;
 use crate::config::Config;
+use proc_macro2::TokenTree;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -327,7 +328,8 @@ pub fn extract_modules_from_file(
             // Style A: #[pymodule] mod Foo { ... }
             Item::Mod(m) if has_attr(&m.attrs, "pymodule") => {
                 if cfg_is_active(&m.attrs, &cx.config.features.enabled)
-                    && let Some(module) = parse_mod_style_module(m, path, pyclass_name_map, cx)
+                    && let Some(module) =
+                        parse_mod_style_module(m, file, path, pyclass_name_map, cx)
                 {
                     result.push(module);
                 }
@@ -351,6 +353,7 @@ pub fn extract_modules_from_file(
 
 fn parse_mod_style_module(
     m: &ItemMod,
+    file: &syn::File,
     path: &Path,
     pyclass_name_map: &HashMap<String, String>,
     cx: ParseContext<'_>,
@@ -358,8 +361,11 @@ fn parse_mod_style_module(
     let (_, items) = m.content.as_ref()?;
     let name = m.ident.to_string();
     let doc = extract_doc(&m.attrs);
+    let pymodule_export = extract_pymodule_export_name(&m.attrs, &name);
 
-    let py_items = collect_items_from_list(items, path, pyclass_name_map, cx);
+    let mut py_items =
+        collect_items_from_list(items, file, path, pyclass_name_map, cx, &pymodule_export);
+    merge_create_exceptions_from_file_items(&file.items, &pymodule_export, path, &mut py_items, cx);
 
     Some(PyModule {
         name,
@@ -369,14 +375,180 @@ fn parse_mod_style_module(
     })
 }
 
+/// Python-visible extension module name for matching `create_exception!(module, ...)`.
+///
+/// Uses `#[pymodule(name = "...")]`, then `#[pyo3(name = "...")]` on the module item, then the Rust
+/// `mod` / `fn` identifier. See <https://pyo3.rs/main/exception>.
+fn extract_pymodule_export_name(attrs: &[Attribute], rust_ident: &str) -> String {
+    for attr in attrs {
+        if !attr.path().is_ident("pymodule") {
+            continue;
+        }
+        let mut found: Option<String> = None;
+        if attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("name") {
+                    let s: LitStr = meta.value()?.parse()?;
+                    let v = s.value();
+                    if !v.is_empty() {
+                        found = Some(v);
+                    }
+                    return Ok(());
+                }
+                if meta.input.peek(syn::token::Eq) {
+                    let _ = meta.value()?.parse::<Expr>()?;
+                }
+                Ok(())
+            })
+            .is_ok()
+            && let Some(name) = found
+        {
+            return name;
+        }
+    }
+    extract_pyo3_name(attrs).unwrap_or_else(|| rust_ident.to_string())
+}
+
+/// Split a [`proc_macro2::TokenStream`] into segments divided by top-level commas, respecting
+/// `()`, `[]`, `{}` grouping (which `proc_macro2` represents as [`TokenTree::Group`]) and
+/// heuristically tracking `<>` for generic arguments.
+///
+/// **Known limitation**: `<` and `>` are plain `Punct` tokens in `proc_macro2`; they also appear
+/// in `>=`, `>>`, `->`, and comparison expressions.  The angle-bracket depth counter uses
+/// [`u32::saturating_sub`] to avoid underflow, so a mismatched `>` resets depth to zero instead
+/// of panicking.  In practice `create_exception!` arguments are simple paths (no generics), so
+/// this heuristic is sufficient; code that passes generic base types may be split incorrectly.
+fn split_tokens_at_top_level_commas(
+    tokens: proc_macro2::TokenStream,
+) -> Vec<proc_macro2::TokenStream> {
+    let mut parts: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut current: Vec<TokenTree> = Vec::new();
+    let mut paren = 0u32;
+    let mut bracket = 0u32;
+    let mut brace = 0u32;
+    let mut angle = 0u32;
+    for tt in tokens {
+        match &tt {
+            TokenTree::Punct(p) => {
+                let c = p.as_char();
+                if c == ',' && paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+                    parts.push(current.drain(..).collect());
+                    continue;
+                }
+                match c {
+                    '(' => paren += 1,
+                    ')' => paren = paren.saturating_sub(1),
+                    '[' => bracket += 1,
+                    ']' => bracket = bracket.saturating_sub(1),
+                    '{' => brace += 1,
+                    '}' => brace = brace.saturating_sub(1),
+                    '<' => angle += 1,
+                    '>' => angle = angle.saturating_sub(1),
+                    _ => {}
+                }
+                current.push(tt);
+            }
+            _ => current.push(tt),
+        }
+    }
+    parts.push(current.into_iter().collect());
+    parts
+}
+
+fn pyclass_from_create_exception(exc_name: &str, base_path: &syn::Path, path: &Path) -> PyClass {
+    let seg = base_path
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let base_py = crate::type_map::pyo3_exception_segment_to_python_builtin(&seg);
+    PyClass {
+        name: exc_name.to_string(),
+        rust_name: exc_name.to_string(),
+        module: None,
+        allows_python_subclass: true,
+        extends: Some(ExtendsSpec::CreateExceptionBase(base_py)),
+        is_enum: false,
+        doc: Vec::new(),
+        methods: Vec::new(),
+        source_file: path.to_path_buf(),
+    }
+}
+
+/// Parses `create_exception!(module, Name, Base)` / `pyo3::create_exception!(...)`.
+fn try_parse_create_exception_macro(
+    mac: &syn::Macro,
+    pymodule_export: &str,
+    path: &Path,
+) -> Option<PyClass> {
+    let last = mac.path.segments.last()?.ident.to_string();
+    if last != "create_exception" {
+        return None;
+    }
+    let arg_streams = split_tokens_at_top_level_commas(mac.tokens.clone());
+    if arg_streams.len() != 3 {
+        return None;
+    }
+    let mod_seg: syn::Ident = syn::parse2(arg_streams[0].clone()).ok()?;
+    if mod_seg != pymodule_export {
+        return None;
+    }
+    let exc_name: syn::Ident = syn::parse2(arg_streams[1].clone()).ok()?;
+    let base_ty: Type = syn::parse2(arg_streams[2].clone()).ok()?;
+    let Type::Path(tp) = base_ty else {
+        return None;
+    };
+    Some(pyclass_from_create_exception(
+        &exc_name.to_string(),
+        &tp.path,
+        path,
+    ))
+}
+
+fn merge_create_exceptions_from_file_items(
+    file_items: &[Item],
+    pymodule_export: &str,
+    path: &Path,
+    out: &mut Vec<PyItem>,
+    cx: ParseContext<'_>,
+) {
+    let enabled = &cx.config.features.enabled;
+    let mut seen: HashSet<String> = out
+        .iter()
+        .filter_map(|i| {
+            if let PyItem::Class(c) = i {
+                Some(c.name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for item in file_items {
+        let Item::Macro(mac) = item else {
+            continue;
+        };
+        if !cfg_is_active(&mac.attrs, enabled) {
+            continue;
+        }
+        if let Some(class) = try_parse_create_exception_macro(&mac.mac, pymodule_export, path)
+            && seen.insert(class.name.clone())
+        {
+            out.push(PyItem::Class(class));
+        }
+    }
+}
+
 fn collect_items_from_list(
     items: &[Item],
+    file: &syn::File,
     path: &Path,
     pyclass_name_map: &HashMap<String, String>,
     cx: ParseContext<'_>,
+    pymodule_export: &str,
 ) -> Vec<PyItem> {
     let enabled = &cx.config.features.enabled;
     let mut result = Vec::new();
+    let mut seen_exc: HashSet<String> = HashSet::new();
     for item in items {
         match item {
             Item::Fn(f) if has_attr(&f.attrs, "pyfunction") => {
@@ -392,42 +564,52 @@ fn collect_items_from_list(
                     result.push(PyItem::Function(func));
                 }
             }
-            Item::Struct(s) if has_attr(&s.attrs, "pyclass") => {
-                if cfg_is_active(&s.attrs, enabled) {
-                    let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
-                    let rust_name = s.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx, false);
-                    result.push(PyItem::Class(class));
-                }
+            Item::Struct(s)
+                if has_attr(&s.attrs, "pyclass") && cfg_is_active(&s.attrs, enabled) =>
+            {
+                let name = extract_pyo3_name(&s.attrs).unwrap_or_else(|| s.ident.to_string());
+                let rust_name = s.ident.to_string();
+                let class = parse_pyclass_struct(&name, &rust_name, &s.attrs, path, cx, false);
+                result.push(PyItem::Class(class));
             }
-            Item::Enum(e) if has_attr(&e.attrs, "pyclass") => {
-                if cfg_is_active(&e.attrs, enabled) {
-                    let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
-                    let rust_name = e.ident.to_string();
-                    let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx, true);
-                    result.push(PyItem::Class(class));
-                }
+            Item::Enum(e) if has_attr(&e.attrs, "pyclass") && cfg_is_active(&e.attrs, enabled) => {
+                let name = extract_pyo3_name(&e.attrs).unwrap_or_else(|| e.ident.to_string());
+                let rust_name = e.ident.to_string();
+                let class = parse_pyclass_struct(&name, &rust_name, &e.attrs, path, cx, true);
+                result.push(PyItem::Class(class));
             }
             // Nested submodule
             Item::Mod(sub) if has_attr(&sub.attrs, "pymodule") => {
                 if cfg_is_active(&sub.attrs, enabled)
-                    && let Some(sub_mod) = parse_mod_style_module(sub, path, pyclass_name_map, cx)
+                    && let Some(sub_mod) =
+                        parse_mod_style_module(sub, file, path, pyclass_name_map, cx)
                 {
                     result.push(PyItem::Module(sub_mod));
                 }
             }
             // Declarative `#[pymodule] mod foo { #[pymodule_init] fn init(m) { m.add(...); } }`
-            Item::Fn(f) if has_attr(&f.attrs, "pymodule_init") => {
-                if cfg_is_active(&f.attrs, enabled) {
-                    let ctx = CollectAddCallsContext {
-                        file_items: items,
-                        path,
-                        pyclass_name_map,
-                        cx,
-                    };
-                    for stmt in &f.block.stmts {
-                        collect_add_calls_from_stmt(stmt, &ctx, &mut result);
-                    }
+            Item::Fn(f)
+                if has_attr(&f.attrs, "pymodule_init") && cfg_is_active(&f.attrs, enabled) =>
+            {
+                let ctx = CollectAddCallsContext {
+                    file_items: items,
+                    path,
+                    pyclass_name_map,
+                    cx,
+                };
+                for stmt in &f.block.stmts {
+                    collect_add_calls_from_stmt(stmt, &ctx, &mut result);
+                }
+            }
+            Item::Macro(mac) => {
+                if !cfg_is_active(&mac.attrs, enabled) {
+                    continue;
+                }
+                if let Some(class) =
+                    try_parse_create_exception_macro(&mac.mac, pymodule_export, path)
+                    && seen_exc.insert(class.name.clone())
+                {
+                    result.push(PyItem::Class(class));
                 }
             }
             _ => {}
@@ -447,6 +629,7 @@ fn parse_fn_style_module(
 ) -> Option<PyModule> {
     let name = f.sig.ident.to_string();
     let doc = extract_doc(&f.attrs);
+    let pymodule_export = extract_pymodule_export_name(&f.attrs, &name);
 
     let mut py_items = Vec::new();
 
@@ -460,6 +643,7 @@ fn parse_fn_style_module(
     for stmt in &f.block.stmts {
         collect_add_calls_from_stmt(stmt, &ctx, &mut py_items);
     }
+    merge_create_exceptions_from_file_items(file_items, &pymodule_export, path, &mut py_items, cx);
 
     Some(PyModule {
         name,
@@ -1733,13 +1917,19 @@ fn type_path_segment_for_extends(ty: &Type) -> Option<String> {
 
 /// Maps `extends` type to a Python builtin base or a same-crate `#[pyclass]` by **last path
 /// segment** only (see [`type_path_segment_for_extends`]). Builtin PyO3 bases use
-/// [`crate::type_map::pyo3_builtin_segment_to_python_class`]; `PyAny` yields no explicit base.
+/// [`crate::type_map::pyo3_builtin_segment_to_python_class`] and
+/// [`crate::type_map::pyo3_builtin_exception_segment`] (for `#[pyclass(extends = PyException)]` and
+/// similar per [PyO3 “complex exceptions”](https://pyo3.rs/main/exception#creating-more-complex-exceptions));
+/// `PyAny` yields no explicit base.
 pub fn extends_spec_from_syn_type(ty: &Type) -> Option<ExtendsSpec> {
     let seg = type_path_segment_for_extends(ty)?;
     if seg == "PyAny" {
         return None;
     }
     if let Some(b) = crate::type_map::pyo3_builtin_segment_to_python_class(&seg) {
+        return Some(ExtendsSpec::Builtin(b));
+    }
+    if let Some(b) = crate::type_map::pyo3_builtin_exception_segment(&seg) {
         return Some(ExtendsSpec::Builtin(b));
     }
     Some(ExtendsSpec::PyClassRustName(seg))
@@ -1811,7 +2001,7 @@ fn type_to_key(ty: &Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::MethodKind;
+    use crate::collector::{ExtendsSpec, MethodKind};
     use crate::config::{Config, RenderPolicy};
     use std::cell::RefCell;
     use std::path::Path;
@@ -2580,6 +2770,148 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         }
     }
 
+    /// `pyo3::create_exception!(module, Name, Base)` at file level is merged into the matching
+    /// `#[pymodule]` stub (see <https://pyo3.rs/main/exception>).
+    #[test]
+    fn create_exception_file_level_collects_as_class_extending_builtin_exception() {
+        let file = syn::parse_file(
+            r#"
+pyo3::create_exception!(my_mod, CustomError, pyo3::exceptions::PyValueError);
+
+#[pymodule]
+mod my_mod {}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let map = HashMap::new();
+        let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &map, cx);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].items.len(), 1);
+        match &modules[0].items[0] {
+            PyItem::Class(c) => {
+                assert_eq!(c.name, "CustomError");
+                assert_eq!(c.rust_name, "CustomError");
+                assert!(c.allows_python_subclass);
+                assert!(!c.is_enum);
+                match &c.extends {
+                    Some(ExtendsSpec::CreateExceptionBase(b)) => assert_eq!(b, "ValueError"),
+                    other => panic!("expected CreateExceptionBase(ValueError), got {other:?}"),
+                }
+            }
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_exception_inside_pymodule_mod_is_collected() {
+        let file = syn::parse_file(
+            r#"
+#[pymodule]
+mod my_mod {
+    create_exception!(my_mod, InnerExc, pyo3::exceptions::PyException);
+}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let map = HashMap::new();
+        let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &map, cx);
+        match &modules[0].items[0] {
+            PyItem::Class(c) => assert_eq!(c.name, "InnerExc"),
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        }
+    }
+
+    /// First argument of `create_exception!` must match `#[pymodule(name = "...")]` when set.
+    #[test]
+    fn create_exception_matches_pymodule_name_attribute() {
+        let file = syn::parse_file(
+            r#"
+pyo3::create_exception!(public_mod, RenamedExc, pyo3::exceptions::PyException);
+
+#[pymodule(name = "public_mod")]
+mod _internal {}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let map = HashMap::new();
+        let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &map, cx);
+        match &modules[0].items[0] {
+            PyItem::Class(c) => assert_eq!(c.name, "RenamedExc"),
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        }
+    }
+
+    /// Chained `create_exception!` where the base is another user-defined exception (no `Py`
+    /// prefix).  The emitted stub should reference the user's exception name directly rather than
+    /// fall back to `Exception`.
+    #[test]
+    fn create_exception_user_defined_base_preserves_base_name() {
+        let file = syn::parse_file(
+            r#"
+pyo3::create_exception!(my_mod, BaseError, pyo3::exceptions::PyException);
+pyo3::create_exception!(my_mod, ChildError, BaseError);
+
+#[pymodule]
+mod my_mod {}
+"#,
+        )
+        .unwrap();
+        let path = Path::new("lib.rs");
+        let config = Config::default();
+        let map = HashMap::new();
+        let type_alias_map = HashMap::new();
+        let impl_map = build_impl_map(&[(path.to_path_buf(), file.clone())], &no_features());
+        let fields_map = StructFieldsMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, path, &map, cx);
+        assert_eq!(modules.len(), 1);
+        let classes: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let PyItem::Class(c) = i {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(classes.len(), 2, "expected BaseError and ChildError");
+        let child = classes
+            .iter()
+            .find(|c| c.name == "ChildError")
+            .expect("ChildError missing");
+        match &child.extends {
+            Some(ExtendsSpec::CreateExceptionBase(b)) => assert_eq!(
+                b, "BaseError",
+                "user-defined base should be 'BaseError', not 'Exception'; got '{b}'"
+            ),
+            other => panic!("expected CreateExceptionBase(BaseError), got {other:?}"),
+        }
+    }
+
     /// Style B: docstring on the struct/enum is looked up via pyclass_attrs_map and
     /// appears on the collected class (fixes docstring loss when class is added via m.add_class::<T>()).
     #[test]
@@ -2743,6 +3075,21 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
         assert_eq!(
             extends_spec_from_syn_type(&ty),
             Some(ExtendsSpec::Builtin("dict"))
+        );
+    }
+
+    /// `#[pyclass(extends = PyException)]` — [complex exceptions](https://pyo3.rs/main/exception#creating-more-complex-exceptions).
+    #[test]
+    fn extract_pyclass_extends_pyo3_exception_yields_python_exception_base() {
+        let item: syn::ItemStruct = syn::parse_quote! {
+            #[pyclass]
+            #[pyo3(extends = PyException)]
+            struct CustomError {}
+        };
+        let ty = extract_pyclass_extends_type(&item.attrs, None).expect("extends");
+        assert_eq!(
+            extends_spec_from_syn_type(&ty),
+            Some(ExtendsSpec::Builtin("Exception"))
         );
     }
 

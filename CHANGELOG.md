@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Macro expansion pre-pass for declarative macros: configure `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` so Rylai expands matched macro invocations before `syn` parsing, allowing wrapped `add_class` / `add_function` registrations to be collected.
+- **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`**: macros (file-level or inside `#[pymodule]`) are collected and emitted as Python exception classes in the matching stub. (#2)
 
 ## [0.3.4] - 2026-04-09
 

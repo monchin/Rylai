@@ -1,10 +1,17 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+
+/// Custom exception type for the sample extension (see `create_exception!` below).
+pyo3::create_exception!(pyo3_sample, SampleError, PyValueError);
 
 /// A Python module implemented in Rust.
 #[pymodule]
 mod pyo3_sample {
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
+
+    #[pymodule_export]
+    use super::SampleError;
 
     /// Formats the sum of two numbers as string.
     #[pyfunction]
