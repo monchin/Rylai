@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import typing as t
 
 from ._typing import KwargsItems
 
@@ -13,25 +12,15 @@ else:
     from typing import Unpack
 
 __all__ = [
-    "sum_as_string",
-    "add",
     "show_kwargs",
-    "C",
-    "SampleError",
+    "multiply",
 ]
-
-# Module: pyo3_sample
-def sum_as_string(a: int, b: int) -> str:
-    """Formats the sum of two numbers as string."""
-
-def add(a: int, b: int) -> int:
-    """Renamed via #[pyo3(name = "...")]"""
 
 def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
     """Example of using "add_content" and "override" in rylai.toml to show the types of kwargs."""
 
-@t.final
-class C:
-    def __init__(self) -> None: ...
-
-class SampleError(ValueError): ...
+def multiply(a: float, b: float) -> float:
+    """
+    Multiply two values.
+    Demonstrates overriding individual parameter types and return type.
+    """

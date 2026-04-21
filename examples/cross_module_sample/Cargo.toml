@@ -1,10 +1,10 @@
 [package]
-name = "pyo3_sample"
+name = "cross_module_sample"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "pyo3_sample"
+name = "cross_module_sample"
 crate-type = ["cdylib"]
 
 [dependencies]

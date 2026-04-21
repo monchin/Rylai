@@ -5,17 +5,7 @@ format = [
 ]
 
 [[add_content]]
-file = "aa.pyi"
-location = "head"
-content = '''
-"""
-This example shows how to use add_content in rylai.toml.
-You can add content after the auto-generated banner.
-"""
-'''
-
-[[add_content]]
-file = "pyo3_sample.pyi"
+file = "override_sample.pyi"
 location = "after-import-typing"
 content = '''
 from ._typing import KwargsItems
@@ -27,5 +17,10 @@ else:
 '''
 
 [[override]]
-item = "pyo3_sample::show_kwargs"
+item = "override_sample::show_kwargs"
 stub = "def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:"
+
+[[override]]
+item = "override_sample::multiply"
+param_types = { a = "float", b = "float" }
+return_type = "float"
