@@ -1,0 +1,18 @@
+format = [
+    "uvx ruff format",
+    "uvx ruff check --select I --fix",
+    "uvx ruff check --select F401 --fix",
+]
+
+# Auto-discover mode: Rylai searches source files for `macro_rules! register_classes`
+# and extracts the pattern/body automatically — no `from`/`to` needed.
+[[macro_expand]]
+name = "register_classes"
+
+# Explicit mode: pattern and replacement are provided directly in config.
+# Useful when the macro is defined in an external crate or has patterns that
+# auto-discovery cannot handle.
+[[macro_expand]]
+name = "register_fn"
+from = "$m:expr, $fn_name:ident"
+to = "$m.add_function(wrap_pyfunction!($fn_name, $m)?)?;"

@@ -260,6 +260,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "macro_expand_sample"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

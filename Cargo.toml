@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/pyo3_sample"]
+members = [".", "examples/pyo3_sample", "examples/macro_expand_sample"]
 resolver = "2"
 
 [package]
