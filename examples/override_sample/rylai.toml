@@ -21,6 +21,6 @@ item = "override_sample::show_kwargs"
 stub = "def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:"
 
 [[override]]
-item = "override_sample::multiply"
-param_types = { a = "float", b = "float" }
-return_type = "float"
+item = "override_sample::apply_policy"
+param_types = { mode = 't.Literal["accept", "deny", "auto"]' }
+return_type = 'dict[str, t.Literal["accept", "deny", "auto"]]'

@@ -35,10 +35,21 @@ mod override_sample {
         Ok(())
     }
 
-    /// Multiply two values.
-    /// Demonstrates overriding individual parameter types and return type.
+    /// Apply a decision policy to predefined items.
+    /// Demonstrates overriding parameter and return types for richer Python type hints.
     #[pyfunction]
-    fn multiply(a: i64, b: i64) -> i64 {
-        a.wrapping_mul(b)
+    fn apply_policy(py: Python<'_>, mode: &str) -> PyResult<Py<PyDict>> {
+        let items = ["config_a", "config_b", "config_c"];
+        let valid = ["accept", "deny", "auto"];
+        if !valid.contains(&mode) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid mode: {mode}. Expected one of: accept, deny, auto"
+            )));
+        }
+        let dict = PyDict::new(py);
+        for item in &items {
+            dict.set_item(*item, mode)?;
+        }
+        Ok(dict.unbind())
     }
 }

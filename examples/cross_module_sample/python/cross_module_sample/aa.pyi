@@ -5,7 +5,7 @@ This example shows how to use add_content in rylai.toml.
 You can add content after the auto-generated banner.
 """
 
-# ruff: noqa: F401
+# ruff: noqa: E501
 from __future__ import annotations
 
 import typing as t

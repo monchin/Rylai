@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import typing as t
 
 from ._typing import KwargsItems
 
@@ -13,14 +14,16 @@ else:
 
 __all__ = [
     "show_kwargs",
-    "multiply",
+    "apply_policy",
 ]
 
 def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
     """Example of using "add_content" and "override" in rylai.toml to show the types of kwargs."""
 
-def multiply(a: float, b: float) -> float:
+def apply_policy(
+    mode: t.Literal["accept", "deny", "auto"],
+) -> dict[str, t.Literal["accept", "deny", "auto"]]:
     """
-    Multiply two values.
-    Demonstrates overriding individual parameter types and return type.
+    Apply a decision policy to predefined items.
+    Demonstrates overriding parameter and return types for richer Python type hints.
     """

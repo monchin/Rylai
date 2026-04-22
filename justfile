@@ -1,10 +1,9 @@
-set windows-shell := ["cmd.exe", "/c"]
-set windows-powershell := true
+set windows-shell := ["powershell", "-NoLogo", "-Command"]
 
 gen-pyi example:
     cargo run -- ./examples/{{example}} -o ./examples/{{example}}/python/{{example}}
 
-examples-gen-pyi:
+gen-pyi-examples:
     @just gen-pyi basic_function_sample
     @just gen-pyi cross_module_sample
     @just gen-pyi macro_expand_sample
