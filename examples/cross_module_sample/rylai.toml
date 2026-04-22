@@ -1,0 +1,17 @@
+format = [
+    "uvx ruff format",
+    "uvx ruff check --select I --fix",
+    "uvx ruff check --select F401 --fix",
+]
+
+[[add_content]]
+file = "aa.pyi"
+location = "head"
+content = '''
+"""
+This example shows how to use add_content in rylai.toml.
+You can add content after the auto-generated banner.
+"""
+
+# ruff: noqa: E501
+'''

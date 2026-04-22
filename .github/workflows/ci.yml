@@ -66,6 +66,17 @@ jobs:
       - name: Clippy (workspace)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Check example stubs are up to date
+        run: |
+          just gen-pyi-examples
+          git diff --exit-code -- '*.pyi'
+
   # Release also ships linux-musl wheels/binaries (messense/rust-musl-cross); keep CI aligned.
   build-linux-musl:
     name: Build & Test (linux-musl ${{ matrix.platform.artifact_suffix }})

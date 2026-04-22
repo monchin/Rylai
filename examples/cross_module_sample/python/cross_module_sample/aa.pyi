@@ -5,11 +5,12 @@ This example shows how to use add_content in rylai.toml.
 You can add content after the auto-generated banner.
 """
 
+# ruff: noqa: E501
 from __future__ import annotations
 
 import typing as t
 
-from pyo3_sample.bb import B
+from cross_module_sample.bb import B
 
 __all__ = [
     "A",
@@ -19,4 +20,4 @@ __all__ = [
 class A:
     def __init__(self) -> None: ...
     def make_b(self) -> B:
-        """Returns a `B` from `pyo3_sample.bb` (Rylai emits `from pyo3_sample.bb import B` in `aa` stub)."""
+        """Returns a `B` from `cross_module_sample.bb` (Rylai emits `from cross_module_sample.bb import B` in `aa` stub)."""

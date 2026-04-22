@@ -13,25 +13,17 @@ else:
     from typing import Unpack
 
 __all__ = [
-    "sum_as_string",
-    "add",
     "show_kwargs",
-    "C",
-    "SampleError",
+    "apply_policy",
 ]
-
-# Module: pyo3_sample
-def sum_as_string(a: int, b: int) -> str:
-    """Formats the sum of two numbers as string."""
-
-def add(a: int, b: int) -> int:
-    """Renamed via #[pyo3(name = "...")]"""
 
 def show_kwargs(**kwargs: Unpack[KwargsItems]) -> None:
     """Example of using "add_content" and "override" in rylai.toml to show the types of kwargs."""
 
-@t.final
-class C:
-    def __init__(self) -> None: ...
-
-class SampleError(ValueError): ...
+def apply_policy(
+    mode: t.Literal["accept", "deny", "auto"],
+) -> dict[str, t.Literal["accept", "deny", "auto"]]:
+    """
+    Apply a decision policy to predefined items.
+    Demonstrates overriding parameter and return types for richer Python type hints.
+    """

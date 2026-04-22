@@ -67,11 +67,8 @@ rylai --config path/to/rylai.toml
 You don’t need to install the binary. Use **`cargo run`** and pass arguments after `--`:
 
 ```bash
-# Default: writes .pyi files into the example crate root (examples/pyo3_sample/)
-cargo run -- examples/pyo3_sample
-
-# Recommended for this repo: stubs next to the Python package (Maturin `python-source` layout)
-cargo run -- examples/pyo3_sample --output examples/pyo3_sample/python/pyo3_sample
+# Run on a single example
+cargo run -- examples/basic_function_sample --output examples/basic_function_sample/python/basic_function_sample
 
 # Show help
 cargo run -- --help
@@ -79,37 +76,26 @@ cargo run -- --help
 
 Anything after `--` is forwarded to the `rylai` binary.
 
-### Example
+### Examples
 
-The crate under `examples/pyo3_sample/` has two `#[pyclass]` types in submodules `pyo3_sample.aa` and `pyo3_sample.bb`, with methods that return the other type (to exercise cross-stub imports). After:
+The `examples/` directory contains several self-contained sample projects, each demonstrating different Rylai features:
+
+| Example | What it demonstrates |
+|---|---|
+| `basic_function_sample` | `#[pyfunction]`, `#[pyo3(name = "...")]` rename, `#[pyclass]`, `create_exception!` |
+| `cross_module_sample` | `#[pyclass(module = "...")]` with cross-module imports, `[[add_content]]` |
+| `override_sample` | `[[override]]` via `stub` and via `param_types` / `return_type`, `[[add_content]]` |
+| `macro_expand_sample` | `[[macro_expand]]` auto-discover and explicit modes |
+
+#### Regenerating all example stubs
+
+Install [just](https://github.com/casey/just), then run:
 
 ```bash
-cargo run -- examples/pyo3_sample --output examples/pyo3_sample/python/pyo3_sample
+just gen-pyi-examples
 ```
 
-you get `pyo3_sample.pyi` (top-level functions) together with `aa.pyi` and `bb.pyi` in the output directory. Submodule stubs use absolute imports such as `from pyo3_sample.bb import B` so Pyright/mypy resolve `pyo3_sample.aa` / `pyo3_sample.bb`. For example `aa.pyi` contains:
-
-```python
-from pyo3_sample.bb import B
-
-__all__ = [
-    "A",
-]
-
-@t.final
-class A:
-    def make_b(self) -> B: ...
-```
-
-See `examples/pyo3_sample/src/lib.rs` for the full Rust source.
-
-The sample also declares `pyo3::create_exception!(pyo3_sample, SampleError, PyValueError)` at crate scope and re-exports it from the pymodule; the generated `pyo3_sample.pyi` includes:
-
-```python
-class SampleError(ValueError): ...
-```
-
-alongside `__all__` and the other symbols. Generated exception classes are not marked `@t.final` so they stay subclassable in stubs.
+This regenerates `.pyi` files for every example. CI checks that the committed stubs match the generated output; if they differ, CI fails.
 
 ### Multi-module stubs (`#[pyclass(module = "...")]`)
 
