@@ -45,6 +45,7 @@ pub fn apply_add_content(
             AddContentLocation::Head => heads.push(c),
             AddContentLocation::AfterImportTyping => mids.push(c),
             AddContentLocation::Tail => tails.push(c),
+            AddContentLocation::File => continue,
         }
     }
 
@@ -234,5 +235,21 @@ mod tests {
             &[entry("m.pyi", AddContentLocation::AfterImportTyping, "y")],
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn file_location_is_noop() {
+        let stub = format!("{}\n\nx = 1\n", TYPING_IMPORT_LINE);
+        let out = apply_add_content(
+            stub.as_str(),
+            Path::new("m.pyi"),
+            &[entry(
+                "m.pyi",
+                AddContentLocation::File,
+                "replaced content\n",
+            )],
+        )
+        .unwrap();
+        assert_eq!(out, stub);
     }
 }

@@ -179,6 +179,8 @@ pub enum AddContentLocation {
     AfterImportTyping,
     /// At end of file.
     Tail,
+    /// Write `content` as the complete file (replaces any generated stub; creates the file if new).
+    File,
 }
 
 /// Per-file `__all__` customisation rules (from `[[all]]` in rylai.toml).
@@ -287,30 +289,75 @@ pub fn canonical_stub_rel_path(p: &Path) -> PathBuf {
     p.components().collect()
 }
 
-/// Every `add_content` entry must refer to a `.pyi` that is generated in this run.
-pub fn validate_add_content_targets(
+#[derive(Debug)]
+pub struct ValidatedAddContent {
+    /// Paths with `location = "file"` that also match a generated stub.
+    /// These stubs will be completely replaced by the entry's `content`.
+    pub replaced_stub_paths: Vec<PathBuf>,
+    /// Paths with `location = "file"` that do NOT match any generated stub.
+    /// These are new files to create under `-o`.
+    pub new_file_paths: Vec<PathBuf>,
+}
+
+/// Validate `[[add_content]]` entries against the set of generated stub paths.
+///
+/// Rules:
+/// - Non-`file` entries must target a generated stub path.
+/// - `file` entries may target any path (generated or new).
+/// - A path with `location = "file"` must have exactly one entry (no mixing with other locations).
+pub fn validate_add_content(
     entries: &[AddContentEntry],
     generated_rel_paths: &[PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ValidatedAddContent> {
     use anyhow::bail;
     if entries.is_empty() {
-        return Ok(());
+        return Ok(ValidatedAddContent {
+            replaced_stub_paths: Vec::new(),
+            new_file_paths: Vec::new(),
+        });
     }
-    let set: HashSet<PathBuf> = generated_rel_paths
+    let generated_set: HashSet<PathBuf> = generated_rel_paths
         .iter()
         .map(|p| canonical_stub_rel_path(p))
         .collect();
+
+    let mut groups: HashMap<PathBuf, Vec<&AddContentEntry>> = HashMap::new();
     for e in entries {
         let p = normalize_add_content_file(&e.file)?;
         let key = canonical_stub_rel_path(&p);
-        if !set.contains(&key) {
+        groups.entry(key).or_default().push(e);
+    }
+
+    let mut replaced_stub_paths = Vec::new();
+    let mut new_file_paths = Vec::new();
+
+    for (key, group) in &groups {
+        let has_file = group.iter().any(|e| e.location == AddContentLocation::File);
+        if has_file {
+            if group.len() != 1 {
+                bail!(
+                    "add_content: file {:?} has {} entries but location = \"file\" requires exactly one",
+                    key,
+                    group.len()
+                );
+            }
+            if generated_set.contains(key) {
+                replaced_stub_paths.push(key.clone());
+            } else {
+                new_file_paths.push(key.clone());
+            }
+        } else if !generated_set.contains(key) {
             bail!(
-                "add_content: no stub generated for file = {:?} (check -o and package layout)",
-                e.file
+                "add_content: no stub generated for file = {:?} (use location = \"file\" to create new files)",
+                key
             );
         }
     }
-    Ok(())
+
+    Ok(ValidatedAddContent {
+        replaced_stub_paths,
+        new_file_paths,
+    })
 }
 
 /// Version-specific rendering decisions, computed once from the configured Python version
@@ -947,6 +994,31 @@ content = "x"
     }
 
     #[test]
+    fn load_merged_parses_add_content_file_location() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rylai_toml = dir.path().join("rylai_file_loc.toml");
+        let pyproject = dir.path().join("pyproject_absent_file_loc.toml");
+        {
+            let mut f = std::fs::File::create(&rylai_toml).expect("create");
+            write!(
+                f,
+                r#"
+[[add_content]]
+file = "new_module.pyi"
+location = "file"
+content = "x: int = 1\n"
+"#
+            )
+            .expect("write");
+        }
+        let config = Config::load_merged(&rylai_toml, &pyproject).expect("valid toml must parse");
+        assert_eq!(config.add_content.len(), 1);
+        assert_eq!(config.add_content[0].location, AddContentLocation::File);
+        assert_eq!(config.add_content[0].file, "new_module.pyi");
+    }
+
+    #[test]
     fn normalize_add_content_file_appends_pyi() {
         assert_eq!(
             normalize_add_content_file("foo/bar").unwrap(),
@@ -961,29 +1033,114 @@ content = "x"
     }
 
     #[test]
-    fn validate_add_content_targets_errors_when_missing() {
+    fn validate_file_location_creates_new_file() {
         let entries = vec![AddContentEntry {
             file: "only.pyi".to_string(),
-            location: AddContentLocation::Tail,
+            location: AddContentLocation::File,
             content: "pass\n".to_string(),
         }];
-        let err =
-            validate_add_content_targets(&entries, &[PathBuf::from("other.pyi")]).unwrap_err();
-        assert!(
-            err.to_string().contains("only.pyi") || err.to_string().contains("no stub"),
-            "got: {err}"
-        );
+        let v = validate_add_content(&entries, &[PathBuf::from("other.pyi")]).expect("ok");
+        assert!(v.replaced_stub_paths.is_empty());
+        assert_eq!(v.new_file_paths, vec![PathBuf::from("only.pyi")]);
     }
 
     #[test]
-    fn validate_add_content_targets_ok_when_matched() {
+    fn validate_file_location_replaces_generated_stub() {
+        let entries = vec![AddContentEntry {
+            file: "pkg/a.pyi".to_string(),
+            location: AddContentLocation::File,
+            content: "replaced\n".to_string(),
+        }];
+        let v = validate_add_content(&entries, &[PathBuf::from("pkg").join("a.pyi")]).expect("ok");
+        assert_eq!(v.replaced_stub_paths, vec![PathBuf::from("pkg/a.pyi")]);
+        assert!(v.new_file_paths.is_empty());
+    }
+
+    #[test]
+    fn validate_non_file_location_matches_generated_stub() {
         let entries = vec![AddContentEntry {
             file: "pkg/a.pyi".to_string(),
             location: AddContentLocation::Tail,
             content: "pass\n".to_string(),
         }];
-        validate_add_content_targets(&entries, &[PathBuf::from("pkg").join("a.pyi")])
-            .expect("same logical path");
+        let v = validate_add_content(&entries, &[PathBuf::from("pkg").join("a.pyi")]).expect("ok");
+        assert!(v.replaced_stub_paths.is_empty());
+        assert!(v.new_file_paths.is_empty());
+    }
+
+    #[test]
+    fn validate_non_file_location_errors_for_non_generated_path() {
+        let entries = vec![AddContentEntry {
+            file: "only.pyi".to_string(),
+            location: AddContentLocation::Tail,
+            content: "pass\n".to_string(),
+        }];
+        let err = validate_add_content(&entries, &[PathBuf::from("other.pyi")]).unwrap_err();
+        assert!(
+            err.to_string().contains("only.pyi") && err.to_string().contains("location = \"file\""),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_file_location_errors_on_duplicate() {
+        let entries = vec![
+            AddContentEntry {
+                file: "extra.pyi".to_string(),
+                location: AddContentLocation::File,
+                content: "a\n".to_string(),
+            },
+            AddContentEntry {
+                file: "extra.pyi".to_string(),
+                location: AddContentLocation::File,
+                content: "b\n".to_string(),
+            },
+        ];
+        let err = validate_add_content(&entries, &[PathBuf::from("main.pyi")]).unwrap_err();
+        assert!(
+            err.to_string().contains("extra.pyi") && err.to_string().contains("exactly one"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_file_location_errors_when_mixed_with_other_locations() {
+        let entries = vec![
+            AddContentEntry {
+                file: "extra.pyi".to_string(),
+                location: AddContentLocation::File,
+                content: "a\n".to_string(),
+            },
+            AddContentEntry {
+                file: "extra.pyi".to_string(),
+                location: AddContentLocation::Tail,
+                content: "b\n".to_string(),
+            },
+        ];
+        let err = validate_add_content(&entries, &[PathBuf::from("main.pyi")]).unwrap_err();
+        assert!(
+            err.to_string().contains("extra.pyi") && err.to_string().contains("exactly one"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_multiple_non_file_locations_for_same_generated_stub() {
+        let entries = vec![
+            AddContentEntry {
+                file: "main.pyi".to_string(),
+                location: AddContentLocation::Head,
+                content: "a\n".to_string(),
+            },
+            AddContentEntry {
+                file: "main.pyi".to_string(),
+                location: AddContentLocation::Tail,
+                content: "b\n".to_string(),
+            },
+        ];
+        let v = validate_add_content(&entries, &[PathBuf::from("main.pyi")]).expect("ok");
+        assert!(v.replaced_stub_paths.is_empty());
+        assert!(v.new_file_paths.is_empty());
     }
 
     #[test]

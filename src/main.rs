@@ -59,33 +59,40 @@ fn main() -> Result<()> {
 
     let mut generated_paths: Vec<PathBuf> = Vec::new();
 
-    if items.is_empty() {
+    let validated = if items.is_empty() {
         // No pymodules found: write an empty stub using the best-guess name
         let name = infer_module_name_from_pyproject(&cli.crate_root)
             .or_else(|| infer_module_name_from_cargo(&cli.crate_root))
             .unwrap_or_else(|| "stub".to_string());
         let rel = PathBuf::from(format!("{name}.pyi"));
-        config::validate_add_content_targets(&config.add_content, std::slice::from_ref(&rel))?;
+        let v = config::validate_add_content(&config.add_content, std::slice::from_ref(&rel))?;
         let path = out_dir.join(format!("{name}.pyi"));
-        let stub = generator::generate_with_known_classes(
-            &items,
-            &config,
-            &known_classes,
-            &pre_warnings,
-            None,
-            Some(&rel),
-        )?;
-        let stub = add_content::apply_add_content(&stub, &rel, &config.add_content)?;
-        std::fs::write(&path, stub)?;
-        println!("Generated: {}", path.display());
+        if v.replaced_stub_paths
+            .contains(&config::canonical_stub_rel_path(&rel))
+        {
+            write_file_entry(&config, &rel, &path, true)?;
+        } else {
+            let stub = generator::generate_with_known_classes(
+                &items,
+                &config,
+                &known_classes,
+                &pre_warnings,
+                None,
+                Some(&rel),
+            )?;
+            let stub = add_content::apply_add_content(&stub, &rel, &config.add_content)?;
+            std::fs::write(&path, stub)?;
+            println!("Generated: {}", path.display());
+        }
         generated_paths.push(path);
+        v
     } else {
         // Resolve layout: one or more (path, PyModule) per top-level pymodule (package mode when
         // #[pyclass(module = "...")] is used). Functions/constants/unannotated classes use the root stub.
         let output_specs = output_layout::resolve(items.clone());
         let generated_rel_paths: Vec<PathBuf> =
             output_specs.iter().map(|(p, _)| p.clone()).collect();
-        config::validate_add_content_targets(&config.add_content, &generated_rel_paths)?;
+        let v = config::validate_add_content(&config.add_content, &generated_rel_paths)?;
         let class_defining_modules = output_layout::rust_class_defining_modules(&items);
         let mut seen_output_paths: HashSet<PathBuf> = HashSet::new();
         for (idx, (rel_path, stub_module)) in output_specs.into_iter().enumerate() {
@@ -101,31 +108,79 @@ fn main() -> Result<()> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let empty: &[String] = &[];
-            let warnings = if idx == 0 {
-                pre_warnings.as_slice()
+            let canonical = config::canonical_stub_rel_path(&rel_path);
+            if v.replaced_stub_paths.contains(&canonical) {
+                write_file_entry(&config, &rel_path, &path, true)?;
             } else {
-                empty
-            };
-            let stub = generator::generate_with_known_classes(
-                std::slice::from_ref(&stub_module),
-                &config,
-                &known_classes,
-                warnings,
-                Some((stub_module.name.as_str(), &class_defining_modules)),
-                Some(&rel_path),
-            )?;
-            let stub = add_content::apply_add_content(&stub, &rel_path, &config.add_content)?;
-            std::fs::write(&path, stub)?;
-            println!("Generated: {}", path.display());
+                let empty: &[String] = &[];
+                let warnings = if idx == 0 {
+                    pre_warnings.as_slice()
+                } else {
+                    empty
+                };
+                let stub = generator::generate_with_known_classes(
+                    std::slice::from_ref(&stub_module),
+                    &config,
+                    &known_classes,
+                    warnings,
+                    Some((stub_module.name.as_str(), &class_defining_modules)),
+                    Some(&rel_path),
+                )?;
+                let stub = add_content::apply_add_content(&stub, &rel_path, &config.add_content)?;
+                std::fs::write(&path, stub)?;
+                println!("Generated: {}", path.display());
+            }
             generated_paths.push(path);
         }
+        v
+    };
+
+    // Create new files from location = "file" entries that don't match any generated stub.
+    for rel_path in &validated.new_file_paths {
+        let path = join_output_path(&out_dir, rel_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_file_entry(&config, rel_path, &path, false)?;
+        generated_paths.push(path);
     }
 
     if !config.format.is_empty() && !generated_paths.is_empty() {
         run_format_commands(&config.format, &generated_paths)?;
     }
 
+    Ok(())
+}
+
+/// Write a `location = "file"` add_content entry to disk.
+/// If `warn_replace` is true, the entry replaces a generated stub — print a warning.
+fn write_file_entry(
+    config: &config::Config,
+    rel_path: &Path,
+    path: &Path,
+    warn_replace: bool,
+) -> Result<()> {
+    let entry = config
+        .add_content
+        .iter()
+        .find(|e| {
+            config::normalize_add_content_file(&e.file).is_ok_and(|p| {
+                config::canonical_stub_rel_path(&p) == config::canonical_stub_rel_path(rel_path)
+            })
+        })
+        .expect("validate_add_content guarantees one entry per path");
+    if warn_replace {
+        eprintln!(
+            "warning: add_content with location = \"file\" replaces generated stub: {}",
+            path.display()
+        );
+    }
+    let mut content = entry.content.clone();
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    std::fs::write(path, content)?;
+    println!("Generated: {}", path.display());
     Ok(())
 }
 

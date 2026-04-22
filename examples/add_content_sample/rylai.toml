@@ -1,0 +1,24 @@
+format = [
+    "uvx ruff format",
+    "uvx ruff check --select I --fix",
+    "uvx ruff check --select F401 --fix",
+]
+
+# Append a note at the end of the generated stub.
+[[add_content]]
+file = "add_content_sample.pyi"
+location = "tail"
+content = '''
+# Extended with add_content: see extra_types.pyi for the Point type alias.
+'''
+
+# Create a standalone .pyi file that does not correspond to any Rust module.
+# location = "file" writes content as-is, creating the file if it doesn't exist.
+[[add_content]]
+file = "extra_types.pyi"
+location = "file"
+content = '''
+Point = tuple[float, float]
+
+__all__ = ["Point"]
+'''

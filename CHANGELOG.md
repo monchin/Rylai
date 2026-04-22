@@ -9,8 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Macro expansion pre-pass for declarative macros: configure `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` so Rylai expands matched macro invocations before `syn` parsing, allowing wrapped `add_class` / `add_function` registrations to be collected.
+- Macro expansion pre-pass for declarative macros: configure `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` so Rylai expands matched macro invocations before `syn` parsing, allowing wrapped `add_class` / `add_function` registrations to be collected. (#3)
 - **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`**: macros (file-level or inside `#[pymodule]`) are collected and emitted as Python exception classes in the matching stub. (#2)
+- `location = "file"` for `[[add_content]]`: write `content` as the complete file instead of splicing into a generated stub. Creates a new `.pyi` file under `-o` if the path doesn't match any generated stub, or completely replaces the generated stub if it does (with a warning). Only one entry per file is allowed when `location = "file"`, and it cannot be mixed with other locations for the same file. Content is written verbatim — no banner or `import typing as t` is added.
+- `examples/add_content_sample`: new example demonstrating `tail` location and `location = "file"` to create standalone `.pyi` files.
+
+### Changed
+
+- Examples reorganized by feature: `examples/` now contains `add_content_sample`, `basic_function_sample`, `cross_module_sample`, `override_sample`, and `macro_expand_sample` — each focused on a specific Rylai feature. (#4)
+- Non-`file` `[[add_content]]` entries that reference a path not matching any generated stub now produce an error (previously the behavior was undefined). Use `location = "file"` to create new files.
 
 ## [0.3.4] - 2026-04-09
 
