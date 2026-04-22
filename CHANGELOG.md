@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-22
+
 ### Added
 
 - Macro expansion pre-pass for declarative macros: configure `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` so Rylai expands matched macro invocations before `syn` parsing, allowing wrapped `add_class` / `add_function` registrations to be collected. (#3)
@@ -96,7 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/monchin/Rylai/releases/tag/v0.4.0
 [0.3.4]: https://github.com/monchin/Rylai/releases/tag/v0.3.4
 [0.3.3]: https://github.com/monchin/Rylai/releases/tag/v0.3.3
 [0.3.2]: https://github.com/monchin/Rylai/releases/tag/v0.3.2
