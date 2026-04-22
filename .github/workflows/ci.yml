@@ -40,6 +40,29 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  coverage:
+    name: Coverage (≥ 85%)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --summary-only --fail-under-lines 85
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

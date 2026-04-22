@@ -102,3 +102,317 @@ pub fn collect_crate(crate_root: &Path, config: &Config) -> Result<(Vec<PyModule
     all_warnings.extend(parse_warnings.into_inner());
     Ok((modules, all_warnings))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn write_file(base: &Path, rel: &str, content: &str) {
+        let p = base.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, content).unwrap();
+    }
+
+    #[test]
+    fn collect_crate_basic_style_a_module() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "src/lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pymodule]
+mod my_module {
+    use pyo3::prelude::*;
+
+    #[pyfunction]
+    fn greet(name: &str) -> String {
+        format!("Hello, {}!", name)
+    }
+
+    #[pyfunction]
+    fn add(a: i64, b: i64) -> i64 {
+        a + b
+    }
+}
+"#,
+        );
+        let config = Config::default();
+        let (modules, warnings) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "my_module");
+        assert!(warnings.is_empty());
+        let fns: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PyItem::Function(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fns.len(), 2);
+        assert!(fns.contains(&"greet".to_string()));
+        assert!(fns.contains(&"add".to_string()));
+    }
+
+    #[test]
+    fn collect_crate_no_src_dir_falls_back_to_crate_root() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pymodule]
+mod root_mod {
+    use pyo3::prelude::*;
+
+    #[pyfunction]
+    fn foo() -> i32 { 42 }
+}
+"#,
+        );
+        let config = Config::default();
+        let (modules, _) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "root_mod");
+    }
+
+    #[test]
+    fn collect_crate_empty_crate_returns_no_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/README.md"), "not rust").unwrap();
+        let config = Config::default();
+        let (modules, warnings) = collect_crate(dir.path(), &config).unwrap();
+        assert!(modules.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn collect_crate_invalid_rust_syntax_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/lib.rs", "this is not valid rust <<<");
+        let config = Config::default();
+        assert!(collect_crate(dir.path(), &config).is_err());
+    }
+
+    #[test]
+    fn collect_crate_pyclass_with_pymethods() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "src/lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pymodule]
+mod animals {
+    use pyo3::prelude::*;
+
+    #[pyclass]
+    pub struct Dog {
+        name: String,
+    }
+
+    #[pymethods]
+    impl Dog {
+        #[new]
+        fn new(name: String) -> Self {
+            Self { name }
+        }
+
+        fn bark(&self) -> String {
+            format!("{} says woof!", self.name)
+        }
+    }
+}
+"#,
+        );
+        let config = Config::default();
+        let (modules, warnings) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert!(warnings.is_empty());
+        let classes: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PyItem::Class(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].name, "Dog");
+        assert!(
+            classes[0].methods.len() >= 2,
+            "expected new + bark, got {:?}",
+            classes[0].methods
+        );
+    }
+
+    #[test]
+    fn collect_crate_style_b_module() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "src/lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pyclass]
+pub struct Counter;
+
+#[pymethods]
+impl Counter {
+    #[new]
+    fn new() -> Self { Self }
+
+    fn value(&self) -> i64 { 0 }
+}
+
+#[pyfunction]
+fn double(x: i64) -> i64 {
+    x * 2
+}
+
+#[pymodule]
+fn my_counter(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Counter>()?;
+    m.add_function(wrap_pyfunction!(double, m)?)?;
+    Ok(())
+}
+"#,
+        );
+        let config = Config::default();
+        let (modules, _) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "my_counter");
+        let classes: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PyItem::Class(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            classes.contains(&"Counter".to_string()),
+            "expected Counter class, got: {classes:?}"
+        );
+        let fns: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PyItem::Function(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fns.contains(&"double".to_string()),
+            "expected double function, got: {fns:?}"
+        );
+    }
+
+    #[test]
+    fn collect_crate_with_macro_expand() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "src/lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+macro_rules! register {
+    ($($cls:ty),* $(,)?) => {
+        $(add_class::<$cls>()?;)*
+    };
+}
+
+#[pyclass]
+pub struct Foo;
+
+#[pymethods]
+impl Foo {
+    #[new]
+    fn new() -> Self { Self }
+}
+
+#[pymodule]
+fn expanded_mod(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register!(Foo);
+    Ok(())
+}
+"#,
+        );
+        let mut config = Config::default();
+        config.macro_expand.push(crate::config::MacroExpandEntry {
+            name: "register".to_string(),
+            from: None,
+            to: None,
+        });
+        let (modules, warnings) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "expanded_mod");
+        assert!(
+            warnings.is_empty(),
+            "macro expansion should not produce warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_crate_multiple_rs_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "src/lib.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pymodule]
+mod multi_file {
+    use pyo3::prelude::*;
+
+    #[pyfunction]
+    fn top_fn() -> i32 { 1 }
+}
+"#,
+        );
+        write_file(
+            dir.path(),
+            "src/extra.rs",
+            r#"
+use pyo3::prelude::*;
+
+#[pyclass]
+pub struct Extra;
+
+#[pymethods]
+impl Extra {
+    #[new]
+    fn new() -> Self { Self }
+}
+"#,
+        );
+        let config = Config::default();
+        let (modules, _) = collect_crate(dir.path(), &config).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "multi_file");
+        let fns: Vec<_> = modules[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                PyItem::Function(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fns.contains(&"top_fn".to_string()),
+            "expected top_fn in multi_file module, got: {fns:?}"
+        );
+    }
+}

@@ -467,4 +467,98 @@ fn setup() -> PyResult<()> {
         assert!(output.contains("add_class"), "missing add_class: {output}");
         assert!(output.contains("Foo"), "missing Foo: {output}");
     }
+
+    // ── Error paths & edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn build_macro_rules_rejects_mismatched_from_to() {
+        for (from, to) in [
+            (Some("$x:expr".to_string()), None),
+            (None, Some("{ $x }".to_string())),
+        ] {
+            let entry = MacroExpandEntry {
+                name: "bad".to_string(),
+                from,
+                to,
+            };
+            let err = build_macro_rules(&[entry], &[], None).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("must both be present or both absent"),
+                "expected mismatched from/to error, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_source_empty_rules_returns_original() {
+        let src = "fn main() {}";
+        let result = expand_source(src, &[]).unwrap();
+        assert_eq!(result, src);
+    }
+
+    #[test]
+    fn build_and_expand_brace_delimiter() {
+        let rules = build_rules_for_explicit("m", "$x:expr", "result($x)").expect("build rules");
+        let expanded = expand_source("m!{hello}", &rules).expect("expand");
+        assert!(
+            expanded.contains("hello"),
+            "brace call expanded: {expanded}"
+        );
+        assert!(!expanded.contains("m!"), "macro call replaced: {expanded}");
+    }
+
+    #[test]
+    fn build_macro_rules_auto_discover_not_found_error_wraps_context() {
+        let entry = MacroExpandEntry {
+            name: "absent_macro".to_string(),
+            from: None,
+            to: None,
+        };
+        let sources = vec![(PathBuf::from("lib.rs"), "fn main() {}".to_string())];
+        let err = build_macro_rules(&[entry], &sources, None).unwrap_err();
+        assert!(
+            err.to_string().contains("absent_macro"),
+            "error should mention macro name: {err}"
+        );
+    }
+
+    #[test]
+    fn discover_macro_arms_extract_failure_errors() {
+        // A macro_rules! whose body is not in the expected Group => Group format
+        // will yield no arms, causing discover_macro_arms to bail.
+        let src = r#"
+macro_rules! weird {
+    not_a_group => also_not_group
+}
+"#;
+        let sources = vec![(PathBuf::from("lib.rs"), src.to_string())];
+        let err = discover_macro_arms("weird", &sources, None).unwrap_err();
+        assert!(
+            err.to_string().contains("weird"),
+            "error should mention macro name: {err}"
+        );
+    }
+
+    #[test]
+    fn build_macro_rules_multiple_entries_produce_combined_rules() {
+        let entries = vec![
+            MacroExpandEntry {
+                name: "a".to_string(),
+                from: Some("$x:expr".to_string()),
+                to: Some("a_out($x)".to_string()),
+            },
+            MacroExpandEntry {
+                name: "b".to_string(),
+                from: Some("$y:expr".to_string()),
+                to: Some("b_out($y)".to_string()),
+            },
+        ];
+        let rules = build_macro_rules(&entries, &[], None).expect("build rules");
+        // Each entry produces 3 rules (one per delimiter), so 6 total
+        assert_eq!(rules.len(), 6);
+        let expanded = expand_source("a!(1) + b!(2)", &rules).expect("expand");
+        assert!(expanded.contains("a_out"), "a expanded: {expanded}");
+        assert!(expanded.contains("b_out"), "b expanded: {expanded}");
+    }
 }
