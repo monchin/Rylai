@@ -2,30 +2,114 @@
 
 [![CI](https://github.com/monchin/Rylai/actions/workflows/ci.yml/badge.svg)](https://github.com/monchin/Rylai/actions/workflows/ci.yml)
 
-Generate Python `.pyi` stub files from [pyo3](https://github.com/PyO3/pyo3)-annotated Rust source code — **statically, without compilation**.
+Generate Python `.pyi` stub files from [PyO3](https://pyo3.rs)-annotated Rust source code — **statically, without compilation**.
 
-## Features
+If you're writing a Python extension in Rust with PyO3, Rylai reads your `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations and produces type stubs that IDEs and type checkers (mypy, Pyright, ty, etc.) can understand — so your Rust-backed module gets proper autocomplete, type hints, and inline documentation in Python.
 
-- Parses `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations directly from Rust source
-- Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]` or `t.List[T]` depending on `python_version`, `Option<T>` → `T | None` or `t.Optional[T]`, etc.)
-- Extracts doc comments and emits them as Python docstrings
-- Generates one `.pyi` file per top-level `#[pymodule]`; when classes use `#[pyclass(module = "...")]`, emits additional sibling `.pyi` files under `-o` (first module segment is implicit) so type checkers and runtime `__module__` agree
-- Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics `list[T]` / `dict[...]` / … for ≥ 3.9, `t.List` / `t.Dict` / … for 3.8; `t.Self` for ≥ 3.11; stubs always include `import typing as t` for consistent `[[add_content]]` placement)
-- Generates `__all__` in every stub listing public top-level exports; names starting with `_` are excluded by default; configurable globally and per file via `[[all]]`
-- Parses **`create_exception!`** / **`pyo3::create_exception!(module, Name, Base)`** ([PyO3 custom exceptions](https://pyo3.rs/main/exception)): emits matching `class Name(Base): ...` stubs in the pymodule file; the first macro argument must be the pymodule’s Python-visible name (`#[pymodule(name = "...")]`, `#[pyo3(name = "...")]`, or the Rust identifier). Builtin `pyo3::exceptions::Py*` bases map to stdlib exception names; chaining another `create_exception!` type uses that class name as the base
-- Optional `[[add_content]]`: inject extra Python (e.g. version branches, shared type aliases) into specific generated `.pyi` files by path under `-o`; use `location = "file"` to create standalone `.pyi` files that don't correspond to any Rust module
-- Optional `[[macro_expand]]`: expand configured `macro_rules!` invocations before AST parsing so wrapped `add_class` / `add_function` calls can be collected
-- Zero-config by default; optionally configured via `rylai.toml`
+## At a Glance
+
+Write Rust with PyO3 annotations:
+
+```rust
+#[pymodule]
+mod my_crate {
+    use pyo3::prelude::*;
+
+    /// Formats the sum of two numbers as string.
+    #[pyfunction]
+    fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
+        Ok((a + b).to_string())
+    }
+
+    #[pyclass]
+    pub struct Counter { value: u64 }
+
+    #[pymethods]
+    impl Counter {
+        #[new]
+        fn new() -> Self { Self { value: 0 } }
+    }
+}
+```
+
+Run `rylai`:
+
+```bash
+rylai path/to/my_crate
+```
+
+Get a `.pyi` stub:
+
+```python
+import typing as t
+
+__all__ = ["sum_as_string", "Counter"]
+
+def sum_as_string(a: int, b: int) -> str:
+    """Formats the sum of two numbers as string."""
+
+@t.final
+class Counter:
+    def __init__(self) -> None: ...
+```
+
+Rust types are mapped to Python types automatically — `usize` → `int`, `PyResult<String>` → `str`, and so on. Doc comments become Python docstrings.
+
+## Quick Start
+
+```bash
+# 1. Run on your PyO3 crate (no install needed if you have uv)
+uvx rylai path/to/my_crate
+
+#    Or install first:
+# cargo install rylai
+# rylai path/to/my_crate
+
+# 2. Stubs are written next to Cargo.toml by default.
+#    Use --output to put them somewhere else:
+uvx rylai path/to/my_crate --output path/to/stubs/
+```
+
+No configuration required. Point it at a crate and it works.
+
+To try it with the bundled example:
+
+```bash
+git clone https://github.com/monchin/Rylai.git
+cd Rylai
+cargo run -- examples/basic_function_sample --output examples/basic_function_sample/python/basic_function_sample
+```
 
 ## Why Rylai?
 
 Compared with other tools that generate `.pyi` stubs for PyO3 projects, Rylai offers:
 
-- **No compilation** — Rylai parses Rust source code directly (via [syn](https://github.com/dtolnay/syn)). You don’t need to build the crate or depend on compiled artifacts, so stub generation is fast and works even when the project doesn’t compile (e.g. missing native deps or wrong toolchain).
+- **No compilation** — Rylai parses Rust source code directly (via [syn](https://github.com/dtolnay/syn)). You don't need to build the crate or depend on compiled artifacts, so stub generation is fast and works even when the project doesn't compile (e.g. missing native deps or wrong toolchain).
 - **No code changes** — No need to add build scripts, `#[cfg]` blocks, or extra annotations to your Rust code. Point Rylai at your crate root and it reads existing `#[pymodule]` / `#[pyfunction]` / `#[pyclass]` and `create_exception!` macros as-is.
-- **No Python version lock-in** — Stubs are plain text. You generate them once and use them with any Python version; there’s no dependency on a specific Python interpreter or ABI, so you avoid “built for Python 3.x” issues and cross-version workflows stay simple.
+- **No Python version lock-in** — Stubs are plain text. You generate them once and use them with any Python version; there's no dependency on a specific Python interpreter or ABI, so you avoid "built for Python 3.x" issues and cross-version workflows stay simple.
 
 Together, this makes Rylai easy to integrate into CI, docs, or local dev without touching your PyO3 code or your Python environment.
+
+## Features
+
+**Core:**
+
+- Parses `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations directly from Rust source
+- Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]`, `Option<T>` → `T | None`, etc.)
+- Extracts doc comments and emits them as Python docstrings
+- Zero-config by default; optionally configured via `rylai.toml`
+
+**Advanced:**
+
+- Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics for ≥ 3.9; `t.Self` for ≥ 3.11)
+- `create_exception!` / `pyo3::create_exception!` support — emits matching `class Name(Base): ...` stubs
+- Generates `__all__` in every stub; configurable globally and per file
+- Multi-module stubs via `#[pyclass(module = "...")]` with automatic cross-module imports
+- `[[override]]` to replace or tweak specific generated signatures
+- `[[add_content]]` to inject custom Python into generated `.pyi` files
+- `[[macro_expand]]` to expand `macro_rules!` invocations before parsing
+- Custom Rust → Python type mapping via `[type_map]`
+- Post-generation formatting via `format` commands (e.g. ruff)
 
 ## Installation
 
@@ -33,10 +117,10 @@ Choose one of the following:
 
 | Method | Command | Notes |
 |--------|---------|--------|
+| **uvx** | `uvx rylai` | Run without installing. Recommended if you have [uv](https://docs.astral.sh/uv/) |
+| **uv** | `uv tool install rylai` | Install to uv tools dir; requires [uv](https://docs.astral.sh/uv/) |
 | **Cargo** | `cargo install rylai` | Build from source and install to `~/.cargo/bin` |
-| **uv** | `uv tool install rylai` | Install to uv tools dir; requires [publish to PyPI](https://pypi.org/project/rylai/) first |
-| **uvx** | `uvx rylai` | Run without installing (same as uv; requires PyPI release) |
-| **crgx** | `crgx rylai` | Run pre-built binary without compiling; requires [crgx](https://github.com/yfedoseev/crgx) and a GitHub Release |
+| **crgx** | `crgx rylai` | Run pre-built binary without compiling; requires [crgx](https://github.com/yfedoseev/crgx) |
 
 For local development:
 
@@ -46,13 +130,13 @@ cargo install --path .
 
 ## Usage
 
-The path you pass is the **project root** — the folder that contains `Cargo.toml` (and usually a `src/` directory). Rylai scans all `.rs` files under that project’s `src/` and uses the root for `rylai.toml`, `pyproject.toml`, etc.
+The path you pass is the **project root** — the folder that contains `Cargo.toml` (and usually a `src/` directory). Rylai scans all `.rs` files under that project's `src/` and uses the root for `rylai.toml`, `pyproject.toml`, etc.
 
 ```bash
 # Run in the current directory (must be the project root with Cargo.toml)
 rylai
 
-# Specify the project root explicitly (folder containing Cargo.toml)
+# Specify the project root explicitly
 rylai path/to/my_crate
 
 # Write stubs to a custom output directory
@@ -62,31 +146,17 @@ rylai path/to/my_crate --output path/to/out/
 rylai --config path/to/rylai.toml
 ```
 
-### For developers (this repo)
-
-You don’t need to install the binary. Use **`cargo run`** and pass arguments after `--`:
-
-```bash
-# Run on a single example
-cargo run -- examples/basic_function_sample --output examples/basic_function_sample/python/basic_function_sample
-
-# Show help
-cargo run -- --help
-```
-
-Anything after `--` is forwarded to the `rylai` binary.
-
 ### Examples
 
 The `examples/` directory contains several self-contained sample projects, each demonstrating different Rylai features:
 
-| Example | What it demonstrates |
-|---|---|
-| `add_content_sample` | `[[add_content]]` with `tail` location and `location = "file"` to create standalone `.pyi` files |
-| `basic_function_sample` | `#[pyfunction]`, `#[pyo3(name = "...")]` rename, `#[pyclass]`, `create_exception!` |
-| `cross_module_sample` | `#[pyclass(module = "...")]` with cross-module imports, `[[add_content]]` |
-| `override_sample` | `[[override]]` via `stub` and via `param_types` / `return_type`, `[[add_content]]` |
-| `macro_expand_sample` | `[[macro_expand]]` auto-discover and explicit modes |
+| Example | What it demonstrates | Try it |
+|---|---|---|
+| `basic_function_sample` | `#[pyfunction]`, `#[pyo3(name = "...")]` rename, `#[pyclass]`, `create_exception!` | `cargo run -- examples/basic_function_sample --output examples/basic_function_sample/python/basic_function_sample` |
+| `cross_module_sample` | `#[pyclass(module = "...")]` with cross-module imports, `[[add_content]]` | `cargo run -- examples/cross_module_sample --output examples/cross_module_sample/python/cross_module_sample` |
+| `override_sample` | `[[override]]` via `stub` and via `param_types` / `return_type`, `[[add_content]]` | `cargo run -- examples/override_sample --output examples/override_sample/python/override_sample` |
+| `add_content_sample` | `[[add_content]]` with `tail` location and `location = "file"` to create standalone `.pyi` files | `cargo run -- examples/add_content_sample --output examples/add_content_sample/python/add_content_sample` |
+| `macro_expand_sample` | `[[macro_expand]]` auto-discover and explicit modes | `cargo run -- examples/macro_expand_sample --output examples/macro_expand_sample/python/macro_expand_sample` |
 
 #### Regenerating all example stubs
 
@@ -98,27 +168,79 @@ just gen-pyi-examples
 
 This regenerates `.pyi` files for every example. CI checks that the committed stubs match the generated output; if they differ, CI fails.
 
-### Multi-module stubs (`#[pyclass(module = "...")]`)
+### For developers (this repo)
 
-If you annotate a class with PyO3’s `module` attribute, e.g. `#[pyclass(module = "abcd.efg")]`, Rylai will emit **multiple** `.pyi` files instead of a single flat stub. **`-o` is treated as the first segment of the Python module path** (the top-level `#[pymodule]` name). So for `-o stubs/` and pymodule `abcd`, submodule `abcd.efg` is written to **`stubs/efg.pyi`**, not `stubs/abcd/efg.pyi`. The root stub is **`stubs/abcd.pyi`**. Only deeper paths add folders after that first segment (e.g. `abcd.abcd.ff` → `abcd/ff.pyi` under `-o`; `abcd.abcd.abcd.gg` → `abcd/abcd/gg.pyi`). If `#[pyclass(module = "pkg.pkg")]` resolves to the same file as the root stub (`pkg.pyi`), those classes are merged into **`pkg.pyi`**. If no class has `module` set, behavior is unchanged: one `{name}.pyi` per top-level `#[pymodule]`. If everything is routed to submodules so the root stub would be empty, Rylai still writes `abcd.pyi` (possibly empty, but still carrying the pymodule docstring when present).
+You don't need to install the binary. Use **`cargo run`** and pass arguments after `--`:
 
-When `#[pyclass(module = "...")]` does **not** start with `{pymodule}.` (for example pymodule `_pkg` and `module = "pkg.abc"`), the extension name and the public Python package can differ: Rylai still collects items from that `#[pymodule]`, but emits those classes by dropping the **first** dotted segment of `module` (the public top-level package) and mirroring the rest under `-o` — e.g. `stubs/abc.pyi`, or `stubs/cba/foo.pyi` for `pkg.cba.foo`. `#[pyfunction]` and classes without `module` stay in `{pymodule}.pyi` (e.g. `stubs/_pkg.pyi`).
+```bash
+cargo run -- examples/basic_function_sample --output examples/basic_function_sample/python/basic_function_sample
+cargo run -- --help
+```
 
-When using `--output` / `-o`, you can point either at a **parent** directory (e.g. `stubs/` → `stubs/abcd.pyi` and `stubs/efg.pyi`) or directly at the **package directory** whose name matches the top-level `#[pymodule]` (e.g. `-o python/abcd` → `python/abcd/abcd.pyi` and `python/abcd/efg.pyi`). If two different layout paths still resolve to the same output file, Rylai reports a duplicate-path error; point `-o` at a parent directory so distinct stubs land on different paths.
+Anything after `--` is forwarded to the `rylai` binary.
 
-Runtime `__module__` for `pyfunction` / `m.add` may follow Maturin’s `module-name` (e.g. `abcd.abcd`), but Rylai still emits those symbols into the **top-level** `#[pymodule]` stub (`abcd.pyi`) together with any `#[pyclass]` that has **no** `module = "..."` attribute. Only classes with an explicit `#[pyclass(module = "...")]` are written to the matching submodule stub.
+## Multi-Module Stubs (`#[pyclass(module = "...")]`)
 
-When a stub references a `#[pyclass]` type that is emitted in **another** submodule (e.g. a return type uses a class defined under `abcd.ff` while generating `ee.pyi`), Rylai prepends absolute imports such as `from abcd.ff import SomeClass` (after `typing` / `pathlib` imports) so Pyright and mypy can resolve the name.
+When you use PyO3's `module` attribute on a class, Rylai emits multiple `.pyi` files instead of a single flat stub. Here's how it works:
+
+**Given this Rust code:**
+
+```rust
+#[pymodule]
+mod my_pkg {
+    #[pyclass(module = "my_pkg.sub_a")]
+    pub struct ClassA { ... }
+
+    #[pyclass(module = "my_pkg.sub_b")]
+    pub struct ClassB { ... }
+
+    #[pyfunction]
+    fn hello() -> String { ... }
+}
+```
+
+**Rylai generates this file structure** (with `-o stubs/`):
+
+```
+stubs/
+├── my_pkg.pyi        # hello() + imports for sub-modules
+├── sub_a.pyi         # ClassA
+└── sub_b.pyi         # ClassB
+```
+
+`-o` is treated as the first segment of the module path (the top-level `#[pymodule]` name). So for `-o stubs/` and pymodule `my_pkg`, submodule `my_pkg.sub_a` is written to `stubs/sub_a.pyi`, not `stubs/my_pkg/sub_a.pyi`.
+
+When a stub references a type from another submodule (e.g. a method in `ClassA` returns `ClassB`), Rylai automatically adds the correct import:
+
+```python
+# stubs/sub_a.pyi
+from my_pkg.sub_b import ClassB
+```
+
+<details>
+<summary><strong>Advanced: <code>-o</code> layouts and edge cases</strong></summary>
+
+**Pointing `-o` at a package directory.** You can point `-o` either at a parent directory (`stubs/` → `stubs/my_pkg.pyi`, `stubs/sub_a.pyi`) or directly at the package directory (`-o python/my_pkg` → `python/my_pkg/my_pkg.pyi`, `python/my_pkg/sub_a.pyi`). If two paths resolve to the same output file, Rylai reports a duplicate-path error; use a parent directory instead.
+
+**Pymodule name differs from public package.** When `#[pyclass(module = "...")]` does not start with `{pymodule}.` (e.g. pymodule `_pkg` but `module = "pkg.abc"`), Rylai emits those classes by dropping the first dotted segment and mirroring the rest under `-o` — e.g. `stubs/abc.pyi`. `#[pyfunction]` and classes without `module` stay in the pymodule stub (e.g. `stubs/_pkg.pyi`).
+
+**Classes in the root stub.** `#[pyfunction]` and `m.add` symbols are emitted into the top-level `#[pymodule]` stub (`my_pkg.pyi`), together with any `#[pyclass]` that has no `module = "..."` attribute. Only classes with an explicit `#[pyclass(module = "...")]` are written to submodule stubs.
+
+**Merging into root.** If `#[pyclass(module = "pkg.pkg")]` resolves to the same file as the root stub (`pkg.pyi`), those classes are merged into `pkg.pyi`. If everything is routed to submodules so the root stub would be empty, Rylai still writes it (possibly empty, but carrying the pymodule docstring when present).
+
+</details>
 
 ## Configuration
 
-Configure via **`rylai.toml`** (crate root) or **`[tool.rylai]`** in `pyproject.toml`. When both exist, duplicate keys in `rylai.toml` take precedence; array tables (`[[override]]`, `[[add_content]]`, `[[all]]`, `[[macro_expand]]`) are replaced as a whole, not merged item-by-item. All sections are optional.
+Rylai works out of the box with no configuration. All options below are optional — only set them when you need to customize behavior.
+
+Configure via **`rylai.toml`** (crate root) or **`[tool.rylai]`** in `pyproject.toml`. When both exist, duplicate keys in `rylai.toml` take precedence; array tables (`[[override]]`, `[[add_content]]`, `[[all]]`, `[[macro_expand]]`) are replaced as a whole, not merged item-by-item.
 
 Root-level keys (e.g. `format`) should appear before any `[section]` or `[[array]]` to avoid being parsed as part of a table.
 
-### `format`
+### `format` — post-generation formatting
 
-Commands to run after generating `.pyi` files. Generated file paths are appended to each command. Only use when you trust this config file.
+Run commands on generated `.pyi` files. Generated file paths are appended to each command.
 
 ```toml
 format = ["ruff format", "ruff check --select I --fix"]
@@ -128,7 +250,7 @@ Each command must be executable (on PATH or use a full path). Empty entries are 
 
 See any `examples/*/rylai.toml` for a working example.
 
-### `[output]`
+### `[output]` — output settings
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -136,7 +258,23 @@ See any `examples/*/rylai.toml` for a working example.
 | `add_header` | `true` | Prepend `# Auto-generated by rylai…` banner |
 | `all_include_private` | `false` | Include `_`-prefixed names in `__all__`. Overridable per file via `[[all]]` |
 
-### `[fallback]`
+### `[type_map]` — custom type mappings
+
+Override how specific Rust types map to Python types. Keys must be Rust **path types** — a single identifier (e.g. `PyBbox`) or a qualified path (e.g. `crate::types::MyHandle`).
+
+```toml
+[type_map]
+"numpy::PyReadonlyArray1" = "numpy.ndarray"
+"PyColor" = "Color"
+```
+
+**Limitations:**
+
+- Anonymous tuple types (e.g. `(u8, u8, u8, u8)`) cannot be keys. Define a `type` alias in Rust, use it in signatures, then map the alias name.
+- A Rust `type` alias listed here is preserved during expansion (not resolved), so nested uses like `Vec<ThatAlias>` still map correctly.
+- Two keys sharing the same last path segment but different Python types cause a warning; the short-name lookup is skipped.
+
+### `[fallback]` — unresolved type behavior
 
 What to emit when a type cannot be resolved statically:
 
@@ -146,35 +284,11 @@ What to emit when a type cannot be resolved statically:
 | `"error"` | Abort with an error |
 | `"skip"` | Silently omit the item |
 
-### `[features]`
+### `[[override]]` — replace generated signatures
 
-`cfg` features to treat as active during parsing.
+When Rylai can't produce the right signature from static analysis alone, you can override specific items.
 
-```toml
-[features]
-enabled = ["some_feature"]
-```
-
-### `[type_map]`
-
-Custom Rust type → Python type overrides. Keys must be Rust **path types** — a single identifier (e.g. `PyBbox`) or a qualified path (e.g. `crate::types::MyHandle`).
-
-```toml
-[type_map]
-"numpy::PyReadonlyArray1" = "numpy.ndarray"
-"PyColor" = "Color"
-```
-
-**Limitations:**
-- Anonymous tuple types (e.g. `(u8, u8, u8, u8)`) cannot be keys. Define a `type` alias in Rust, use it in signatures, then map the alias name.
-- A Rust `type` alias listed here is preserved during expansion (not resolved), so nested uses like `Vec<ThatAlias>` still map correctly.
-- Two keys sharing the same last path segment but different Python types cause a warning; the short-name lookup is skipped.
-
-### `[[override]]`
-
-Replace generated signatures with custom ones. Two modes:
-
-**`stub` — full signature line:**
+**Full override with `stub`:**
 
 ```toml
 [[override]]
@@ -182,7 +296,7 @@ item = "my_module::complex_function"
 stub = "def complex_function(x: t.Any, **kwargs: t.Any) -> dict[str, t.Any]:"
 ```
 
-**`param_types` / `return_type` — partial override (mutually exclusive with `stub`):**
+**Partial override with `param_types` / `return_type` (mutually exclusive with `stub`):**
 
 Rylai still builds `def ...` from Rust and `#[pyo3(signature)]`; you only override the specified parts.
 
@@ -202,9 +316,9 @@ return_type = "dict[str, t.Any]"
 
 See `examples/override_sample/` for a working example.
 
-### `[[add_content]]`
+### `[[add_content]]` — inject custom Python
 
-Inject raw Python into generated `.pyi` files. `file` is relative to `-o`, use `/`.
+Add extra Python code (type aliases, imports, version branches) into generated `.pyi` files. `file` is relative to `-o`, use `/`.
 
 | `location` | Behavior |
 |-----------|----------|
@@ -226,9 +340,31 @@ For `head`, `after-import-typing`, and `tail`: `file` must match a `.pyi` path p
 
 See `examples/add_content_sample/` (tail + file), `examples/override_sample/` (after-import-typing), and `examples/cross_module_sample/` for working examples.
 
-### `[[macro_expand]]`
+### `[[all]]` — per-file `__all__` overrides
 
-Expand `macro_rules!` invocations before AST parsing so wrapped `add_class` / `add_function` calls can be collected.
+Customize which names appear in `__all__` for specific files. Paths relative to `-o`, same convention as `[[add_content]]`.
+
+```toml
+[[all]]
+file = "my_package.pyi"
+include_private = true
+include = ["_special_export"]
+exclude = ["InternalHelper"]
+```
+
+**Priority (highest first):**
+
+1. Per-file `exclude` — always removed from `__all__`
+2. Per-file `include` — force-included even if `_`-prefixed (only for symbols Rylai actually generated)
+3. Per-file `include_private` — overrides global setting
+4. Global `output.all_include_private`
+5. Default (`false`): `_`-prefixed names excluded
+
+Names added via `[[add_content]]` are **not** automatically included in `__all__`. Multiple entries for the same file are merged.
+
+### `[[macro_expand]]` — expand `macro_rules!` before parsing
+
+If your project wraps PyO3 registration calls in custom macros, Rylai can expand them before parsing so wrapped `add_class` / `add_function` calls are collected.
 
 **Mode A — explicit pattern/transcription:**
 
@@ -250,27 +386,14 @@ Mode B searches source files for `macro_rules! {name}` and extracts the pattern/
 
 See `examples/macro_expand_sample/` for a working example.
 
-### `[[all]]`
+### `[features]` — cfg features
 
-Per-file `__all__` overrides. Paths relative to `-o`, same convention as `[[add_content]]`. Multiple entries for the same file are merged (`include`/`exclude` sets unioned; last `include_private` wins).
+`cfg` features to treat as active during parsing.
 
 ```toml
-[[all]]
-file = "my_package.pyi"
-include_private = true
-include = ["_special_export"]
-exclude = ["InternalHelper"]
+[features]
+enabled = ["some_feature"]
 ```
-
-**Priority (highest first):**
-
-1. Per-file `exclude` — always removed from `__all__`
-2. Per-file `include` — force-included even if `_`-prefixed (only for symbols Rylai actually generated)
-3. Per-file `include_private` — overrides global setting
-4. Global `output.all_include_private`
-5. Default (`false`): `_`-prefixed names excluded
-
-Names added via `[[add_content]]` are **not** automatically included in `__all__`.
 
 ### `pyproject.toml`
 
@@ -316,7 +439,7 @@ exclude = ["InternalHelper"]
 
 ## Supported Type Mappings
 
-For **`[output] python_version`**: generic containers follow [PEP 585](https://peps.python.org/pep-0585/) only on **Python ≥ 3.9** (`list[T]`, `dict[K, V]`, `tuple[...]`, `set[T]`). On **3.8**, Rylai emits the equivalent **`typing`** forms with the usual stub alias: `t.List[T]`, `t.Dict[K, V]`, `t.Tuple[...]`, `t.Set[T]` (stubs use `import typing as t`). Bare `list` / `dict` / `set` without type parameters stay as built-in names.
+For **`[output] python_version`**: generic containers follow [PEP 585](https://peps.python.org/pep-0585/) only on **Python ≥ 3.9** (`list[T]`, `dict[K, V]`, `tuple[...]`, `set[T]`). On **3.8**, Rylai emits the equivalent **`typing`** forms: `t.List[T]`, `t.Dict[K, V]`, `t.Tuple[...]`, `t.Set[T]` (stubs use `import typing as t`). Bare `list` / `dict` / `set` without type parameters stay as built-in names.
 
 | Rust type | Python type |
 |---|---|
@@ -357,16 +480,16 @@ Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfuncti
 
 ### Current limitations
 
-- **Same-name items.** Rylai keys most internal lookups (functions, classes, type aliases, impl blocks, struct fields) by bare identifier. If two items in different modules share the same Rust name (e.g. two `struct Foo`), the last one parsed silently wins — fields, methods, and attributes from earlier definitions are lost. Use unique names or `#[pyclass(name = "...")]` to disambiguate.
-- **`use … as …` renamed imports.** Rylai does not resolve import aliases. Code like `use pyo3::prelude::PyResult as MyResult;` followed by `-> MyResult<T>` will cause `MyResult` to be treated as an unknown type (falling back to `t.Any`). Use the original name or add a `type` alias + `[type_map]` entry instead.
+- **Same-name items.** Rylai keys most internal lookups by bare identifier. If two items in different modules share the same Rust name (e.g. two `struct Foo`), the last one parsed silently wins. Use unique names or `#[pyclass(name = "...")]` to disambiguate.
+- **`use … as …` renamed imports.** Rylai does not resolve import aliases. Code like `use pyo3::prelude::PyResult as MyResult;` followed by `-> MyResult<T>` will cause `MyResult` to be treated as unknown (falling back to `t.Any`). Use the original name or add a `type` alias + `[type_map]` entry instead.
 - **`create_exception!` parsing.** Parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
-- **`[[macro_expand]]` repetition blocks.** Due to a `macro_rules_rt` limitation, `$(...)*` blocks can only contain repeating variables (e.g. `$cls`). Non-repeating metavariables inside a repetition are not expanded. The standard workaround is to bind non-repeating variables outside the repetition with a `let` (see the `macro_expand_sample` example).
+- **`[[macro_expand]]` repetition blocks.** Due to a `macro_rules_rt` limitation, `$(...)*` blocks can only contain repeating variables (e.g. `$cls`). Non-repeating metavariables inside a repetition are not expanded. Bind non-repeating variables outside the repetition with a `let` (see the `macro_expand_sample` example).
 
 ### When to use a build-based tool instead
 
 For more complex projects, or when you rely on type/signature information that only exists after a build, a build-based approach is a better choice — for example [pyo3-stub-gen](https://github.com/jij-inc/pyo3-stub-gen), which compiles the extension first and then generates stubs from runtime/compilation artifacts.
 
-For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai’s **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). For declarative macros that wrap binding registration calls, you can now use `[[macro_expand]]` / `[[tool.rylai.macro_expand]]` to expand specific macros before parsing. Coverage is still opt-in and pattern-driven: unsupported macro patterns or unconfigured macros may still be missed.
+For relatively simple projects where PyO3 bindings are mostly hand-annotated with straightforward types, Rylai's **speed, no-compile workflow, and zero intrusion** are strong advantages. This is especially true when you have **Python version requirements** (e.g. supporting versions below 3.10 which pyo3-stub-gen does not support). For declarative macros that wrap binding registration calls, you can use `[[macro_expand]]` to expand specific macros before parsing.
 
 Related support is planned, but Rylai cannot generate stubs for all possible PyO3 code.
 
