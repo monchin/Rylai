@@ -29,6 +29,13 @@ jobs:
             bin_upload_name: bin-x86_64-unknown-linux-gnu
             out_file: rylai-x86_64-unknown-linux-gnu.tar.gz
             package_kind: unix
+          - os: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            maturin_args: --release --strip --out dist --target aarch64-unknown-linux-gnu
+            binary_path: target/aarch64-unknown-linux-gnu/release/rylai
+            bin_upload_name: bin-aarch64-unknown-linux-gnu
+            out_file: rylai-aarch64-unknown-linux-gnu.tar.gz
+            package_kind: unix
           - os: windows-latest
             artifact_suffix: windows
             maturin_args: --release --strip --out dist
@@ -72,7 +79,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          manylinux: ${{ matrix.os == 'ubuntu-latest' && 'manylinux_2_17' || '' }}
+          manylinux: ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-24.04-arm') && 'manylinux_2_17' || '' }}
           args: ${{ matrix.maturin_args }}
 
       - name: Package standalone binary (Unix, same build as wheel)
@@ -214,6 +221,10 @@ jobs:
           path: dist/bin-aarch64-unknown-linux-musl
       - uses: actions/download-artifact@v4
         with:
+          name: bin-aarch64-unknown-linux-gnu
+          path: dist/bin-aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@v4
+        with:
           name: bin-aarch64-pc-windows-msvc
           path: dist/bin-aarch64-pc-windows-msvc
 
@@ -226,6 +237,7 @@ jobs:
             dist/bin-x86_64-unknown-linux-gnu \
             dist/bin-x86_64-unknown-linux-musl \
             dist/bin-aarch64-unknown-linux-musl \
+            dist/bin-aarch64-unknown-linux-gnu \
             dist/bin-x86_64-apple-darwin \
             dist/bin-aarch64-apple-darwin \
             dist/bin-x86_64-pc-windows-msvc \
@@ -241,6 +253,7 @@ jobs:
           cp dist/bin-x86_64-unknown-linux-gnu/* release/
           cp dist/bin-x86_64-unknown-linux-musl/* release/
           cp dist/bin-aarch64-unknown-linux-musl/* release/
+          cp dist/bin-aarch64-unknown-linux-gnu/* release/
           cp dist/bin-x86_64-apple-darwin/* release/
           cp dist/bin-aarch64-apple-darwin/* release/
           cp dist/bin-x86_64-pc-windows-msvc/* release/
@@ -295,6 +308,10 @@ jobs:
         with:
           name: wheels-windows-arm64
           path: dist/wheels-windows-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-arm64
+          path: dist/wheels-linux-arm64
 
       - name: Merge wheels into one directory
         run: |
@@ -306,6 +323,7 @@ jobs:
           cp dist/wheels-linux-musl-x86_64/*.whl dist/wheels/ 2>/dev/null || true
           cp dist/wheels-linux-musl-aarch64/*.whl dist/wheels/ 2>/dev/null || true
           cp dist/wheels-windows-arm64/*.whl dist/wheels/ 2>/dev/null || true
+          cp dist/wheels-linux-arm64/*.whl dist/wheels/ 2>/dev/null || true
           ls -la dist/wheels/
 
       - name: Publish to PyPI

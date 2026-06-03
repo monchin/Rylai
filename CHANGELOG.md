@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release artifacts for **Linux ARM64 (glibc)** (`aarch64-unknown-linux-gnu`): manylinux wheel and standalone binary via native GitHub Actions `ubuntu-24.04-arm` runner.
+- CI now tests on `ubuntu-24.04-arm` to cover Linux ARM64 (glibc).
+
 ## [0.4.0] - 2026-04-22
 
 ### Added
