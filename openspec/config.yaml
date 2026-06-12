@@ -1,0 +1,39 @@
+schema: spec-driven
+
+context: |
+  Project: Rylai — Static Python stub (.pyi) generator from PyO3-annotated Rust source code.
+  Tech stack: Rust (2024 edition), syn (AST parsing), clap (CLI), toml (config), PyO3
+  Build system: Cargo with workspace (root binary + example packages)
+  Domain: Developer tools, Rust-Python interop, type hint generation
+  Key modules:
+    - src/main.rs — CLI entry point, orchestrates collection → generation → output
+    - src/collector/ — AST parsing (parse.rs), data models (model.rs), rename logic (rename_all.rs)
+    - src/generator.rs — Stub file generation, Rust → Python type mapping, cross-module imports
+    - src/config.rs — Configuration from rylai.toml or [tool.rylai] in pyproject.toml
+    - src/output_layout.rs — Multi-module stub file layout
+    - src/add_content.rs — Custom content injection into generated stubs
+    - src/macro_expand.rs — Macro expansion before parsing
+    - src/type_map.rs — Custom type mapping configuration
+    - src/stub_constants.rs — Template constants
+  Conventions:
+    - Conventional commits for changelog
+    - Tests use integration tests in tests/ directory
+    - Examples live in examples/ as separate Cargo workspace members
+  Config files: rylai.toml or [tool.rylai] in pyproject.toml
+
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Always include a "Non-goals" section
+    - Consider impact on PyO3 API compatibility
+    - Note whether changes affect the CLI, parser, generator, or config layer
+  tasks:
+    - Keep each task focused on a single concern
+    - Each task should have clear acceptance criteria
+    - Prefer integration tests over unit tests for new features
+    - Run `cargo test` and `cargo clippy` after changes
+  implementation:
+    - Follow Rust 2024 edition idioms
+    - Use syn for any AST-related changes
+    - Maintain backward compatibility for existing rylai.toml configs
+    - Update examples if behavior changes affect them
