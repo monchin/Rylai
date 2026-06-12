@@ -1935,37 +1935,60 @@ pub fn extends_spec_from_syn_type(ty: &Type) -> Option<ExtendsSpec> {
     Some(ExtendsSpec::PyClassRustName(seg))
 }
 
+/// Returns true if any generic type argument in `args` resolves to `Self`.
+/// Used to detect PyO3 receiver patterns like `Py<Self>`, `Bound<'_, Self>`.
+fn generic_arg_is_self(args: &syn::PathArguments) -> bool {
+    has_generic_arg_named(args, "Self")
+}
+
+/// Returns true if any generic type argument in `args` is a type whose last
+/// path segment matches `name` (e.g. `"Self"`, `"PyModule"`).
+fn has_generic_arg_named(args: &syn::PathArguments, name: &str) -> bool {
+    let syn::PathArguments::AngleBracketed(ab) = args else {
+        return false;
+    };
+    ab.args.iter().any(|a| {
+        matches!(
+            a,
+            syn::GenericArgument::Type(Type::Path(tp))
+                if tp.path.segments.last().map(|s| s.ident == name).unwrap_or(false)
+        )
+    })
+}
+
 /// Returns true for pyo3 "injected" parameter types that should not appear in the Python stub:
-/// `Python<'_>`, `&Bound<'_, PyModule>`, etc.
+/// `Python<'_>`, `&Bound<'_, PyModule>`, `Py<Self>`, `Bound<'_, Self>`, etc.
 fn is_pyo3_injected_param(ty: &Type) -> bool {
     let Type::Reference(r) = ty else {
         if let Type::Path(tp) = ty
             && let Some(seg) = tp.path.segments.last()
         {
             // Python<'_> by value, and pyo3 self-ref types used instead of &self / &mut self
-            return matches!(
+            if matches!(
                 seg.ident.to_string().as_str(),
                 "Python" | "PyRef" | "PyRefMut"
-            );
+            ) {
+                return true;
+            }
+            // Py<Self> — by-value receiver, and Bound<'_, Self> — bound receiver
+            if (seg.ident == "Py" || seg.ident == "Bound") && generic_arg_is_self(&seg.arguments) {
+                return true;
+            }
+            return false;
         }
         return false;
     };
     if let Type::Path(tp) = r.elem.as_ref()
         && let Some(seg) = tp.path.segments.last()
     {
-        let name = seg.ident.to_string();
-        if matches!(name.as_str(), "Python" | "PyModule") {
+        if matches!(seg.ident.to_string().as_str(), "Python" | "PyModule") {
             return true;
         }
-        // &Bound<'_, T> / &Borrowed<'_, T> — only injected when T is PyModule
-        if matches!(name.as_str(), "Bound" | "Borrowed") {
-            return match &seg.arguments {
-                syn::PathArguments::AngleBracketed(ab) => ab.args.iter().any(|a| {
-                    matches!(a, syn::GenericArgument::Type(Type::Path(tp))
-                        if tp.path.segments.last().map(|s| s.ident == "PyModule").unwrap_or(false))
-                }),
-                _ => false,
-            };
+        // &Bound<'_, T> / &Borrowed<'_, T> — injected when T is PyModule or Self (receiver)
+        if seg.ident == "Bound" || seg.ident == "Borrowed" {
+            // Self and PyModule both checked via shared has_generic_arg_named helper.
+            return generic_arg_is_self(&seg.arguments)
+                || has_generic_arg_named(&seg.arguments, "PyModule");
         }
     }
     false
@@ -2042,6 +2065,54 @@ mod tests {
             type_map_preserve_idents: preserve,
             pyfunction_map: None,
         }
+    }
+
+    /// Helper: parse `source` into PyModules using default config.
+    fn parse_test_modules(source: &str) -> (syn::File, Vec<PyModule>) {
+        let file = syn::parse_file(source).unwrap();
+        let config = Config::default();
+        let map = HashMap::new();
+        let impl_map = build_impl_map(
+            &[(std::path::PathBuf::from("lib.rs"), file.clone())],
+            &no_features(),
+        );
+        let fields_map = StructFieldsMap::new();
+        let type_alias_map = HashMap::new();
+        let attrs_map = PyclassAttrsMap::new();
+        let cx = make_cx(&config, &impl_map, &fields_map, &type_alias_map, &attrs_map);
+        let modules = extract_modules_from_file(&file, Path::new("lib.rs"), &map, cx);
+        (file, modules)
+    }
+
+    /// Helper: parse `source` as a Rust file, extract the first `#[pyclass]` class,
+    /// find the method named `method_name` in its `#[pymethods]`, and return its
+    /// parameter names.
+    fn class_method_param_names(source: &str, method_name: &str) -> Vec<String> {
+        let (_, modules) = parse_test_modules(source);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        class
+            .methods
+            .iter()
+            .find(|m| m.name == method_name)
+            .unwrap_or_else(|| panic!("{method_name} not found"))
+            .params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Helper: parse `source` as a Rust file, extract the first `#[pyfunction]`,
+    /// and return its parameter names.
+    fn function_param_names(source: &str) -> Vec<String> {
+        let (_, modules) = parse_test_modules(source);
+        let func = match &modules[0].items[0] {
+            PyItem::Function(f) => f,
+            other => panic!("expected PyItem::Function, got {other:?}"),
+        };
+        func.params.iter().map(|p| p.name.clone()).collect()
     }
 
     // ── extract_pyo3_name ────────────────────────────────────────────────────
@@ -3600,6 +3671,193 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             param_names,
             vec!["index"],
             "only 'index' should remain, got: {param_names:?}"
+        );
+    }
+
+    // ── Py<Self> / Bound<'_, Self> / &Bound<'_, Self> / &Borrowed<'_, Self> receivers ────
+
+    /// `slf_handle: Py<Self>` is pyo3's by-value receiver; it must not leak into the stub.
+    #[test]
+    fn py_self_param_is_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn method(slf_handle: Py<Self>, x: i32) -> i32 { x }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "method",
+        );
+        assert_eq!(params, vec!["x"], "Py<Self> should not appear as a param");
+    }
+
+    /// `fn __iter__(slf: Py<Self>)` — magic method with Py<Self> receiver.
+    #[test]
+    fn py_self_magic_method_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn __iter__(slf: Py<Self>) -> Py<Self> { slf }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "__iter__",
+        );
+        assert!(
+            params.is_empty(),
+            "Py<Self> in __iter__ should not appear as a param, got: {params:?}"
+        );
+    }
+
+    /// `slf: Bound<'_, Self>` — bound receiver by value.
+    #[test]
+    fn bound_self_param_is_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn process(slf: Bound<'_, Self>, data: i32) -> i32 { data }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "process",
+        );
+        assert_eq!(
+            params,
+            vec!["data"],
+            "Bound<'_, Self> should not appear as a param"
+        );
+    }
+
+    /// `slf: &Bound<'_, Self>` — borrowed bound receiver (common in inheritance).
+    #[test]
+    fn ref_bound_self_param_is_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn set(slf: &Bound<'_, Self>, key: String, value: i32) -> () {}
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "set",
+        );
+        assert_eq!(
+            params,
+            vec!["key", "value"],
+            "&Bound<'_, Self> should not appear as a param"
+        );
+    }
+
+    /// `slf: &Borrowed<'_, Self>` — borrowed variant of bound receiver.
+    #[test]
+    fn borrowed_self_param_is_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn process(slf: &Borrowed<'_, Self>, data: i32) -> i32 { data }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "process",
+        );
+        assert_eq!(
+            params,
+            vec!["data"],
+            "&Borrowed<'_, Self> should not appear as a param"
+        );
+    }
+
+    /// `Py<OtherClass>` is NOT a receiver — it must be preserved as a regular param.
+    #[test]
+    fn py_non_self_is_preserved() {
+        let params = function_param_names(
+            r#"
+#[pyclass]
+struct OtherClass {}
+
+#[pyfunction]
+fn process(obj: Py<OtherClass>) -> i32 { 0 }
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_function(wrap_pyfunction!(process, m)?)?;
+    Ok(())
+}
+"#,
+        );
+        assert_eq!(
+            params,
+            vec!["obj"],
+            "Py<OtherClass> should be preserved as a param"
+        );
+    }
+
+    /// `Bound<'_, OtherClass>` (by value, non-ref) is NOT a receiver — must be preserved.
+    #[test]
+    fn bound_non_self_is_preserved() {
+        let params = function_param_names(
+            r#"
+#[pyclass]
+struct OtherClass {}
+
+#[pyfunction]
+fn process(obj: Bound<'_, OtherClass>) -> i32 { 0 }
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_function(wrap_pyfunction!(process, m)?)?;
+    Ok(())
+}
+"#,
+        );
+        assert_eq!(
+            params,
+            vec!["obj"],
+            "Bound<'_, OtherClass> should be preserved as a param"
         );
     }
 

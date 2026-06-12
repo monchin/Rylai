@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Exclude `Py<Self>`, `Bound<'_, Self>` and `&Bound<'_, Self>` PyO3 receiver types from generated stub parameters. Previously these receivers leaked their binding names (e.g. `slf`, `slf_handle`) into `.pyi` signatures alongside the implicit `self`, causing mypy/pyright errors at correct call sites.
+
 ## [0.4.1] - 2026-06-03
 
 ### Added
