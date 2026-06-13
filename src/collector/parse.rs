@@ -910,7 +910,13 @@ pub fn parse_pyfunction(
     let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| rust_name.clone());
     let doc = extract_doc(&f.attrs);
     let signature_override = extract_pyo3_signature(&f.attrs);
-    let params = parse_params(&f.sig, config, type_alias_map, type_map_preserve_idents);
+    let params = parse_params(
+        &f.sig,
+        config,
+        type_alias_map,
+        type_map_preserve_idents,
+        false,
+    );
     let return_type = parse_return_type(
         &f.sig.output,
         config,
@@ -934,14 +940,26 @@ fn parse_params(
     config: &Config,
     type_alias_map: &HashMap<String, Type>,
     type_map_preserve_idents: &HashSet<String>,
+    is_instance_method: bool,
 ) -> Vec<PyParam> {
     let mut params = Vec::new();
+    // Tracks whether the implicit `self` receiver has been consumed — either via an explicit
+    // `FnArg::Receiver` (`&self`) or via the first typed Self-receiver param. Once set, any further
+    // Self-dependent type (`Py<Self>`, `Bound<'_, Self>`, …) is a regular parameter.
+    let mut receiver_taken = false;
     for input in &sig.inputs {
         match input {
-            FnArg::Receiver(_) => {} // skip `self`
+            FnArg::Receiver(_) => receiver_taken = true, // skip `self`
             FnArg::Typed(pt) => {
-                // Skip pyo3 injected parameters: &Python<'_>, &Bound<PyModule>, etc.
-                if is_pyo3_injected_param(&pt.ty) {
+                // Self-dependent receiver types are excluded only at the receiver position of an
+                // instance-style method; elsewhere they are regular params.
+                if !receiver_taken && is_instance_method && is_self_receiver_type(&pt.ty) {
+                    receiver_taken = true;
+                    continue;
+                }
+                // Position-independent injected params (Python<'_>, &Bound<'_, PyModule>, …) are
+                // always excluded regardless of position.
+                if is_pure_injected_type(&pt.ty) {
                     continue;
                 }
                 let name = match pt.pat.as_ref() {
@@ -1212,14 +1230,23 @@ fn parse_pymethod(
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| rust_ident.clone());
     let doc = extract_doc(&m.attrs);
     let signature_override = extract_pyo3_signature(&m.attrs);
-    let params = parse_params(&m.sig, config, type_alias_map, type_map_preserve_idents);
+    // Detect kind first: instance-style methods (Instance / Getter / Setter) carry an implicit
+    // `self` receiver, so a Self-dependent first param must be treated as the receiver and
+    // excluded. Static / Class / New have no receiver, so their `Py<Self>` stays as a regular param.
+    let kind = detect_method_kind(&m.attrs, &name);
+    let params = parse_params(
+        &m.sig,
+        config,
+        type_alias_map,
+        type_map_preserve_idents,
+        has_instance_receiver(&kind),
+    );
     let return_type = parse_return_type(
         &m.sig.output,
         config,
         type_alias_map,
         type_map_preserve_idents,
     );
-    let kind = detect_method_kind(&m.attrs, &name);
 
     Some(PyMethod {
         rust_ident,
@@ -1250,6 +1277,19 @@ fn detect_method_kind(attrs: &[Attribute], name: &str) -> MethodKind {
         return MethodKind::Setter(prop_name);
     }
     MethodKind::Instance
+}
+
+/// Returns true for method kinds that carry an implicit `self` receiver — instance methods and
+/// accessors (`Instance` / `Getter` / `Setter`). `Static` / `Class` / `New` have no receiver, so a
+/// Self-dependent first param (e.g. `Py<Self>`) is a regular parameter there, not the receiver.
+///
+/// Centralized here so the "which kinds have a receiver" knowledge lives in the parser rather than
+/// being re-derived (as a `matches!`) at each [`parse_params`] call site.
+fn has_instance_receiver(kind: &MethodKind) -> bool {
+    matches!(
+        kind,
+        MethodKind::Instance | MethodKind::Getter(_) | MethodKind::Setter(_)
+    )
 }
 
 fn extract_getter_name(attrs: &[Attribute], fn_name: &str) -> Option<String> {
@@ -1956,40 +1996,70 @@ fn has_generic_arg_named(args: &syn::PathArguments, name: &str) -> bool {
     })
 }
 
-/// Returns true for pyo3 "injected" parameter types that should not appear in the Python stub:
-/// `Python<'_>`, `&Bound<'_, PyModule>`, `Py<Self>`, `Bound<'_, Self>`, etc.
-fn is_pyo3_injected_param(ty: &Type) -> bool {
-    let Type::Reference(r) = ty else {
-        if let Type::Path(tp) = ty
-            && let Some(seg) = tp.path.segments.last()
-        {
-            // Python<'_> by value, and pyo3 self-ref types used instead of &self / &mut self
-            if matches!(
-                seg.ident.to_string().as_str(),
-                "Python" | "PyRef" | "PyRefMut"
-            ) {
-                return true;
-            }
-            // Py<Self> — by-value receiver, and Bound<'_, Self> — bound receiver
-            if (seg.ident == "Py" || seg.ident == "Bound") && generic_arg_is_self(&seg.arguments) {
-                return true;
-            }
-            return false;
-        }
+/// Returns true for receiver types that depend on `Self` — the pyo3 ways to spell the implicit
+/// `self` parameter other than a literal `FnArg::Receiver`: `Py<Self>`, `Bound<'_, Self>`,
+/// `&Bound<'_, Self>`, `&Borrowed<'_, Self>`, `PyRef<'_, Self>`, `PyRefMut<'_, Self>`.
+///
+/// These are excluded **only at the receiver position** (first param of an instance-style method);
+/// when they appear elsewhere (e.g. `fn m(&self, other: Py<Self>)`) they denote another instance of
+/// the same class and are kept as regular parameters. This is what distinguishes them from the
+/// position-independent injected types detected by [`is_pure_injected_type`].
+fn is_self_receiver_type(ty: &Type) -> bool {
+    // Unwrap one layer of reference so that `Bound<'_, Self>` and `&Bound<'_, Self>` share a branch.
+    let inner = match ty {
+        Type::Reference(r) => r.elem.as_ref(),
+        other => other,
+    };
+    let Type::Path(tp) = inner else {
         return false;
     };
-    if let Type::Path(tp) = r.elem.as_ref()
-        && let Some(seg) = tp.path.segments.last()
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    let ident = seg.ident.to_string();
+    // Any `Self`-parameterized form of these type names spells the implicit `self` receiver:
+    // `Py<Self>`, `Bound<'_, Self>` (+ `&`), `PyRef<'_, Self>` / `PyRefMut<'_, Self>`, `&Borrowed<'_, Self>`.
+    if matches!(
+        ident.as_str(),
+        "Py" | "Bound" | "PyRef" | "PyRefMut" | "Borrowed"
+    ) && generic_arg_is_self(&seg.arguments)
     {
-        if matches!(seg.ident.to_string().as_str(), "Python" | "PyModule") {
-            return true;
-        }
-        // &Bound<'_, T> / &Borrowed<'_, T> — injected when T is PyModule or Self (receiver)
-        if seg.ident == "Bound" || seg.ident == "Borrowed" {
-            // Self and PyModule both checked via shared has_generic_arg_named helper.
-            return generic_arg_is_self(&seg.arguments)
-                || has_generic_arg_named(&seg.arguments, "PyModule");
-        }
+        return true;
+    }
+    false
+}
+
+/// Returns true for position-independent injected types that are always excluded regardless of
+/// position: `Python<'_>`, `&Python<'_>`, `&PyModule`, `&Bound<'_, PyModule>`, `&Borrowed<'_, PyModule>`.
+///
+/// Unlike [`is_self_receiver_type`], these are genuine pyo3 framework injections (the interpreter
+/// handle `Python<'_>` and the module handle) at any position, never a Python-visible parameter.
+fn is_pure_injected_type(ty: &Type) -> bool {
+    // Python<'_> by value.
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Python"
+    {
+        return true;
+    }
+    let Type::Reference(r) = ty else {
+        return false;
+    };
+    let Type::Path(tp) = r.elem.as_ref() else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    // &Python<'_>, &PyModule.
+    if matches!(seg.ident.to_string().as_str(), "Python" | "PyModule") {
+        return true;
+    }
+    // &Bound<'_, PyModule>, &Borrowed<'_, PyModule>.
+    if (seg.ident == "Bound" || seg.ident == "Borrowed")
+        && has_generic_arg_named(&seg.arguments, "PyModule")
+    {
+        return true;
     }
     false
 }
@@ -3808,6 +3878,237 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             params,
             vec!["data"],
             "&Borrowed<'_, Self> should not appear as a param"
+        );
+    }
+
+    // ── has_instance_receiver ───────────────────────────────────────────────
+
+    /// The receiver classification must cover Instance / Getter / Setter and exclude
+    /// Static / Class / New — the single source of truth consumed by `parse_params`.
+    #[test]
+    fn has_instance_receiver_classifies_method_kinds() {
+        assert!(has_instance_receiver(&MethodKind::Instance));
+        assert!(has_instance_receiver(&MethodKind::Getter("x".to_string())));
+        assert!(has_instance_receiver(&MethodKind::Setter("x".to_string())));
+        assert!(!has_instance_receiver(&MethodKind::Static));
+        assert!(!has_instance_receiver(&MethodKind::Class));
+        assert!(!has_instance_receiver(&MethodKind::New));
+    }
+
+    // ── Self-dependent types in NON-receiver positions are preserved ────────
+
+    /// `fn by_normal(&self, other: Py<Self>)` — `other` denotes another instance of the same
+    /// class, so it must be kept as a regular param (not excluded as a receiver).
+    #[test]
+    fn py_self_in_normal_position_is_preserved() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn by_normal(&self, other: Py<Self>) -> i64 { 0 }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "by_normal",
+        );
+        assert_eq!(
+            params,
+            vec!["other"],
+            "Py<Self> in a non-receiver position must be kept, got: {params:?}"
+        );
+    }
+
+    /// `fn m(slf: Py<Self>, other: Py<Self>)` — only the first `Py<Self>` is the receiver; the
+    /// second must survive as a regular param.
+    #[test]
+    fn py_self_after_receiver_is_preserved() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    fn m(slf: Py<Self>, other: Py<Self>) -> i64 { 0 }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "m",
+        );
+        assert_eq!(
+            params,
+            vec!["other"],
+            "only the first Py<Self> is the receiver; the second must be kept, got: {params:?}"
+        );
+    }
+
+    /// `#[staticmethod] fn make(other: Py<Self>)` — static methods have no receiver, so `Py<Self>`
+    /// stays as a regular param.
+    #[test]
+    fn py_self_in_staticmethod_is_preserved() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[staticmethod]
+    fn make(other: Py<Self>) -> i64 { 0 }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "make",
+        );
+        assert_eq!(
+            params,
+            vec!["other"],
+            "staticmethod has no receiver; Py<Self> must be kept, got: {params:?}"
+        );
+    }
+
+    /// `Bound<'_, Self>` / `&Bound<'_, Self>` / `&Borrowed<'_, Self>` appearing AFTER `&self` are
+    /// regular params — the receiver was already taken by `&self`.
+    #[test]
+    fn bound_self_variants_in_normal_position_are_preserved() {
+        for method in [
+            r#"fn m(&self, other: Bound<'_, Self>) -> i64 { 0 }"#,
+            r#"fn m(&self, other: &Bound<'_, Self>) -> i64 { 0 }"#,
+            r#"fn m(&self, other: &Borrowed<'_, Self>) -> i64 { 0 }"#,
+        ] {
+            let src = format!(
+                r#"
+#[pyclass]
+struct Foo {{}}
+
+#[pymethods]
+impl Foo {{
+    {}
+}}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {{
+    m.add_class::<Foo>()?;
+    Ok(())
+}}
+"#,
+                method
+            );
+            let params = class_method_param_names(&src, "m");
+            assert_eq!(
+                params,
+                vec!["other"],
+                "Self-dependent Bound/Borrowed type in non-receiver position must be kept, got: {params:?}"
+            );
+        }
+    }
+
+    /// `PyRef<'_, Self>` / `PyRefMut<'_, Self>` appearing AFTER `&self` are regular params (covers
+    /// decision 3: these moved from unconditional injection to position-sensitive exclusion).
+    #[test]
+    fn pyref_self_variants_in_normal_position_are_preserved() {
+        for method in [
+            r#"fn m(&self, other: PyRef<'_, Self>) -> i64 { 0 }"#,
+            r#"fn m(&self, other: PyRefMut<'_, Self>) -> i64 { 0 }"#,
+        ] {
+            let src = format!(
+                r#"
+#[pyclass]
+struct Foo {{}}
+
+#[pymethods]
+impl Foo {{
+    {}
+}}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {{
+    m.add_class::<Foo>()?;
+    Ok(())
+}}
+"#,
+                method
+            );
+            let params = class_method_param_names(&src, "m");
+            assert_eq!(
+                params,
+                vec!["other"],
+                "PyRef/PyRefMut<Self> in non-receiver position must be kept, got: {params:?}"
+            );
+        }
+    }
+
+    /// getter / setter with a typed Self receiver (`PyRef`/`PyRefMut`) — the receiver must be
+    /// excluded, and the setter's value must be the real param `v` (not the receiver). Regression
+    /// guard: if these were treated as non-instance, `setter_value_param_type` would pick the
+    /// receiver as the value.
+    #[test]
+    fn setter_getter_typed_self_receiver_is_excluded() {
+        let setter_params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[setter]
+    fn set_x(slf: PyRefMut<'_, Self>, v: i32) {}
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "set_x",
+        );
+        assert_eq!(
+            setter_params,
+            vec!["v"],
+            "setter's typed receiver must be excluded; value must be `v`, got: {setter_params:?}"
+        );
+
+        let getter_params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[getter]
+    fn get_x(slf: PyRef<'_, Self>) -> i32 { 0 }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "get_x",
+        );
+        assert!(
+            getter_params.is_empty(),
+            "getter's typed receiver must be excluded, got: {getter_params:?}"
         );
     }
 
