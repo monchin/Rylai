@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Exclude `Py<Self>`, `Bound<'_, Self>` and `&Bound<'_, Self>` PyO3 receiver types from generated stub parameters. Previously these receivers leaked their binding names (e.g. `slf`, `slf_handle`) into `.pyi` signatures alongside the implicit `self`, causing mypy/pyright errors at correct call sites.
+- Exclude `Self`-dependent PyO3 receiver types (`Py<Self>`, `Bound<'_, Self>`, `&Bound<'_, Self>`, `&Borrowed<'_, Self>`, `PyRef<'_, Self>`, `PyRefMut<'_, Self>`) from generated stub parameters **only at the receiver position** (first parameter of an instance method, getter, or setter). The same type used as a later parameter (e.g. `fn m(&self, other: Py<Self>)`) or in a `#[staticmethod]` / `#[classmethod]` is now kept as a regular parameter and mapped to the class type. Fixes incorrect stubs where such parameters were either leaked as extra `self`-like bindings (`slf`, `slf_handle`, …) or silently dropped from the signature — both triggered mypy/pyright errors at correct call sites. (#5, #6)
 
 ## [0.4.1] - 2026-06-03
 

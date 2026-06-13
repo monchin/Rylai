@@ -484,6 +484,7 @@ Rylai is **purely static**: it parses Rust source for `#[pymodule]`, `#[pyfuncti
 - **`use … as …` renamed imports.** Rylai does not resolve import aliases. Code like `use pyo3::prelude::PyResult as MyResult;` followed by `-> MyResult<T>` will cause `MyResult` to be treated as unknown (falling back to `t.Any`). Use the original name or add a `type` alias + `[type_map]` entry instead.
 - **`create_exception!` parsing.** Parsing expects exactly three comma-separated macro arguments; if the exception base path contains generics (`<...>`), comma splitting may fail.
 - **`[[macro_expand]]` repetition blocks.** Due to a `macro_rules_rt` limitation, `$(...)*` blocks can only contain repeating variables (e.g. `$cls`). Non-repeating metavariables inside a repetition are not expanded. Bind non-repeating variables outside the repetition with a `let` (see the `macro_expand_sample` example).
+- **Type-aliased receiver types.** Rylai expands `type` aliases for *parameter type mapping* (e.g. `type Pair = (i32, i32)` → `tuple[int, int]`), but does **not** expand them when deciding whether a parameter is the implicit `self`. So a receiver written through an alias like `type Handle = Py<Self>; fn m(slf: Handle, x: i32)` leaks `slf` as an extra parameter, and `[type_map]` cannot work around it (it only remaps types, not parameter exclusion). Use the concrete `Py<Self>` / `Bound<'_, Self>` / `&self` form at the receiver position.
 
 ### When to use a build-based tool instead
 
