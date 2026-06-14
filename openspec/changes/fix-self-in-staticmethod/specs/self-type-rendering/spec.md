@@ -14,7 +14,7 @@
 
 #### Scenario: classmethod 返回 Self 在 py3.11 渲染为 t.Self
 - **WHEN** `#[pymethods]` classmethod 声明为 `#[classmethod] fn factory(cls) -> Self`,`python_version = 3.11`
-- **THEN** 生成的 stub MUST 为 `@classmethod` 修饰的 `def factory(cls) -> t.Self:`
+- **THEN** 该 classmethod 的 `Self` 返回类型 MUST 渲染为 `t.Self:`(PEP 673 接受 classmethod 中的 `Self`)
 
 #### Scenario: Initializer 模式下 `__new__` 返回 Self 在 py3.11 渲染为 t.Self
 - **WHEN** Initializer 模式下 `#[new]` 方法返回 `Self`(或 `PyResult<Self>`),`python_version = 3.11`
@@ -48,4 +48,4 @@ py ≥ 3.11 时,类体内 forward reference(类名)在 `.pyi` 中合法,rylai MU
 
 #### Scenario: 同类内 staticmethod 与其他方法共存时渲染互不干扰
 - **WHEN** 同一 `#[pyclass]` 内含 instance method `fn a(&self) -> Self`、classmethod `#[classmethod] fn b(cls) -> Self`、staticmethod `#[staticmethod] fn c() -> Self`,`python_version = 3.11`,类名 `Widget`
-- **THEN** 生成的 stub MUST 同时满足:`def a(self) -> t.Self:`、`def b(cls) -> t.Self:`、`def c() -> Widget:`(staticmethod 的类名渲染 MUST NOT 泄漏到相邻的 instance/classmethod)
+- **THEN** instance method `a` 与 classmethod `b` 的 `Self` 返回类型 MUST 渲染为 `t.Self:`,staticmethod `c` 的 MUST 渲染为 `Widget:`(staticmethod 的类名渲染 MUST NOT 泄漏到相邻的 instance/classmethod)
