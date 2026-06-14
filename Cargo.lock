@@ -226,6 +226,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "initializer_mode_sample"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

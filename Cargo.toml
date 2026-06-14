@@ -4,7 +4,8 @@ members = [
     "examples/basic_function_sample", 
     "examples/cross_module_sample", 
     "examples/override_sample", 
-    "examples/macro_expand_sample"
+    "examples/macro_expand_sample",
+    "examples/initializer_mode_sample"
 ]
 resolver = "2"
 

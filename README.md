@@ -102,6 +102,7 @@ Together, this makes Rylai easy to integrate into CI, docs, or local dev without
 **Advanced:**
 
 - Python-version-aware output (`T | None` for ≥ 3.10, `t.Optional[T]` for older; PEP 585 built-in generics for ≥ 3.9; `t.Self` for ≥ 3.11)
+- PyO3 constructor semantics per the [Initializer docs](https://pyo3.rs/main/class.html#initializer): `#[new]` maps to `__init__` by default; when a class also defines an explicit `fn __init__`, `#[new]` maps to `__new__(cls, ...) -> Self` and `__init__` stays `__init__` — never producing duplicate `__init__` definitions
 - `create_exception!` / `pyo3::create_exception!` support — emits matching `class Name(Base): ...` stubs
 - Generates `__all__` in every stub; configurable globally and per file
 - Multi-module stubs via `#[pyclass(module = "...")]` with automatic cross-module imports
@@ -157,6 +158,7 @@ The `examples/` directory contains several self-contained sample projects, each 
 | `override_sample` | `[[override]]` via `stub` and via `param_types` / `return_type`, `[[add_content]]` | `cargo run -- examples/override_sample --output examples/override_sample/python/override_sample` |
 | `add_content_sample` | `[[add_content]]` with `tail` location and `location = "file"` to create standalone `.pyi` files | `cargo run -- examples/add_content_sample --output examples/add_content_sample/python/add_content_sample` |
 | `macro_expand_sample` | `[[macro_expand]]` auto-discover and explicit modes | `cargo run -- examples/macro_expand_sample --output examples/macro_expand_sample/python/macro_expand_sample` |
+| `initializer_mode_sample` | PyO3 [Initializer](https://pyo3.rs/main/class.html#initializer) mode: `#[new]` + explicit `fn __init__` → separate `__new__` / `__init__` | `cargo run -- examples/initializer_mode_sample --output examples/initializer_mode_sample/python/initializer_mode_sample` |
 
 #### Regenerating all example stubs
 
@@ -312,7 +314,7 @@ return_type = "dict[str, t.Any]"
 - Module-level: `{module}::{function}`
 - Class method: `{module}::{class}::{method}`
 
-`{module}` is the **logical Python module of the stub file** — the top-level `#[pymodule]` name for the root `.pyi`, or the full `#[pyclass(module = "...")]` string for submodule stubs (e.g. `pkg.abc::MyClass::method`). `class` may be the Rust struct name or `#[pyclass(name = "...")]`. `method` is the Rust `fn` ident or `#[pyo3(name = "...")]`. For `#[new]`, use `...::__init__` as the method segment.
+`{module}` is the **logical Python module of the stub file** — the top-level `#[pymodule]` name for the root `.pyi`, or the full `#[pyclass(module = "...")]` string for submodule stubs (e.g. `pkg.abc::MyClass::method`). `class` may be the Rust struct name or `#[pyclass(name = "...")]`. `method` is the Rust `fn` ident or `#[pyo3(name = "...")]`. For `#[new]`, use the method segment matching its generated stub name: `...::__init__` normally, or `...::__new__` in PyO3 [Initializer](https://pyo3.rs/main/class.html#initializer) mode (class defines both `#[new]` and an explicit `fn __init__`). The Rust `fn` ident (e.g. `...::py_new`) always works as a fallback.
 
 See `examples/override_sample/` for a working example.
 
