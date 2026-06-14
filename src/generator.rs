@@ -47,6 +47,7 @@ pub fn generate_with_known_classes(
         needs_union: false,
         warnings,
         current_self_type: None,
+        in_static_method: false,
         known_classes,
         current_stub_module: cross_import.map(|(s, _)| s.to_string()),
         class_rust_to_module: cross_import.map(|(_, m)| (*m).clone()),
@@ -159,16 +160,22 @@ pub(crate) fn generate(modules: &[PyModule], config: &Config) -> Result<String> 
 
 // ── Generation context ───────────────────────────────────────────────────────
 
-/// Restores `GenCtx::current_self_type` to `None` when dropped so that early returns
-/// (e.g. via `?`) from `gen_method` do not leave the context in a stale state.
-struct RestoreCurrentSelfTypeGuard(*mut Option<String>);
+/// Restores `GenCtx::current_self_type` to `None` and `in_static_method` to `false`
+/// when dropped so that early returns (e.g. via `?`) from `gen_method` do not leave the
+/// context in a stale state.
+struct RestoreMethodContextGuard {
+    self_type: *mut Option<String>,
+    in_static: *mut bool,
+}
 
-impl Drop for RestoreCurrentSelfTypeGuard {
+impl Drop for RestoreMethodContextGuard {
     fn drop(&mut self) {
-        // SAFETY: the pointer is taken from `&mut self.current_self_type` in `gen_method`
-        // and is only used while that method is running; the guard is dropped on return.
+        // SAFETY: the pointers are taken from `&mut self.current_self_type` and
+        // `&mut self.in_static_method` in `gen_method` and are only used while that
+        // method is running; the guard is dropped on return.
         unsafe {
-            *self.0 = None;
+            *self.self_type = None;
+            *self.in_static = false;
         }
     }
 }
@@ -209,6 +216,10 @@ struct GenCtx<'a> {
     /// Set to the Python class name while generating methods for that class,
     /// so that Rust `Self` return types resolve correctly.
     current_self_type: Option<String>,
+    /// True while generating a `#[staticmethod]`. PEP 673 rejects `Self` in static
+    /// methods, so under `native_self` (py >= 3.11) `Self` still resolves to the class
+    /// name instead of emitting the `t.Self` keyword.
+    in_static_method: bool,
     /// Maps each `#[pyclass]` Rust struct name to its Python-visible class name, collected
     /// before generation starts.  This allows return types like `-> PyResult<PyPageIterator>`
     /// (where the Rust struct is `PyPageIterator` but the Python name is `PageIterator`) to
@@ -239,9 +250,19 @@ impl<'a> GenCtx<'a> {
             return Ok(ov.clone());
         }
 
+        // PEP 673 rejects `Self` in staticmethods. Under `native_self` (py >= 3.11), force
+        // the class-name path by locally disabling `native_self`; recursion inside `map_type`
+        // (`Py<Self>`, `PyResult<Self>`, `Vec<Self>`, ...) then follows the class-name branch.
+        let effective_policy = if self.in_static_method && self.policy.native_self {
+            let mut p = self.policy.clone();
+            p.native_self = false;
+            p
+        } else {
+            self.policy.clone()
+        };
         let mapping = type_map::map_type(
             &py_type.rust_type,
-            &self.policy,
+            &effective_policy,
             self.current_self_type.as_deref(),
             &self.known_classes,
         );
@@ -817,8 +838,11 @@ impl<'a> GenCtx<'a> {
         indent: usize,
     ) -> Result<()> {
         self.current_self_type = Some(class.name.clone());
-        let _guard =
-            RestoreCurrentSelfTypeGuard(&mut self.current_self_type as *mut Option<String>);
+        self.in_static_method = matches!(m.kind, MethodKind::Static);
+        let _guard = RestoreMethodContextGuard {
+            self_type: &mut self.current_self_type as *mut Option<String>,
+            in_static: &mut self.in_static_method as *mut bool,
+        };
         let pad = "    ".repeat(indent);
         // Initializer mode detection (see design decision 2): the class has a method whose literal name is `__init__` and that is not `#[new]`.
         let has_explicit_init = Self::class_has_explicit_init(class);
@@ -1928,10 +1952,11 @@ mod tests {
         );
     }
 
-    /// With python_version 3.12 (native_self), stub must NOT add future_annotations,
-    /// must add `import typing as t`, and return type must be `t.Self`.
+    /// With python_version 3.12 (native_self), a staticmethod returning Self must still
+    /// render the class name (PEP 673 rejects `Self` in staticmethods), while NOT adding
+    /// `from __future__ import annotations` and still importing typing.
     #[test]
-    fn render_policy_py312_emits_native_self_and_no_future_annotations() {
+    fn render_policy_py312_staticmethod_self_uses_class_name() {
         let config = config_with_python_version("3.12");
         let class = make_class_with_self_return("PdfDocument", "from_bytes");
         let stub = stub_for_config(vec![PyItem::Class(class)], &config);
@@ -1941,11 +1966,250 @@ mod tests {
         );
         assert!(
             stub.contains(TYPING_IMPORT_LINE),
-            "py 3.12 must import typing when Self is used, got:\n{stub}"
+            "py 3.12 must import typing, got:\n{stub}"
         );
         assert!(
-            stub.contains("-> t.Self:") || stub.contains("-> t.Self :"),
-            "py 3.12 must use t.Self as return type, got:\n{stub}"
+            stub.contains("-> PdfDocument:"),
+            "py 3.12 staticmethod Self must render the class name, not t.Self (PEP 673), got:\n{stub}"
+        );
+    }
+
+    // ── staticmethod Self rendering (PEP 673) ────────────────────────────────
+    // `Self` is rejected in staticmethods by PEP 673, so it must always render the class
+    // name regardless of `native_self`. Instance methods / classmethods keep `t.Self`.
+
+    /// A `#[staticmethod]` returning bare `Self` under py3.11 (native_self) MUST render the
+    /// class name, not `t.Self`.
+    #[test]
+    fn static_method_bare_self_return_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "make_direct",
+                MethodKind::Static,
+                vec![],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def make_direct() -> Widget:"),
+            "py3.11 staticmethod Self must render class name, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("t.Self"),
+            "py3.11 staticmethod must NOT emit t.Self, got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` returning `PyResult<Self>` under py3.11 MUST unwrap to the class name.
+    #[test]
+    fn static_method_pyresult_self_return_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "from_int",
+                MethodKind::Static,
+                vec![make_param("x", syn::parse_quote! { i64 })],
+                syn::parse_quote! { pyo3::PyResult<Self> },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def from_int(x: int) -> Widget:"),
+            "py3.11 staticmethod PyResult<Self> must unwrap to class name, got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` with a bare `Self` parameter under py3.11 MUST render the class name.
+    #[test]
+    fn static_method_bare_self_param_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "take_direct",
+                MethodKind::Static,
+                vec![make_param("other", syn::parse_quote! { Self })],
+                syn::parse_quote! { i64 },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def take_direct(other: Widget) -> int:"),
+            "py3.11 staticmethod Self param must render class name, got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` with a `Py<Self>` parameter under py3.11 MUST recurse to the class
+    /// name (verifies `map_type` recursion follows the class-name path under the forced policy).
+    #[test]
+    fn static_method_py_self_param_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "take_py",
+                MethodKind::Static,
+                vec![make_param("other", syn::parse_quote! { pyo3::Py<Self> })],
+                syn::parse_quote! { i64 },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def take_py(other: Widget) -> int:"),
+            "py3.11 staticmethod Py<Self> param must recurse to class name, got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` with a `PyRef<'_, Self>` parameter under py3.11 MUST recurse to the
+    /// class name. `PyRef` is a separate `map_type` branch from `Py` (task 3.4), so this locks
+    /// the forced-policy path for the PyO3 reference-return wrapper independently.
+    #[test]
+    fn static_method_pyref_self_param_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "take_pyref",
+                MethodKind::Static,
+                vec![make_param(
+                    "other",
+                    syn::parse_quote! { pyo3::PyRef<'_, Self> },
+                )],
+                syn::parse_quote! { i64 },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def take_pyref(other: Widget) -> int:"),
+            "py3.11 staticmethod PyRef<'_, Self> param must recurse to class name, got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` with a `Bound<'_, Self>` parameter under py3.11 MUST recurse to the
+    /// class name. `Bound` shares the `Py`/`Bound`/`Borrowed` branch but `generic_args` must skip
+    /// the `'_` lifetime to reach `Self` — this guards both that skip and the forced policy.
+    #[test]
+    fn static_method_bound_self_param_py311_uses_class_name() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "take_bound",
+                MethodKind::Static,
+                vec![make_param(
+                    "other",
+                    syn::parse_quote! { pyo3::Bound<'_, Self> },
+                )],
+                syn::parse_quote! { i64 },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def take_bound(other: Widget) -> int:"),
+            "py3.11 staticmethod Bound<'_, Self> param must recurse to class name, got:\n{stub}"
+        );
+    }
+
+    /// An instance method returning `Self` under py3.11 MUST keep `t.Self` (PEP 673 accepts it).
+    #[test]
+    fn instance_method_self_return_py311_keeps_t_self() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "echo",
+                MethodKind::Instance,
+                vec![],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def echo(self) -> t.Self:"),
+            "py3.11 instance method must keep t.Self (PEP 673 accepts), got:\n{stub}"
+        );
+    }
+
+    /// A classmethod returning `Self` under py3.11 MUST keep `t.Self` (PEP 673 accepts it).
+    #[test]
+    fn classmethod_self_return_py311_keeps_t_self() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "factory",
+                MethodKind::Class,
+                vec![],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("-> t.Self:"),
+            "py3.11 classmethod Self return must render as t.Self (PEP 673 accepts), got:\n{stub}"
+        );
+    }
+
+    /// Within one class, instance/classmethod keep `t.Self` while staticmethod uses the class
+    /// name — verifies `in_static_method` resets between methods (no guard leak).
+    #[test]
+    fn mixed_methods_in_one_class_py311_static_uses_class_name_others_t_self() {
+        let config = config_with_python_version("3.11");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![
+                make_method(
+                    "a",
+                    MethodKind::Instance,
+                    vec![],
+                    syn::parse_quote! { Self },
+                ),
+                make_method("b", MethodKind::Class, vec![], syn::parse_quote! { Self }),
+                make_method("c", MethodKind::Static, vec![], syn::parse_quote! { Self }),
+            ],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def a(self) -> t.Self:"),
+            "instance got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def c() -> Widget:"),
+            "staticmethod got:\n{stub}"
+        );
+        assert_eq!(
+            stub.matches("-> t.Self:").count(),
+            2,
+            "instance + classmethod both keep t.Self (no staticmethod guard leak), got:\n{stub}"
+        );
+    }
+
+    /// A `#[staticmethod]` returning `Self` under py3.9 MUST render the class name with
+    /// `from __future__ import annotations` (unchanged behavior, no regression).
+    #[test]
+    fn static_method_self_return_py39_unchanged_class_name() {
+        let config = config_with_python_version("3.9");
+        let class = make_class_with_methods(
+            "Widget",
+            vec![make_method(
+                "make_direct",
+                MethodKind::Static,
+                vec![],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def make_direct() -> Widget:"),
+            "py3.9 staticmethod must render class name, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("from __future__ import annotations"),
+            "py3.9 must emit future annotations, got:\n{stub}"
         );
     }
 

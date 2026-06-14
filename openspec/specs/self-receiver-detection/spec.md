@@ -55,11 +55,11 @@
 
 "receiver 位置"定义为：方法**带有实例 receiver**（`MethodKind::Instance` / `Getter` / `Setter`，即非 `#[staticmethod]` / `#[classmethod]` / `#[new]`），且该参数为方法签名中的首个参数，其前不存在 `&self` / `&mut self` / `self`（即无 `FnArg::Receiver`）。
 
-一旦方法的 receiver 被确认（出现了 `FnArg::Receiver`，或首个 typed 参数已被识别为 receiver），后续所有依赖 `Self` 的 receiver 类型参数**必须作为普通参数保留**在 stub 中，并映射为对应的 Python 类类型。
+一旦方法的 receiver 被确认（出现了 `FnArg::Receiver`，或首个 typed 参数已被识别为 receiver），后续所有依赖 `Self` 的 receiver 类型参数**MUST 作为普通参数保留**在 stub 中，并映射为对应的 Python 类类型。
 
 `Python<'_>`、`&Bound<'_, PyModule>` 等与位置无关的纯注入类型不受此规则约束，继续在任何位置无条件排除。
 
-补充：被保留为普通参数的 `Py<Self>` / `Bound<'_, Self>` 等类型，其 Python 类型取决于渲染策略——py < 3.11 映射为类名（如 `Foo`），py ≥ 3.11（`nativeSelf`）映射为 `t.Self`。下方 scenario 以默认策略（类名）示例，两种映射均满足"作为普通参数保留"的契约。
+补充：被保留为普通参数的 `Py<Self>` / `Bound<'_, Self>` 等类型，其 Python 类型遵循 `self-type-rendering` capability 的规则——对 instance method / classmethod 的普通参数位置，py < 3.11 映射为类名（如 `Foo`）、py ≥ 3.11 映射为 `t.Self`；对 `#[staticmethod]` 中的此类参数，无论版本 MUST 映射为类名（PEP 673）。下方 scenario 以默认策略（类名）示例，均满足“作为普通参数保留”的契约。
 
 #### Scenario: Py<Self> 在普通参数位置必须保留
 - **WHEN** `#[pymethods]` 方法声明为 `fn by_normal(&self, other: Py<Self>) -> i64`
