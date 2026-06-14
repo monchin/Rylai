@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- PyO3 [Initializer](https://pyo3.rs/main/class.html#initializer) mode support: when a class defines both `#[new]` and an explicit `fn __init__`, `#[new]` now emits `__new__(cls, ...) -> Self` and `__init__` emits `__init__(self, ...) -> None` — previously both collapsed to a single (duplicate) `__init__` definition. The `__new__` return type reuses the version-aware `Self` renderer (`t.Self` for ≥ 3.11, class name for older). `#[new]` without an explicit `__init__` is unchanged. Also aligns `[[override]]` `#[new]` aliasing with the generated stub name.
+- PyO3 [Initializer](https://pyo3.rs/main/class.html#initializer) mode support: when a class defines both `#[new]` and an explicit `fn __init__`, `#[new]` now emits `__new__(cls, ...) -> Self` and `__init__` emits `__init__(self, ...) -> None` — previously both collapsed to a single (duplicate) `__init__` definition. The `__new__` return type reuses the version-aware `Self` renderer (`t.Self` for ≥ 3.11, class name for older). `#[new]` without an explicit `__init__` is unchanged. Also aligns `[[override]]` `#[new]` aliasing with the generated stub name. (#7)
 
 ### Fixed
 
