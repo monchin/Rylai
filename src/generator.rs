@@ -595,7 +595,7 @@ impl<'a> GenCtx<'a> {
             // #[pyo3(signature = (...))] is present: merge signature shape with Rust-inferred types
             self.merge_sig_with_types(sig, &f.params, &f.name, lookup, used)?
         } else {
-            self.gen_params(&f.params, &f.name, false, lookup, used)?
+            self.gen_params(&f.params, &f.name, lookup, used)?
         };
 
         out.push_str(&format!("{pad}def {}({params_str}) -> {ret}:\n", f.name));
@@ -773,28 +773,25 @@ impl<'a> GenCtx<'a> {
             MethodKind::New => {
                 if has_explicit_init {
                     // Initializer mode (PyO3 #[new] + explicit __init__): `#[new]` -> `__new__(cls, ...) -> Self`.
-                    // The first param injects a bare `cls` (no type annotation, following PEP 673 / typeshed, symmetric with `self` injection),
-                    // and the remaining params reuse method_params(with_self=false) with `cls` manually prefixed.
-                    let rest = self.method_params(m, location, false, lookup, used)?;
-                    let params = if rest.is_empty() {
-                        "cls".to_string()
-                    } else {
-                        format!("cls, {rest}")
-                    };
+                    // method_params injects a bare `cls` (no annotation, following PEP 673 / typeshed,
+                    // symmetric with `self` injection) before the remaining params.
+                    let params = self.method_params(m, location, Some("cls"), lookup, used)?;
                     out.push_str(&format!("{pad}def __new__({params}) -> {ret}:\n"));
                 } else {
-                    let params = self.method_params(m, location, true, lookup, used)?;
+                    let params = self.method_params(m, location, Some("self"), lookup, used)?;
                     out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
                 }
             }
             MethodKind::Static => {
                 out.push_str(&format!("{pad}@staticmethod\n"));
-                let params = self.method_params(m, location, false, lookup, used)?;
+                let params = self.method_params(m, location, None, lookup, used)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
             MethodKind::Class => {
                 out.push_str(&format!("{pad}@classmethod\n"));
-                let params = self.method_params(m, location, true, lookup, used)?;
+                // A classmethod's implicit receiver is `cls` (PEP 673), not `self`. method_params
+                // injects a bare `cls` (no annotation, matching typeshed) before the remaining params.
+                let params = self.method_params(m, location, Some("cls"), lookup, used)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
             MethodKind::Getter(prop) => {
@@ -809,7 +806,7 @@ impl<'a> GenCtx<'a> {
                 ));
             }
             MethodKind::Instance => {
-                let params = self.method_params(m, location, true, lookup, used)?;
+                let params = self.method_params(m, location, Some("self"), lookup, used)?;
                 out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
             }
         }
@@ -912,26 +909,29 @@ impl<'a> GenCtx<'a> {
         Ok(())
     }
 
-    /// Build the parameter list for a method: uses `signature_override` when present,
-    /// otherwise `gen_params`. When `with_self` is true, the result includes a leading `self`.
+    /// Build the parameter list for a method, optionally prefixing a bare receiver name:
+    /// `Some("self")` for instance methods, `Some("cls")` for classmethods / `__new__`, `None`
+    /// for staticmethods. When `signature_override` is present the `#[pyo3(signature = (...))]`
+    /// body is merged with Rust-inferred types; otherwise `gen_params` is used. An empty body
+    /// yields just the receiver name with no trailing comma.
     fn method_params(
         &mut self,
         m: &PyMethod,
         location: &str,
-        with_self: bool,
+        receiver: Option<&str>,
         lookup: Option<&HashMap<String, String>>,
         used: &mut HashSet<String>,
     ) -> Result<String> {
-        if let Some(sig) = &m.signature_override {
-            let merged = self.merge_sig_with_types(sig, &m.params, location, lookup, used)?;
-            Ok(if with_self {
-                format!("self, {merged}")
-            } else {
-                merged
-            })
+        let body = if let Some(sig) = &m.signature_override {
+            self.merge_sig_with_types(sig, &m.params, location, lookup, used)?
         } else {
-            self.gen_params(&m.params, location, with_self, lookup, used)
-        }
+            self.gen_params(&m.params, location, lookup, used)?
+        };
+        Ok(match receiver {
+            Some(name) if body.is_empty() => name.to_string(),
+            Some(name) => format!("{name}, {body}"),
+            None => body,
+        })
     }
 
     // ── Signature merge ──────────────────────────────────────────────────────
@@ -1018,14 +1018,10 @@ impl<'a> GenCtx<'a> {
         &mut self,
         params: &[PyParam],
         location: &str,
-        with_self: bool,
         lookup: Option<&HashMap<String, String>>,
         used: &mut HashSet<String>,
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
-        if with_self {
-            parts.push("self".to_string());
-        }
         for p in params {
             let mut ty = self.resolve_type(&p.ty, &format!("{location}::{}", p.name))?;
             if let Some(lu) = lookup
@@ -3323,8 +3319,25 @@ mod tests {
             "@classmethod decorator must appear, got:\n{stub}"
         );
         assert!(
-            stub.contains("def create(self)"),
-            "classmethod must include self param, got:\n{stub}"
+            stub.contains("def create(cls)"),
+            "classmethod must inject cls (not self), got:\n{stub}"
+        );
+    }
+
+    /// A classmethod with extra params injects bare `cls` before the remaining params.
+    #[test]
+    fn classmethod_with_params_injects_cls() {
+        let m = make_method(
+            "create",
+            MethodKind::Class,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { Self },
+        );
+        let class = make_class_with_methods("MyClass", vec![m]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def create(cls, x: int)"),
+            "classmethod must inject cls before remaining params, got:\n{stub}"
         );
     }
 

@@ -916,6 +916,7 @@ pub fn parse_pyfunction(
         type_alias_map,
         type_map_preserve_idents,
         false,
+        false,
     );
     let return_type = parse_return_type(
         &f.sig.output,
@@ -941,6 +942,7 @@ fn parse_params(
     type_alias_map: &HashMap<String, Type>,
     type_map_preserve_idents: &HashSet<String>,
     is_instance_method: bool,
+    is_class_method: bool,
 ) -> Vec<PyParam> {
     let mut params = Vec::new();
     // Tracks whether the implicit `self` receiver has been consumed — either via an explicit
@@ -954,6 +956,12 @@ fn parse_params(
                 // Self-dependent receiver types are excluded only at the receiver position of an
                 // instance-style method; elsewhere they are regular params.
                 if !receiver_taken && is_instance_method && is_self_receiver_type(&pt.ty) {
+                    receiver_taken = true;
+                    continue;
+                }
+                // A `#[classmethod]`'s implicit `cls` is spelled `&Bound<'_, PyType>`; exclude it
+                // only at the receiver position (first param), mirroring the instance receiver above.
+                if !receiver_taken && is_class_method && is_cls_receiver_type(&pt.ty) {
                     receiver_taken = true;
                     continue;
                 }
@@ -1240,6 +1248,7 @@ fn parse_pymethod(
         type_alias_map,
         type_map_preserve_idents,
         has_instance_receiver(&kind),
+        has_attr(&m.attrs, "classmethod"),
     );
     let return_type = parse_return_type(
         &m.sig.output,
@@ -2027,6 +2036,28 @@ fn is_self_receiver_type(ty: &Type) -> bool {
         return true;
     }
     false
+}
+
+/// Returns true for the pyo3-injected `cls` receiver of a `#[classmethod]`: `&Bound<'_, PyType>`.
+/// Like [`is_self_receiver_type`], this is **position-sensitive** — only the first param of a
+/// classmethod is the implicit `cls`; a `&Bound<'_, PyType>` appearing elsewhere is a genuine
+/// `type` argument and is kept. Unwrapping one layer of reference means the by-value
+/// `Bound<'_, PyType>` form matches too, which is harmless: pyo3 does not accept it as `cls`, so it
+/// never occurs in real input. Distinguished from [`is_self_receiver_type`] by the generic argument
+/// (`PyType` for the class vs `Self` for the instance).
+fn is_cls_receiver_type(ty: &Type) -> bool {
+    // Unwrap one layer of reference so `&Bound<'_, PyType>` and `Bound<'_, PyType>` share a branch.
+    let inner = match ty {
+        Type::Reference(r) => r.elem.as_ref(),
+        other => other,
+    };
+    let Type::Path(tp) = inner else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    seg.ident == "Bound" && has_generic_arg_named(&seg.arguments, "PyType")
 }
 
 /// Returns true for position-independent injected types that are always excluded regardless of
@@ -3768,6 +3799,106 @@ fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
             "method",
         );
         assert_eq!(params, vec!["x"], "Py<Self> should not appear as a param");
+    }
+
+    /// `#[classmethod] fn create(cls: &Bound<'_, PyType>)` — the pyo3-injected `cls` receiver must
+    /// be excluded from the stub params.
+    #[test]
+    fn classmethod_cls_param_is_excluded() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[classmethod]
+    fn create(cls: &Bound<'_, PyType>) -> Self { unimplemented!() }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "create",
+        );
+        assert!(
+            params.is_empty(),
+            "classmethod cls receiver must be excluded, got: {params:?}"
+        );
+    }
+
+    /// `#[classmethod] fn create(cls: &Bound<'_, PyType>, x: i32)` — only `cls` is excluded; `x` stays.
+    #[test]
+    fn classmethod_cls_param_excluded_keeps_rest() {
+        let params = class_method_param_names(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[classmethod]
+    fn create(cls: &Bound<'_, PyType>, x: i32) -> i32 { x }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+            "create",
+        );
+        assert_eq!(
+            params,
+            vec!["x"],
+            "only the cls receiver should be excluded, got: {params:?}"
+        );
+    }
+
+    /// End-to-end (parse→generate): `#[classmethod] fn create(cls: &Bound<'_, PyType>, x: i32)`
+    /// yields `def create(cls, x: int)` — collector excludes the `cls` receiver, generator injects
+    /// bare `cls`. Also regresses instance (`def inst(self, y: int)`) and staticmethod behavior.
+    #[test]
+    fn classmethod_cls_end_to_end_generates_cls() {
+        let (_, modules) = parse_test_modules(
+            r#"
+#[pyclass]
+struct Foo {}
+
+#[pymethods]
+impl Foo {
+    #[classmethod]
+    fn create(cls: &Bound<'_, PyType>, x: i32) -> i32 { x }
+    fn inst(&self, y: i32) -> i32 { y }
+    #[staticmethod]
+    fn stat(z: i32) -> i32 { z }
+}
+
+#[pymodule]
+fn my_mod(m: &pyo3::Bound<'_, pyo3::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<Foo>()?;
+    Ok(())
+}
+"#,
+        );
+        let stub = crate::generator::generate(&modules, &Config::default())
+            .expect("generation should succeed");
+        assert!(
+            stub.contains("def create(cls, x: int)"),
+            "classmethod must inject cls and drop the cls receiver, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def inst(self, y: int)"),
+            "instance method must keep self, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def stat(z: int)"),
+            "staticmethod must inject neither cls nor self, got:\n{stub}"
+        );
     }
 
     /// `fn __iter__(slf: Py<Self>)` — magic method with Py<Self> receiver.
