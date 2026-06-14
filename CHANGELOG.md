@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PyO3 [Initializer](https://pyo3.rs/main/class.html#initializer) mode support: when a class defines both `#[new]` and an explicit `fn __init__`, `#[new]` now emits `__new__(cls, ...) -> Self` and `__init__` emits `__init__(self, ...) -> None` — previously both collapsed to a single (duplicate) `__init__` definition. The `__new__` return type reuses the version-aware `Self` renderer (`t.Self` for ≥ 3.11, class name for older). `#[new]` without an explicit `__init__` is unchanged. Also aligns `[[override]]` `#[new]` aliasing with the generated stub name.
+
 ### Fixed
 
 - Exclude `Self`-dependent PyO3 receiver types (`Py<Self>`, `Bound<'_, Self>`, `&Bound<'_, Self>`, `&Borrowed<'_, Self>`, `PyRef<'_, Self>`, `PyRefMut<'_, Self>`) from generated stub parameters **only at the receiver position** (first parameter of an instance method, getter, or setter). The same type used as a later parameter (e.g. `fn m(&self, other: Py<Self>)`) or in a `#[staticmethod]` / `#[classmethod]` is now kept as a regular parameter and mapped to the class type. Fixes incorrect stubs where such parameters were either leaked as extra `self`-like bindings (`slf`, `slf_handle`, …) or silently dropped from the signature — both triggered mypy/pyright errors at correct call sites. (#5, #6)

@@ -188,6 +188,9 @@ struct MethodSignatureEmitOpts<'a> {
     used: &'a mut HashSet<String>,
     return_override: Option<&'a str>,
     touch_discarded_return: bool,
+    /// Whether this class has an explicit `fn __init__` distinct from `#[new]`
+    /// (PyO3 Initializer mode). Drives the `#[new]` → `__new__` split.
+    has_explicit_init: bool,
 }
 
 struct GenCtx<'a> {
@@ -368,6 +371,17 @@ impl<'a> GenCtx<'a> {
         Ok(())
     }
 
+    /// Whether `class` has an explicit `fn __init__` distinct from `#[new]` (PyO3 Initializer mode).
+    /// A method cannot be both a constructor (`#[new]`) and an initializer (explicit `__init__`),
+    /// so `MethodKind::New` entries named `__init__` are excluded — otherwise `#[new] fn __init__`
+    /// would be misclassified as Initializer mode. See design decision 2.
+    fn class_has_explicit_init(class: &PyClass) -> bool {
+        class
+            .methods
+            .iter()
+            .any(|m| m.rust_ident == "__init__" && m.kind != MethodKind::New)
+    }
+
     /// Whether `[[override]]` `item` targets this `#[pymethods]` entry (any kind: instance, static,
     /// class, getter/setter, or `#[new]`).
     fn method_override_entry_matches(
@@ -387,10 +401,18 @@ impl<'a> GenCtx<'a> {
             return true;
         }
         if matches!(method.kind, MethodKind::New) {
-            if matches_pair(&class.rust_name, "__init__") {
+            // The dunder alias of `#[new]` = the stub name it actually generates (design decision 5, hard constraint).
+            // In non-Initializer mode it generates `__init__`; in Initializer mode it generates `__new__`. Single alias:
+            // if it held both, an `__init__` override would match both `#[new]` and the explicit `__init__` (bug).
+            let alias = if Self::class_has_explicit_init(class) {
+                "__new__"
+            } else {
+                "__init__"
+            };
+            if matches_pair(&class.rust_name, alias) {
                 return true;
             }
-            if matches_pair(&class.name, "__init__") {
+            if matches_pair(&class.name, alias) {
                 return true;
             }
         }
@@ -636,9 +658,21 @@ impl<'a> GenCtx<'a> {
         m: &PyMethod,
         location: &str,
         return_override: Option<&str>,
+        is_initializer: bool,
     ) -> Result<String> {
         Ok(match &m.kind {
-            MethodKind::New | MethodKind::Setter(_) => String::new(),
+            MethodKind::Setter(_) => String::new(),
+            // Initializer mode: `#[new]` generates `__new__`, and the return type goes through the version-aware Self rendering
+            // (py >= 3.11 -> `t.Self`, py < 3.11 -> class name), sharing the same path as "methods that return Self".
+            // Honor return_override; otherwise resolve_self_type.
+            MethodKind::New if is_initializer => {
+                if let Some(s) = return_override.filter(|s| !s.trim().is_empty()) {
+                    s.trim().to_string()
+                } else {
+                    self.resolve_self_type(&format!("{location}::return"))?
+                }
+            }
+            MethodKind::New => String::new(),
             _ => {
                 if let Some(s) = return_override.filter(|s| !s.trim().is_empty()) {
                     s.trim().to_string()
@@ -647,6 +681,18 @@ impl<'a> GenCtx<'a> {
                 }
             }
         })
+    }
+
+    /// Resolve the `Self` type for the current class via the version-aware renderer
+    /// (py ≥ 3.11 → `t.Self`, py < 3.11 → class name). Reuses the same path as any
+    /// `-> Self` method so `__new__`'s return type stays consistent with staticmethods
+    /// returning `Self`. See design decision 3.
+    fn resolve_self_type(&mut self, location: &str) -> Result<String> {
+        let self_pytype = PyType {
+            rust_type: syn::parse_quote! { Self },
+            override_str: None,
+        };
+        self.resolve_type(&self_pytype, location)
     }
 
     /// Value parameter type for a `#[setter]` stub (`value: ...`), with optional `param_types` override.
@@ -696,15 +742,29 @@ impl<'a> GenCtx<'a> {
             used,
             return_override,
             touch_discarded_return,
+            has_explicit_init,
         } = opts;
         if touch_discarded_return && matches!(m.kind, MethodKind::New | MethodKind::Setter(_)) {
             let _ = self.resolve_type(&m.return_type, &format!("{location}::return"))?;
         }
-        let ret = self.method_stub_return_type(m, location, return_override)?;
+        let ret = self.method_stub_return_type(m, location, return_override, has_explicit_init)?;
         match &m.kind {
             MethodKind::New => {
-                let params = self.method_params(m, location, true, lookup, used)?;
-                out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
+                if has_explicit_init {
+                    // Initializer mode (PyO3 #[new] + explicit __init__): `#[new]` -> `__new__(cls, ...) -> Self`.
+                    // The first param injects a bare `cls` (no type annotation, following PEP 673 / typeshed, symmetric with `self` injection),
+                    // and the remaining params reuse method_params(with_self=false) with `cls` manually prefixed.
+                    let rest = self.method_params(m, location, false, lookup, used)?;
+                    let params = if rest.is_empty() {
+                        "cls".to_string()
+                    } else {
+                        format!("cls, {rest}")
+                    };
+                    out.push_str(&format!("{pad}def __new__({params}) -> {ret}:\n"));
+                } else {
+                    let params = self.method_params(m, location, true, lookup, used)?;
+                    out.push_str(&format!("{pad}def __init__({params}) -> None:\n"));
+                }
             }
             MethodKind::Static => {
                 out.push_str(&format!("{pad}@staticmethod\n"));
@@ -760,6 +820,8 @@ impl<'a> GenCtx<'a> {
         let _guard =
             RestoreCurrentSelfTypeGuard(&mut self.current_self_type as *mut Option<String>);
         let pad = "    ".repeat(indent);
+        // Initializer mode detection (see design decision 2): the class has a method whose literal name is `__init__` and that is not `#[new]`.
+        let has_explicit_init = Self::class_has_explicit_init(class);
 
         if let Some(ov) = self.find_method_override(class, m).cloned() {
             if let Some(stub) = ov.stub.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -790,6 +852,7 @@ impl<'a> GenCtx<'a> {
                     used: &mut used,
                     return_override,
                     touch_discarded_return: false,
+                    has_explicit_init,
                 },
             )?;
 
@@ -817,6 +880,7 @@ impl<'a> GenCtx<'a> {
                 used: &mut unused,
                 return_override: None,
                 touch_discarded_return: true,
+                has_explicit_init,
             },
         )?;
         self.emit_method_doc_or_placeholder(m, out, &pad, indent);
@@ -2556,6 +2620,206 @@ mod tests {
         assert!(
             stub.contains("def __init__(self, x: int) -> None:"),
             "#[new] must emit __init__, got:\n{stub}"
+        );
+    }
+
+    // ── Initializer mode: `#[new]` + explicit `__init__` generate `__new__` / `__init__` separately ──
+    // See openspec/changes/distinguish-new-and-init (follows the PyO3 Initializer docs).
+
+    /// Build an Initializer-mode class: a `#[new]` method + an explicit `fn __init__`.
+    fn make_initializer_mode_class(class_name: &str) -> PyClass {
+        let new_method = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param("value", syn::parse_quote! { i32 })],
+            syn::parse_quote! { Self },
+        );
+        let init_method = make_method(
+            "__init__",
+            MethodKind::Instance,
+            vec![make_param("value", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        make_class_with_methods(class_name, vec![new_method, init_method])
+    }
+
+    /// Initializer mode: `#[new]` -> `__new__(cls, ...)`, explicit `__init__` -> `__init__(self, ...) -> None`,
+    /// and the two are not duplicated.
+    #[test]
+    fn initializer_mode_emits_new_and_init_separately() {
+        let class = make_initializer_mode_class("MyDict");
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        // Default python_version 3.10 (< 3.11) -> `__new__` returns the class name.
+        assert!(
+            stub.contains("def __new__(cls, value: int) -> MyDict:"),
+            "Initializer mode MUST emit __new__(cls, ...) -> class name, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def __init__(self, value: int) -> None"),
+            "explicit __init__ MUST emit __init__(self, ...) -> None, got:\n{stub}"
+        );
+        assert_eq!(
+            stub.matches("def __new__").count(),
+            1,
+            "there should be exactly one def __new__, got:\n{stub}"
+        );
+        assert_eq!(
+            stub.matches("def __init__").count(),
+            1,
+            "there should be exactly one def __init__ (no duplication), got:\n{stub}"
+        );
+    }
+
+    /// python_version 3.12 (>= 3.11): `__new__` returns `t.Self`.
+    #[test]
+    fn initializer_mode_py312_returns_t_self() {
+        let config = config_with_python_version("3.12");
+        let class = make_initializer_mode_class("MyDict");
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def __new__(cls, value: int) -> t.Self:"),
+            "py 3.12 __new__ MUST return t.Self, got:\n{stub}"
+        );
+        assert!(stub.contains("import typing as t"), "got:\n{stub}");
+    }
+
+    /// python_version 3.9 (< 3.11): `__new__` returns the class name + future annotations.
+    #[test]
+    fn initializer_mode_py39_returns_class_name() {
+        let config = config_with_python_version("3.9");
+        let class = make_initializer_mode_class("MyDict");
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("def __new__(cls, value: int) -> MyDict:"),
+            "py 3.9 __new__ MUST return the class name, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("from __future__ import annotations"),
+            "py 3.9 MUST emit future annotations, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("t.Self"),
+            "py 3.9 MUST NOT use t.Self, got:\n{stub}"
+        );
+    }
+
+    /// No explicit `__init__`: `#[new] fn new()` -> `__init__` (existing behavior unchanged).
+    #[test]
+    fn new_without_explicit_init_emits_init() {
+        let class = make_class_with_methods(
+            "C",
+            vec![make_method(
+                "new",
+                MethodKind::New,
+                vec![make_param("value", syn::parse_quote! { i32 })],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, value: int) -> None"),
+            "with no explicit __init__, #[new] MUST emit __init__, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("def __new__"),
+            "MUST NOT emit __new__, got:\n{stub}"
+        );
+    }
+
+    /// No explicit `__init__` and the `#[new]` method is named `__new__`: still emits `__init__` (the method name is not a branching criterion).
+    #[test]
+    fn new_named_new_underscore_without_init_still_emits_init() {
+        let class = make_class_with_methods(
+            "C",
+            vec![make_method(
+                "__new__",
+                MethodKind::New,
+                vec![make_param("value", syn::parse_quote! { i32 })],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, value: int) -> None"),
+            "#[new] named __new__ but with no explicit __init__ still MUST emit __init__, got:\n{stub}"
+        );
+        assert!(!stub.contains("def __new__"), "got:\n{stub}");
+    }
+
+    /// The `#[new]` method is literally named `__init__` (no standalone `__init__`): does not trigger Initializer, collapses to `__init__`.
+    #[test]
+    fn new_named_init_not_initializer_mode() {
+        let class = make_class_with_methods(
+            "C",
+            vec![make_method(
+                "__init__",
+                MethodKind::New,
+                vec![make_param("value", syn::parse_quote! { i32 })],
+                syn::parse_quote! { Self },
+            )],
+        );
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, value: int) -> None"),
+            "#[new] fn __init__ (no standalone __init__) MUST collapse to __init__, got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("def __new__"),
+            "MUST NOT trigger Initializer, got:\n{stub}"
+        );
+    }
+
+    /// `#[pyo3(name = "__init__")]` (rust_ident != `__init__`) does not trigger Initializer mode.
+    #[test]
+    fn pyo3_name_init_does_not_trigger_initializer() {
+        let new_method = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param("value", syn::parse_quote! { i32 })],
+            syn::parse_quote! { Self },
+        );
+        // Simulate #[pyo3(name = "__init__")]: rust_ident differs from name.
+        let renamed = PyMethod {
+            rust_ident: "my_init".to_string(),
+            name: "__init__".to_string(),
+            doc: vec![],
+            kind: MethodKind::Instance,
+            signature_override: None,
+            params: vec![make_param("value", syn::parse_quote! { i32 })],
+            return_type: PyType {
+                rust_type: syn::parse_quote! { () },
+                override_str: None,
+            },
+        };
+        let class = make_class_with_methods("C", vec![new_method, renamed]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            !stub.contains("def __new__"),
+            "#[pyo3(name=__init__)] MUST NOT trigger Initializer (no __new__), got:\n{stub}"
+        );
+    }
+
+    /// Initializer mode: an override on `::Class::__init__` matches only the explicit `__init__` and does not affect `#[new]`'s `__new__`
+    /// (no duplicate match invariant, see design decision 5).
+    #[test]
+    fn initializer_mode_override_init_does_not_hit_new() {
+        use crate::config::OverrideEntry;
+        let mut config = Config::default();
+        config.overrides.push(OverrideEntry {
+            item: "m::MyDict::__init__".to_string(),
+            stub: Some("def __init__(self, overridden: int) -> None:".to_string()),
+            param_types: None,
+            return_type: None,
+        });
+        let class = make_initializer_mode_class("MyDict");
+        let stub = stub_for_config(vec![PyItem::Class(class)], &config);
+        assert!(
+            stub.contains("overridden"),
+            "override __init__ MUST match the explicit __init__, got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def __new__(cls, value: int) -> MyDict:"),
+            "override __init__ MUST NOT affect #[new]'s __new__ (no duplicate match), got:\n{stub}"
         );
     }
 
