@@ -1000,7 +1000,12 @@ impl<'a> GenCtx<'a> {
                     }
                     match default_opt {
                         Some(default) => {
-                            let py_default = normalize_default_value(default);
+                            let (py_default, safe) = normalize_default_value_checked(default);
+                            if !safe {
+                                self.warnings.push(format!(
+                                    "rylai: [signature] could not translate default `{default}` for parameter `{name}` in `{fn_name}` — used `...` placeholder"
+                                ));
+                            }
                             out_parts.push(format!("{name}: {ty} = {py_default}"))
                         }
                         None => out_parts.push(format!("{name}: {ty}")),
@@ -1455,48 +1460,94 @@ fn split_name_default(token: &str) -> (&str, Option<&str>) {
 }
 
 /// Normalize a Rust default-value expression (taken from a `#[pyo3(signature = (...)]`
-/// entry) into its Python equivalent for the `.pyi`.
+/// entry) into its Python equivalent for the `.pyi`, and report whether the
+/// translation is safe.
+///
+/// Returns `(py_default, safe)`: `safe` is `false` when the Rust expression
+/// could not be turned into a valid Python literal — in that case the value is
+/// the `...` placeholder (PEP 484 "defaulted, value irrelevant") and callers
+/// should record a warning so the fallback is visible.
 ///
 /// `syn` stringifies token streams with single spaces between tokens, so a Rust
 /// default like `vec![]` arrives here as `vec ! []` and `(1, 2, 3)` as `(1 , 2 , 3)`.
 /// We tolerate that spacing.
 ///
-/// Currently mapped:
+/// Currently mapped (all safe):
+/// - `true` / `false`                             → `True` / `False`
 /// - `vec![]` / `vec![...]`                       → `[]` / `[...]`
 /// - `Vec::new()`                                 → `[]`
 /// - `HashMap::new()` / `BTreeMap::new()`         → `{}`
 /// - `HashSet::new()` / `BTreeSet::new()`         → `set()`
 ///
 /// Tuples `(a, b, ...)` are already valid Python and are passed through, but the
-/// noisy ` , ` spacing syn injects is tidied to `, `.
+/// noisy ` , ` spacing syn injects is tidied to `, ` (string-literal-aware, so
+/// commas inside a Rust string are preserved).
+///
+/// Mapped to `...` + unsafe (no valid Python literal form):
+/// - `vec![x; n]` repeat-fill
+/// - nested `vec![vec![...]]` (only the outer layer is stripped)
 ///
 /// Everything else (numbers, strings, `None`, identifiers, ...) is returned
 /// unchanged — those are already valid Python literals or are emitted verbatim on
 /// purpose (e.g. an opaque expression we cannot safely translate).
-fn normalize_default_value(default: &str) -> String {
+fn normalize_default_value_checked(default: &str) -> (String, bool) {
     let d = default.trim();
 
-    // `vec![...]` macro form.
+    // Rust bool literals are lowercase; Python needs `True`/`False`.
+    // (`True`/`False` already pass through unchanged below.)
+    match d {
+        "true" => return ("True".to_string(), true),
+        "false" => return ("False".to_string(), true),
+        _ => {}
+    }
+
+    // `vec![...]` macro form. Two sub-cases we cannot translate:
+    //   - repeat-fill `vec![x; n]` (no direct Python literal)
+    //   - a nested `vec ! [...]` (only the outer layer is stripped here)
+    // In both, the cleaned inner still carries ` ; ` or a `vec !` token —
+    // invalid Python — so we fall back to `...` (PEP 484 "defaulted, value
+    // irrelevant") and flag it unsafe so a warning is recorded.
     if let Some(inner) = match_vec_macro(d) {
-        return format!("[{}]", clean_list_ws(&inner));
+        let cleaned = clean_list_ws(&inner);
+        // Detect untranslatable forms *outside* string literals: a `;` repeat
+        // separator or a nested `vec!` macro. Scanning the cleaned text directly
+        // would false-positive on string elements like `vec!["a;b"]` or
+        // `vec!["vec!"]` — both are valid Python once the outer macro is stripped.
+        if contains_outside_strings(&cleaned, ";") || contains_outside_strings(&cleaned, "vec!") {
+            return ("...".to_string(), false);
+        }
+        return (format!("[{}]", cleaned), true);
     }
 
     // `T::new()` collection constructors. Whitespace is insignificant for these
     // (no string literals are possible here), so squash all spaces before comparing.
     let squashed: String = d.chars().filter(|c| !c.is_whitespace()).collect();
     match squashed.as_str() {
-        "Vec::new()" => return "[]".to_string(),
-        "HashMap::new()" | "BTreeMap::new()" => return "{}".to_string(),
-        "HashSet::new()" | "BTreeSet::new()" => return "set()".to_string(),
+        "Vec::new()" => return ("[]".to_string(), true),
+        "HashMap::new()" | "BTreeMap::new()" => return ("{}".to_string(), true),
+        "HashSet::new()" | "BTreeSet::new()" => return ("set()".to_string(), true),
         _ => {}
     }
 
     // Tuples are valid Python; just tidy the ` , ` spacing syn injects.
     if d.starts_with('(') && d.ends_with(')') {
-        return clean_list_ws(d);
+        return (clean_list_ws(d), true);
     }
 
-    default.to_string()
+    // Numbers, strings, `None`, identifiers, and anything else we cannot
+    // classify are emitted verbatim. A Rust token like a stray `vec ! ...` or
+    // a path expression is not guaranteed to be valid Python, but we cannot
+    // safely rewrite it either, so we keep the existing pass-through behavior
+    // rather than guessing.
+    (default.to_string(), true)
+}
+
+/// Test-only convenience wrapper around [`normalize_default_value_checked`]
+/// that drops the safety flag — for assertions that only care about the
+/// rendered value.
+#[cfg(test)]
+fn normalize_default_value(default: &str) -> String {
+    normalize_default_value_checked(default).0
 }
 
 /// Recognize the `vec![...]` macro as stringified by syn (`vec ! [...]`).
@@ -1555,6 +1606,46 @@ fn clean_list_ws(s: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Test whether `needle` occurs in `haystack` *outside* Rust string literals.
+///
+/// Pairs with [`clean_list_ws`] (same string-scanning convention): the two
+/// needles we care about (`;` and `vec!`) are meaningful only as Rust tokens,
+/// so a match buried inside a `"..."` literal — e.g. `vec!["a;b"]` or
+/// `vec!["vec!"]` — must not count. Whitespace *between* tokens outside a
+/// string is ignored, so a needle like `vec!` still matches the syn-stringified
+/// form `vec !`. Returns `false` when `needle` is empty.
+fn contains_outside_strings(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    // Collect only code (non-string) characters, dropping whitespace, so the
+    // subsequence match ignores syn's single-space token separation. String
+    // literals are skipped wholesale, keeping any `;`/`vec!` inside them inert.
+    let mut code_only = String::with_capacity(haystack.len());
+    let bytes = haystack.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                let d = bytes[i];
+                i += 1;
+                if d == b'\\' && i < bytes.len() {
+                    i += 1;
+                } else if d == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            code_only.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    code_only.contains(needle)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1916,6 +2007,99 @@ mod tests {
         );
     }
 
+    // ── normalize_default_value_checked (bool + unsafe vec variants) ────────
+
+    #[test]
+    fn normalize_default_translates_rust_bool_to_python() {
+        // Rust `true`/`false` are lowercase idents; Python needs `True`/`False`.
+        // Both are safe translations (no warning).
+        assert_eq!(
+            normalize_default_value_checked("true"),
+            ("True".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("false"),
+            ("False".to_string(), true)
+        );
+        // Already-Python `True`/`False` still pass through unchanged.
+        assert_eq!(
+            normalize_default_value_checked("True"),
+            ("True".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("False"),
+            ("False".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn normalize_default_unsafe_vec_repeat_fill() {
+        // `vec![x; n]` has no Python literal form → `...` + unsafe.
+        let (val, safe) = normalize_default_value_checked("vec ! [0 ; 3]");
+        assert_eq!(val, "...");
+        assert!(!safe);
+    }
+
+    #[test]
+    fn normalize_default_unsafe_nested_vec_macro() {
+        // Nested `vec![vec![...]]` leaves an inner `vec !` → invalid Python → `...` + unsafe.
+        let (val, safe) = normalize_default_value_checked("vec ! [vec ! [1]]");
+        assert_eq!(val, "...");
+        assert!(!safe);
+    }
+
+    #[test]
+    fn normalize_default_string_with_semicolon_stays_safe() {
+        // A `;` or `vec!` *inside* a string literal is not a Rust token — the
+        // result is valid Python (`["a;b"]`), so it must stay safe (no warning).
+        assert_eq!(
+            normalize_default_value_checked("vec ! [\"a;b\"]"),
+            ("[\"a;b\"]".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn normalize_default_string_spelling_vec_macro_stays_safe() {
+        // The literal text `vec!` inside a string is harmless — stay safe.
+        assert_eq!(
+            normalize_default_value_checked("vec ! [\"vec!\"]"),
+            ("[\"vec!\"]".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn normalize_default_safe_variants_stay_safe() {
+        // Known-good forms must all remain safe (no warning) under the checked API.
+        assert_eq!(
+            normalize_default_value_checked("vec ! []"),
+            ("[]".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("vec ! [1 , 2]"),
+            ("[1, 2]".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("Vec :: new()"),
+            ("[]".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("HashMap :: new()"),
+            ("{}".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("(1 , 2)"),
+            ("(1, 2)".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("0"),
+            ("0".to_string(), true)
+        );
+        assert_eq!(
+            normalize_default_value_checked("None"),
+            ("None".to_string(), true)
+        );
+    }
+
     // ── merge_sig_with_types (via generate) ──────────────────────────────────
 
     /// Regular params with defaults get their Rust types attached.
@@ -1975,6 +2159,57 @@ mod tests {
             stub.contains("color: tuple[int, int, int] = (255, 255, 0)"),
             "got:\n{stub}"
         );
+    }
+
+    /// Rust bool defaults (`true`/`false`) must become Python `True`/`False`,
+    /// not the lowercase Rust form which is invalid Python.
+    #[test]
+    fn merge_rust_bool_default_becomes_python_bool() {
+        let f = make_fn(
+            "render",
+            Some("verbose=true, quiet=false"),
+            vec![
+                make_param("verbose", syn::parse_quote! { bool }),
+                make_param("quiet", syn::parse_quote! { bool }),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("verbose: bool = True"), "got:\n{stub}");
+        assert!(stub.contains("quiet: bool = False"), "got:\n{stub}");
+        // Lowercase rust forms must not leak through.
+        assert!(!stub.contains("= true"), "got:\n{stub}");
+        assert!(!stub.contains("= false"), "got:\n{stub}");
+    }
+
+    /// `vec![x; n]` (repeat-fill) has no Python literal form — the stub falls
+    /// back to the `...` placeholder instead of emitting invalid `[0 ; 3]`.
+    #[test]
+    fn merge_unsafe_vec_repeat_fill_uses_ellipsis() {
+        let f = make_fn(
+            "alloc",
+            Some("buf=vec ! [0 ; 3]"),
+            vec![make_param("buf", syn::parse_quote! { Vec<i32> })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("buf: list[int] = ..."), "got:\n{stub}");
+        // The invalid `;` form must not reach the stub.
+        assert!(!stub.contains(" ; "), "got:\n{stub}");
+    }
+
+    /// Nested `vec![vec![...]]` likewise falls back to `...`.
+    #[test]
+    fn merge_unsafe_nested_vec_uses_ellipsis() {
+        let f = make_fn(
+            "grid",
+            Some("rows=vec ! [vec ! [1]]"),
+            vec![make_param("rows", syn::parse_quote! { Vec<Vec<i32>> })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(stub.contains("rows: list[list[int]] = ..."), "got:\n{stub}");
+        assert!(!stub.contains("vec"), "got:\n{stub}");
     }
 
     /// Required params (no default in signature) get typed but no `= ...`.
