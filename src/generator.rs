@@ -999,7 +999,10 @@ impl<'a> GenCtx<'a> {
                         used.insert(normalize_param_types_key(name));
                     }
                     match default_opt {
-                        Some(default) => out_parts.push(format!("{name}: {ty} = {default}")),
+                        Some(default) => {
+                            let py_default = normalize_default_value(default);
+                            out_parts.push(format!("{name}: {ty} = {py_default}"))
+                        }
                         None => out_parts.push(format!("{name}: {ty}")),
                     }
                 } else {
@@ -1451,6 +1454,69 @@ fn split_name_default(token: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Normalize a Rust default-value expression (taken from a `#[pyo3(signature = (...)]`
+/// entry) into its Python equivalent for the `.pyi`.
+///
+/// `syn` stringifies token streams with single spaces between tokens, so a Rust
+/// default like `vec![]` arrives here as `vec ! []` and `(1, 2, 3)` as `(1 , 2 , 3)`.
+/// We tolerate that spacing.
+///
+/// Currently mapped:
+/// - `vec![]` / `vec![...]`                       → `[]` / `[...]`
+/// - `Vec::new()`                                 → `[]`
+/// - `HashMap::new()` / `BTreeMap::new()`         → `{}`
+/// - `HashSet::new()` / `BTreeSet::new()`         → `set()`
+///
+/// Tuples `(a, b, ...)` are already valid Python and are passed through, but the
+/// noisy ` , ` spacing syn injects is tidied to `, `.
+///
+/// Everything else (numbers, strings, `None`, identifiers, ...) is returned
+/// unchanged — those are already valid Python literals or are emitted verbatim on
+/// purpose (e.g. an opaque expression we cannot safely translate).
+fn normalize_default_value(default: &str) -> String {
+    let d = default.trim();
+
+    // `vec![...]` macro form.
+    if let Some(inner) = match_vec_macro(d) {
+        return format!("[{}]", clean_list_ws(&inner));
+    }
+
+    // `T::new()` collection constructors. Whitespace is insignificant for these
+    // (no string literals are possible here), so squash all spaces before comparing.
+    let squashed: String = d.chars().filter(|c| !c.is_whitespace()).collect();
+    match squashed.as_str() {
+        "Vec::new()" => return "[]".to_string(),
+        "HashMap::new()" | "BTreeMap::new()" => return "{}".to_string(),
+        "HashSet::new()" | "BTreeSet::new()" => return "set()".to_string(),
+        _ => {}
+    }
+
+    // Tuples are valid Python; just tidy the ` , ` spacing syn injects.
+    if d.starts_with('(') && d.ends_with(')') {
+        return clean_list_ws(d);
+    }
+
+    default.to_string()
+}
+
+/// Recognize the `vec![...]` macro as stringified by syn (`vec ! [...]`).
+/// Returns the bracket contents unchanged, or `None` if `d` is not this form.
+/// Only a single level is recognized; a nested `vec![...]` inside is left as-is.
+fn match_vec_macro(d: &str) -> Option<String> {
+    let after_vec = d.strip_prefix("vec")?;
+    let after_bang = after_vec.trim_start().strip_prefix('!')?;
+    let after_bracket = after_bang.trim_start().strip_prefix('[')?;
+    let inner = after_bracket.strip_suffix(']')?;
+    Some(inner.to_string())
+}
+
+/// Tidy the spacing syn injects between list elements: `1 , 2` → `1, 2`.
+/// Only the ` , ` form is rewritten, which never appears inside a Rust string
+/// literal in this context, so it is safe.
+fn clean_list_ws(s: &str) -> String {
+    s.trim().replace(" , ", ", ")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1740,6 +1806,56 @@ mod tests {
         assert_eq!(split_name_default("clip=(1,2)"), ("clip", Some("(1,2)")));
     }
 
+    // ── normalize_default_value ──────────────────────────────────────────────
+
+    #[test]
+    fn normalize_default_empty_vec_macro() {
+        // syn stringifies `vec![]` as `vec ! []`
+        assert_eq!(normalize_default_value("vec ! []"), "[]");
+    }
+
+    #[test]
+    fn normalize_default_vec_macro_with_items() {
+        // syn inserts ` , ` between items
+        assert_eq!(normalize_default_value("vec ! [1 , 2 , 3]"), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn normalize_default_vec_new() {
+        assert_eq!(normalize_default_value("Vec :: new()"), "[]");
+    }
+
+    #[test]
+    fn normalize_default_map_new() {
+        assert_eq!(normalize_default_value("HashMap :: new()"), "{}");
+        assert_eq!(normalize_default_value("BTreeMap :: new()"), "{}");
+    }
+
+    #[test]
+    fn normalize_default_set_new() {
+        assert_eq!(normalize_default_value("HashSet :: new()"), "set()");
+        assert_eq!(normalize_default_value("BTreeSet :: new()"), "set()");
+    }
+
+    #[test]
+    fn normalize_default_tuple_tidy_and_empty() {
+        // syn emits `(255 , 255 , 0)` — tidied but otherwise valid Python.
+        assert_eq!(normalize_default_value("(255 , 255 , 0)"), "(255, 255, 0)");
+        // Unit tuple `()` stays as-is.
+        assert_eq!(normalize_default_value("()"), "()");
+    }
+
+    #[test]
+    fn normalize_default_passes_through_literals() {
+        // Numbers, None, strings and identifiers are already valid Python.
+        assert_eq!(normalize_default_value("0"), "0");
+        assert_eq!(normalize_default_value("None"), "None");
+        assert_eq!(normalize_default_value("True"), "True");
+        assert_eq!(normalize_default_value("\"x\""), "\"x\"");
+        // Unknown expressions are emitted unchanged.
+        assert_eq!(normalize_default_value("foo + 1"), "foo + 1");
+    }
+
     // ── merge_sig_with_types (via generate) ──────────────────────────────────
 
     /// Regular params with defaults get their Rust types attached.
@@ -1757,6 +1873,48 @@ mod tests {
         let stub = stub_for(vec![PyItem::Function(f)]);
         assert!(stub.contains("page: int | None = None"), "got:\n{stub}");
         assert!(stub.contains("clip: str | None = None"), "got:\n{stub}");
+    }
+
+    /// `vec![]` default (a Vec param) is translated to `[]`, not emitted as the
+    /// raw Rust macro. Reproduces the ConsumerClient case.
+    #[test]
+    fn merge_vec_macro_default_becomes_empty_list() {
+        let f = make_fn(
+            "connect",
+            Some("address, object_store_url, object_store_options=vec ! []"),
+            vec![
+                make_param("address", syn::parse_quote! { String }),
+                make_param("object_store_url", syn::parse_quote! { String }),
+                make_param(
+                    "object_store_options",
+                    syn::parse_quote! { Vec<(String, String)> },
+                ),
+            ],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("object_store_options: list[tuple[str, str]] = []"),
+            "got:\n{stub}"
+        );
+        // The raw Rust macro must not leak through.
+        assert!(!stub.contains("vec"), "got:\n{stub}");
+    }
+
+    /// A tuple default is valid Python; syn's noisy ` , ` spacing is tidied.
+    #[test]
+    fn merge_tuple_default_tidied() {
+        let f = make_fn(
+            "draw",
+            Some("color = (255 , 255 , 0)"),
+            vec![make_param("color", syn::parse_quote! { (u8, u8, u8) })],
+            syn::parse_quote! { () },
+        );
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("color: tuple[int, int, int] = (255, 255, 0)"),
+            "got:\n{stub}"
+        );
     }
 
     /// Required params (no default in signature) get typed but no `= ...`.
