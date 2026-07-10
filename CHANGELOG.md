@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-11
+
 ### Fixed
 
-- Translate Rust collection defaults in `#[pyo3(signature = (...))]` to Python instead of emitting them verbatim: `vec![]`/`Vec::new()` → `[]`, `vec![a, b]` → `[a, b]`, `HashMap::new()`/`BTreeMap::new()` → `{}`, `HashSet::new()`/`BTreeSet::new()` → `set()`. Previously produced invalid Python like `= vec ! []`. Scalar and unknown defaults pass through unchanged.
-- Tidy `syn`'s spacing in tuple defaults: `(255 , 255 , 0)` → `(255, 255, 0)`.
-- Translate Rust `true`/`false` bool defaults to Python `True`/`False` instead of emitting the invalid-Python lowercase form.
-- Fall back to the `...` placeholder (with a warning) for defaults that have no Python literal form: `vec![x; n]` repeat-fill and nested `vec![vec![...]]`. (Previously emitted invalid Python.)
+- Translate Rust collection defaults in `#[pyo3(signature = (...))]` to Python instead of emitting them verbatim: `vec![]`/`Vec::new()` → `[]`, `vec![a, b]` → `[a, b]`, `HashMap::new()`/`BTreeMap::new()` → `{}`, `HashSet::new()`/`BTreeSet::new()` → `set()`. Previously produced invalid Python like `= vec ! []`. Scalar and unknown defaults pass through unchanged. (#10)
+- Tidy `syn`'s spacing in tuple defaults: `(255 , 255 , 0)` → `(255, 255, 0)`. (#10)
+- Translate Rust `true`/`false` bool defaults to Python `True`/`False` instead of emitting the invalid-Python lowercase form. (#10)
+- Fall back to the `...` placeholder (with a warning) for defaults that have no Python literal form: `vec![x; n]` repeat-fill and nested `vec![vec![...]]`. (Previously emitted invalid Python.) (#10)
 
 ## [0.5.0] - 2026-06-14
 
@@ -124,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/monchin/Rylai/releases/tag/v0.5.1
 [0.5.0]: https://github.com/monchin/Rylai/releases/tag/v0.5.0
 [0.4.1]: https://github.com/monchin/Rylai/releases/tag/v0.4.1
 [0.4.0]: https://github.com/monchin/Rylai/releases/tag/v0.4.0
