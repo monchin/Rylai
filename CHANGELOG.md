@@ -7,11 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Translate Rust collection defaults in `#[pyo3(signature = (...))]` to Python instead of emitting them verbatim: `vec![]`/`Vec::new()` → `[]`, `vec![a, b]` → `[a, b]`, `HashMap::new()`/`BTreeMap::new()` → `{}`, `HashSet::new()`/`BTreeSet::new()` → `set()`. Previously produced invalid Python like `= vec ! []`. Scalar and unknown defaults pass through unchanged.
-- Tidy `syn`'s spacing in tuple defaults: `(255 , 255 , 0)` → `(255, 255, 0)`.
-
 ## [0.5.0] - 2026-06-14
 
 ### Added
