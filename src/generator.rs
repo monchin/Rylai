@@ -1511,10 +1511,50 @@ fn match_vec_macro(d: &str) -> Option<String> {
 }
 
 /// Tidy the spacing syn injects between list elements: `1 , 2` → `1, 2`.
-/// Only the ` , ` form is rewritten, which never appears inside a Rust string
-/// literal in this context, so it is safe.
+///
+/// Scans with awareness of Rust string literals so that ` , ` inside a string
+/// is preserved verbatim — e.g. `vec ! ["a , b"]` stays `["a , b"]`, and
+/// `("x , y" , 1)` becomes `("x , y", 1)` (only the outer comma is tightened).
+/// Only the leading space of a ` , ` sequence is dropped; everything else is
+/// copied unchanged.
 fn clean_list_ws(s: &str) -> String {
-    s.trim().replace(" , ", ", ")
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        // String literal: copy verbatim (honoring `\"` escapes) so commas
+        // inside the string are never touched.
+        if c == b'"' {
+            out.push('"');
+            i += 1;
+            while i < bytes.len() {
+                let d = bytes[i];
+                out.push(d as char);
+                i += 1;
+                if d == b'\\' && i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                } else if d == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Collapse syn's ` , ` spacing to `, ` by dropping the leading space.
+        if c == b' ' && bytes.get(i + 1) == Some(&b',') {
+            i += 1;
+            continue;
+        }
+
+        out.push(c as char);
+        i += 1;
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1854,6 +1894,26 @@ mod tests {
         assert_eq!(normalize_default_value("\"x\""), "\"x\"");
         // Unknown expressions are emitted unchanged.
         assert_eq!(normalize_default_value("foo + 1"), "foo + 1");
+    }
+
+    #[test]
+    fn normalize_default_preserves_commas_inside_strings() {
+        // ` , ` inside a string literal must not be rewritten — this used to
+        // corrupt defaults like `vec!["a , b"]` into `["a, b"]`.
+        assert_eq!(normalize_default_value("vec ! [\"a , b\"]"), "[\"a , b\"]");
+        // A trailing ` , ` before the close bracket still collapses; the
+        // comma inside the string does not.
+        assert_eq!(
+            normalize_default_value("vec ! [\"x , y\" , 2]"),
+            "[\"x , y\", 2]"
+        );
+        // Same hazard in tuple defaults: `("a , b" , 1)` → `("a , b", 1)`.
+        assert_eq!(normalize_default_value("(\"a , b\" , 1)"), "(\"a , b\", 1)");
+        // Escaped quote inside a string is not mistaken for the close.
+        assert_eq!(
+            normalize_default_value("vec ! [\"a\\\" , b\"]"),
+            "[\"a\\\" , b\"]"
+        );
     }
 
     // ── merge_sig_with_types (via generate) ──────────────────────────────────
