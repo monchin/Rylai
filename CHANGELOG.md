@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-12
+
 ### Added
 
-- `async fn` support: `#[pyfunction]`/`#[pymethods]` async functions render as `async def`. Return types stay the unwrapped inner type (no `Coroutine[...]` wrapper). `#[new]`, `#[getter]`, and `#[setter]` ignore the `async` flag.
-- Exclude `#[pyo3(cancel_handle)]` parameters from stubs (pyo3-injected, Python-invisible).
-- `examples/async_await_sample` demonstrating async functions and `cancel_handle`.
+- `async fn` support: `#[pyfunction]`/`#[pymethods]` async functions render as `async def`. Return types stay the unwrapped inner type (no `Coroutine[...]` wrapper). `#[new]`, `#[getter]`, and `#[setter]` ignore the `async` flag. (#11)
+- Exclude `#[pyo3(cancel_handle)]` parameters from stubs (pyo3-injected, Python-invisible). (#11)
+- `examples/async_await_sample` demonstrating async functions and `cancel_handle`. (#11)
 
 ## [0.5.1] - 2026-07-11
 
@@ -132,7 +134,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for `#[pymodule]`, `#[pyfunction]`, `#[pyclass]` and `#[pymethods]`.
 - Configurable behavior via `rylai.toml` (output, fallback, type_map, overrides).
 
-[Unreleased]: https://github.com/monchin/Rylai/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/monchin/Rylai/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/monchin/Rylai/releases/tag/v0.6.0
 [0.5.1]: https://github.com/monchin/Rylai/releases/tag/v0.5.1
 [0.5.0]: https://github.com/monchin/Rylai/releases/tag/v0.5.0
 [0.4.1]: https://github.com/monchin/Rylai/releases/tag/v0.4.1
