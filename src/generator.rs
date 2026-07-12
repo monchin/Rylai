@@ -598,7 +598,11 @@ impl<'a> GenCtx<'a> {
             self.gen_params(&f.params, &f.name, lookup, used)?
         };
 
-        out.push_str(&format!("{pad}def {}({params_str}) -> {ret}:\n", f.name));
+        out.push_str(&format!(
+            "{pad}{} {}({params_str}) -> {ret}:\n",
+            Self::def_keyword(f.is_async),
+            f.name
+        ));
 
         if !f.doc.is_empty() {
             self.gen_docstring(&f.doc, out, indent + 1);
@@ -744,6 +748,14 @@ impl<'a> GenCtx<'a> {
         Ok(val_type)
     }
 
+    /// `def` keyword for an async-aware callable: `async def` when `is_async`, else `def`. Used for
+    /// `#[pyfunction]` and Instance / Static / Class methods. `#[new]` (→ `__init__`), getter, setter
+    /// ignore `is_async` and always render plain `def` (async is invalid for them in Python and
+    /// unsupported by pyo3).
+    fn def_keyword(is_async: bool) -> &'static str {
+        if is_async { "async def" } else { "def" }
+    }
+
     /// Decorators and `def` line for a `#[pymethods]` entry (no docstring / body line).
     ///
     /// When `touch_discarded_return` is true (normal generation), `m.return_type` is still resolved
@@ -785,14 +797,22 @@ impl<'a> GenCtx<'a> {
             MethodKind::Static => {
                 out.push_str(&format!("{pad}@staticmethod\n"));
                 let params = self.method_params(m, location, None, lookup, used)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+                out.push_str(&format!(
+                    "{pad}{} {}({params}) -> {ret}:\n",
+                    Self::def_keyword(m.is_async),
+                    m.name
+                ));
             }
             MethodKind::Class => {
                 out.push_str(&format!("{pad}@classmethod\n"));
                 // A classmethod's implicit receiver is `cls` (PEP 673), not `self`. method_params
                 // injects a bare `cls` (no annotation, matching typeshed) before the remaining params.
                 let params = self.method_params(m, location, Some("cls"), lookup, used)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+                out.push_str(&format!(
+                    "{pad}{} {}({params}) -> {ret}:\n",
+                    Self::def_keyword(m.is_async),
+                    m.name
+                ));
             }
             MethodKind::Getter(prop) => {
                 out.push_str(&format!("{pad}@property\n"));
@@ -807,7 +827,11 @@ impl<'a> GenCtx<'a> {
             }
             MethodKind::Instance => {
                 let params = self.method_params(m, location, Some("self"), lookup, used)?;
-                out.push_str(&format!("{pad}def {}({params}) -> {ret}:\n", m.name));
+                out.push_str(&format!(
+                    "{pad}{} {}({params}) -> {ret}:\n",
+                    Self::def_keyword(m.is_async),
+                    m.name
+                ));
             }
         }
         Ok(())
@@ -1688,6 +1712,7 @@ mod tests {
                 rust_type: ret,
                 override_str: None,
             },
+            is_async: false,
             source_file: dummy_path(),
         }
     }
@@ -1725,6 +1750,7 @@ mod tests {
                     rust_type: syn::parse_quote! { pyo3::PyResult<Self> },
                     override_str: None,
                 },
+                is_async: false,
             }],
             source_file: dummy_path(),
         }
@@ -3063,6 +3089,7 @@ mod tests {
                 rust_type: syn::parse_quote! { () },
                 override_str: None,
             },
+            is_async: false,
         };
         let class = PyClass {
             name: "TfSettings".to_string(),
@@ -3133,6 +3160,7 @@ mod tests {
                 rust_type: syn::parse_quote! { () },
                 override_str: None,
             },
+            is_async: false,
         };
         let class = make_class_with_methods("TfSettings", vec![m]);
         let stub = stub_for_config(vec![PyItem::Class(class)], &config);
@@ -3164,6 +3192,7 @@ mod tests {
                 rust_type: syn::parse_quote! { &'static str },
                 override_str: None,
             },
+            is_async: false,
         };
         let class = PyClass {
             name: "Visible".to_string(),
@@ -3204,6 +3233,7 @@ mod tests {
                 rust_type: syn::parse_quote! { &'static str },
                 override_str: None,
             },
+            is_async: false,
         };
         let class = PyClass {
             name: "Visible".to_string(),
@@ -3299,6 +3329,7 @@ mod tests {
                 rust_type: ret,
                 override_str: None,
             },
+            is_async: false,
         }
     }
 
@@ -3503,6 +3534,7 @@ mod tests {
                 rust_type: syn::parse_quote! { () },
                 override_str: None,
             },
+            is_async: false,
         };
         let class = make_class_with_methods("C", vec![new_method, renamed]);
         let stub = stub_for(vec![PyItem::Class(class)]);
@@ -4103,6 +4135,137 @@ mod tests {
         assert!(
             stub.contains("\"_hidden\""),
             "per-file include_private=true should override global false; got:\n{stub}"
+        );
+    }
+
+    // ── async def emission ───────────────────────────────────────────────────
+
+    #[test]
+    fn async_pyfunction_emits_async_def() {
+        // is_async = true → `async def`; return type stays the unwrapped inner type (no Coroutine).
+        let mut f = make_fn(
+            "fetch",
+            None,
+            vec![],
+            syn::parse_quote! { pyo3::PyResult<String> },
+        );
+        f.is_async = true;
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("async def fetch() -> str:"),
+            "async PyFunction must render async def with inner return type; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("Coroutine"),
+            "must NOT wrap return type in Coroutine; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn sync_pyfunction_still_emits_def() {
+        // Regression: sync functions are unaffected.
+        let f = make_fn("fetch", None, vec![], syn::parse_quote! { String });
+        let stub = stub_for(vec![PyItem::Function(f)]);
+        assert!(
+            stub.contains("def fetch() -> str:\n"),
+            "sync function must render plain def; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("async def fetch"),
+            "sync function must not gain async; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn async_pymethod_emits_async_def() {
+        // Instance / Static / Class async methods render async def; sync ones stay def.
+        fn async_method(name: &str, kind: MethodKind) -> PyMethod {
+            let mut m = make_method(
+                name,
+                kind,
+                vec![],
+                syn::parse_quote! { pyo3::PyResult<i32> },
+            );
+            m.is_async = true;
+            m
+        }
+        let methods = vec![
+            async_method("inst", MethodKind::Instance),
+            async_method("stat", MethodKind::Static),
+            async_method("cls", MethodKind::Class),
+            make_method(
+                "sync_inst",
+                MethodKind::Instance,
+                vec![],
+                syn::parse_quote! { i32 },
+            ),
+        ];
+        let class = make_class_with_methods("C", methods);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("async def inst(self) -> int:"),
+            "async instance method; got:\n{stub}"
+        );
+        assert!(
+            stub.contains("async def stat() -> int:"),
+            "async staticmethod; got:\n{stub}"
+        );
+        assert!(
+            stub.contains("async def cls(cls) -> int:"),
+            "async classmethod (bare cls); got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("async def sync_inst"),
+            "sync method must stay def; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn async_new_still_emits_sync_def() {
+        // async #[new] / getter / setter are invalid in Python + unsupported by pyo3 — the async
+        // flag MUST be ignored so the stub is always legal `def` / @property.
+        let mut new = make_method(
+            "new",
+            MethodKind::New,
+            vec![make_param("x", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        new.is_async = true;
+        let mut getter = make_method(
+            "value",
+            MethodKind::Getter("value".to_string()),
+            vec![],
+            syn::parse_quote! { i32 },
+        );
+        getter.is_async = true;
+        let mut setter = make_method(
+            "set_value",
+            MethodKind::Setter("value".to_string()),
+            vec![make_param("value", syn::parse_quote! { i32 })],
+            syn::parse_quote! { () },
+        );
+        setter.is_async = true;
+        let class = make_class_with_methods("C", vec![new, getter, setter]);
+        let stub = stub_for(vec![PyItem::Class(class)]);
+        assert!(
+            stub.contains("def __init__(self, x: int) -> None:"),
+            "async #[new] must still emit sync __init__; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("async def __init__"),
+            "async __init__ is illegal Python; got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def value(self) -> int:"),
+            "async getter must stay sync property; got:\n{stub}"
+        );
+        assert!(
+            stub.contains("def value(self, value: int) -> None:"),
+            "async setter must stay sync; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("async def value"),
+            "no async property/setter; got:\n{stub}"
         );
     }
 }
