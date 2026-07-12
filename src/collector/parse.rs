@@ -910,6 +910,7 @@ pub fn parse_pyfunction(
     let name = extract_pyo3_name(&f.attrs).unwrap_or_else(|| rust_name.clone());
     let doc = extract_doc(&f.attrs);
     let signature_override = extract_pyo3_signature(&f.attrs);
+    let is_async = f.sig.asyncness.is_some();
     let params = parse_params(
         &f.sig,
         config,
@@ -932,6 +933,7 @@ pub fn parse_pyfunction(
         signature_override,
         params,
         return_type,
+        is_async,
         source_file: path.to_path_buf(),
     })
 }
@@ -968,6 +970,11 @@ fn parse_params(
                 // Position-independent injected params (Python<'_>, &Bound<'_, PyModule>, …) are
                 // always excluded regardless of position.
                 if is_pure_injected_type(&pt.ty) {
+                    continue;
+                }
+                // `#[pyo3(cancel_handle)]` marks a pyo3-injected `CancelHandle` (async cancellation)
+                // that is invisible on the Python side — exclude it by attribute, not by type name.
+                if has_cancel_handle_attr(&pt.attrs) {
                     continue;
                 }
                 let name = match pt.pat.as_ref() {
@@ -1043,6 +1050,28 @@ fn pyo3_field_flags(attrs: &[Attribute]) -> (bool, bool) {
     (false, false)
 }
 
+/// Returns true if any attribute is `#[pyo3(cancel_handle)]` — a pyo3-injected async cancellation
+/// handle that is invisible on the Python side and must be excluded from the stub. Detection is
+/// keyed on the attribute (a bare `cancel_handle` ident inside the `#[pyo3(...)]` meta list), NOT on
+/// the parameter type name (`CancelHandle` belongs to pyo3's `experimental-async` feature).
+fn has_cancel_handle_attr(attrs: &[Attribute]) -> bool {
+    for attr in attrs {
+        if !attr.path().is_ident("pyo3") {
+            continue;
+        }
+        if let Meta::List(ml) = &attr.meta
+            && ml
+                .tokens
+                .to_string()
+                .split(',')
+                .any(|p| p.trim() == "cancel_handle")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build a [`PyType`] directly from a struct field's `syn::Type`.
 fn make_field_py_type(
     ty: &Type,
@@ -1108,6 +1137,7 @@ fn parse_struct_fields_as_methods(
                 signature_override: None,
                 params: vec![],
                 return_type: py_type.clone(),
+                is_async: false,
             });
         }
         if has_set {
@@ -1127,6 +1157,7 @@ fn parse_struct_fields_as_methods(
                     rust_type: syn::parse_quote! { () },
                     override_str: None,
                 },
+                is_async: false,
             });
         }
     }
@@ -1238,6 +1269,7 @@ fn parse_pymethod(
     let name = extract_pyo3_name(&m.attrs).unwrap_or_else(|| rust_ident.clone());
     let doc = extract_doc(&m.attrs);
     let signature_override = extract_pyo3_signature(&m.attrs);
+    let is_async = m.sig.asyncness.is_some();
     // Detect kind first: instance-style methods (Instance / Getter / Setter) carry an implicit
     // `self` receiver, so a Self-dependent first param must be treated as the receiver and
     // excluded. Static / Class / New have no receiver, so their `Py<Self>` stays as a regular param.
@@ -1265,6 +1297,7 @@ fn parse_pymethod(
         signature_override,
         params,
         return_type,
+        is_async,
     })
 }
 
@@ -5276,5 +5309,210 @@ struct MyClass {}
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("is_pyfunction"));
         assert!(!map.contains_key("not_pyfunction"));
+    }
+
+    // ── async fn detection (sig.asyncness) ──────────────────────────────────
+
+    #[test]
+    fn pyfunction_asyncness_is_captured() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            async fn fetch() -> PyResult<String> { unreachable!() }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
+        assert!(func.is_async, "async fn must set is_async = true");
+    }
+
+    #[test]
+    fn pyfunction_sync_is_not_async() {
+        let item: syn::ItemFn = syn::parse_quote! {
+            #[pyfunction]
+            fn fetch() -> PyResult<String> { unreachable!() }
+        };
+        let config = Config::default();
+        let func = parse_pyfunction(
+            &item,
+            dummy_path(),
+            &config,
+            &HashMap::new(),
+            &EMPTY_TYPE_MAP_PRESERVE,
+        )
+        .unwrap();
+        assert!(!func.is_async, "sync fn must keep is_async = false");
+    }
+
+    #[test]
+    fn pymethod_asyncness_is_captured() {
+        // Instance / Static / Class async methods each set is_async = true.
+        let source = r#"
+#[pymodule]
+mod m {
+    #[pyclass]
+    struct Worker;
+
+    #[pymethods]
+    impl Worker {
+        #[new]
+        fn new() -> Self { Self }
+
+        async fn compute(&self, n: usize) -> PyResult<f64> { unreachable!() }
+
+        #[staticmethod]
+        async fn build() -> PyResult<Worker> { unreachable!() }
+
+        #[classmethod]
+        async fn create(cls: &Bound<'_, PyType>) -> PyResult<Worker> { unreachable!() }
+
+        fn sync_method(&self) -> i32 { 0 }
+    }
+}
+"#;
+        let (_, modules) = parse_test_modules(source);
+        let class = match &modules[0].items[0] {
+            PyItem::Class(c) => c,
+            other => panic!("expected PyItem::Class, got {other:?}"),
+        };
+        let find = |name: &str| {
+            class
+                .methods
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} not found"))
+        };
+        assert!(find("compute").is_async, "async instance method");
+        assert!(find("build").is_async, "async static method");
+        assert!(find("create").is_async, "async class method");
+        assert!(
+            !find("sync_method").is_async,
+            "sync method must stay is_async = false"
+        );
+    }
+
+    // ── #[pyo3(cancel_handle)] param exclusion ───────────────────────────────
+
+    /// End-to-end (parse→generate) helper: parse `source` and render its first module to a stub.
+    fn first_module_stub(source: &str) -> String {
+        let (_, modules) = parse_test_modules(source);
+        crate::generator::generate(&modules, &Config::default()).expect("stub")
+    }
+
+    #[test]
+    fn cancel_handle_param_is_excluded() {
+        // `#[pyo3(cancel_handle)]` marks a pyo3-injected CancelHandle — Python-invisible.
+        let stub = first_module_stub(
+            r#"
+#[pymodule]
+mod m {
+    use pyo3::prelude::*;
+    type CancelHandle = pyo3::Bound<'_, pyo3::PyAny>;
+
+    #[pyfunction]
+    async fn cancellable(#[pyo3(cancel_handle)] mut cancel: CancelHandle) { }
+}
+"#,
+        );
+        assert!(
+            stub.contains("async def cancellable() -> None:"),
+            "cancel param must be excluded; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn cancel_handle_keeps_sibling_params() {
+        let stub = first_module_stub(
+            r#"
+#[pymodule]
+mod m {
+    use pyo3::prelude::*;
+    type CancelHandle = pyo3::Bound<'_, pyo3::PyAny>;
+
+    #[pyfunction]
+    async fn f(#[pyo3(cancel_handle)] mut handle: CancelHandle, x: usize) -> PyResult<String> {
+        unreachable!()
+    }
+}
+"#,
+        );
+        assert!(
+            stub.contains("async def f(x: int) -> str:"),
+            "only the cancel_handle param excluded; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn cancel_handle_excluded_by_attr_not_type_name() {
+        // Type name is MyHandle (not CancelHandle); exclusion must be keyed on the attribute.
+        let stub = first_module_stub(
+            r#"
+#[pymodule]
+mod m {
+    use pyo3::prelude::*;
+    type MyHandle = pyo3::Bound<'_, pyo3::PyAny>;
+
+    #[pyfunction]
+    async fn f(#[pyo3(cancel_handle)] mut h: MyHandle) { }
+}
+"#,
+        );
+        assert!(
+            stub.contains("async def f() -> None:"),
+            "exclusion is by attribute, not type name; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn cancel_handle_excluded_under_signature_override() {
+        // signature = (x) does not list h; parse-stage exclusion drops h from f.params so the
+        // signature merge in the generator never sees it either.
+        let stub = first_module_stub(
+            r#"
+#[pymodule]
+mod m {
+    use pyo3::prelude::*;
+    type CancelHandle = pyo3::Bound<'_, pyo3::PyAny>;
+
+    #[pyfunction]
+    #[pyo3(signature = (x))]
+    async fn f(x: usize, #[pyo3(cancel_handle)] mut h: CancelHandle) -> PyResult<String> {
+        unreachable!()
+    }
+}
+"#,
+        );
+        assert!(
+            stub.contains("async def f(x: int) -> str:"),
+            "signature override + cancel_handle exclusion must compose; got:\n{stub}"
+        );
+    }
+
+    #[test]
+    fn async_pyfunction_survives_parse_to_generate() {
+        // Integration across the parse→generate boundary: a real `#[pyfunction] async fn` AST is
+        // parsed into PyFunction (asyncness captured), then rendered by the generator.
+        let stub = first_module_stub(
+            r#"
+#[pymodule]
+mod m {
+    #[pyfunction]
+    async fn fetch() -> PyResult<String> { unreachable!() }
+}
+"#,
+        );
+        assert!(
+            stub.contains("async def fetch() -> str:"),
+            "asyncness must survive parse→generate; got:\n{stub}"
+        );
+        assert!(
+            !stub.contains("Coroutine"),
+            "must NOT wrap return type in Coroutine; got:\n{stub}"
+        );
     }
 }

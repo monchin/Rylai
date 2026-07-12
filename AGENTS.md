@@ -63,6 +63,14 @@ Detection strategy: find `ItemFn` annotated with `#[pymodule]`, parse `ExprMetho
 | `&Bound<PyAny>` / `PyObject` / `impl IntoPyObject` | `t.Any` + emit warning (`import typing as t`) |
 | unknown / unresolvable cross-crate type | `t.Any` + emit warning (`import typing as t`) |
 
+### Async Functions
+
+- `#[pyfunction]` / `#[pymethods]` `async fn` is detected via `sig.asyncness` and rendered as Python `async def`. Detection is keyed off the `async` keyword only — never on return-type sniffing or config.
+- The stub return type stays the **inner type** (PyResult/Result unwrapped); it is **not** wrapped in `Coroutine[...]` / `Awaitable[...]` — `async def` already implies coroutine semantics under PEP 484.
+- Applies to `#[pyfunction]` and Instance / `#[staticmethod]` / `#[classmethod]` methods. `#[new]` (→ `__init__`), `#[getter]`, `#[setter]` **ignore** the `async` flag (async `__init__`/property is illegal Python and unsupported by pyo3) and always emit a plain `def` / `@property`.
+- A parameter annotated `#[pyo3(cancel_handle)]` is a pyo3-injected (async cancellation) handle, invisible on the Python side; it is **excluded** from the stub params. Exclusion is by the attribute, not by the type name (`CancelHandle` belongs to pyo3's `experimental-async` feature), and is orthogonal to `async def` rendering.
+- `#[pyo3(signature = ...)]` overrides do not suppress `async def` — asyncness and signature are orthogonal.
+
 ### `#[pyclass]` Handling
 
 - Emit a `class` block in the stub.

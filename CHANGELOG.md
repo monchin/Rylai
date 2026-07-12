@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `async fn` support: `#[pyfunction]`/`#[pymethods]` async functions render as `async def`. Return types stay the unwrapped inner type (no `Coroutine[...]` wrapper). `#[new]`, `#[getter]`, and `#[setter]` ignore the `async` flag.
+- Exclude `#[pyo3(cancel_handle)]` parameters from stubs (pyo3-injected, Python-invisible).
+- `examples/async_await_sample` demonstrating async functions and `cancel_handle`.
+
 ## [0.5.1] - 2026-07-11
 
 ### Fixed

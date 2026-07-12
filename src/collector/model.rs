@@ -45,6 +45,8 @@ pub struct PyFunction {
     pub signature_override: Option<String>,
     pub params: Vec<PyParam>,
     pub return_type: PyType,
+    /// True when the Rust `fn` is `async fn` (`sig.asyncness.is_some()`); renders `async def`.
+    pub is_async: bool,
     /// Source file for diagnostics (reserved for future use)
     #[allow(dead_code)]
     pub source_file: PathBuf,
@@ -119,6 +121,9 @@ pub struct PyMethod {
     pub signature_override: Option<String>,
     pub params: Vec<PyParam>,
     pub return_type: PyType,
+    /// True when the Rust method is `async fn` (`sig.asyncness.is_some()`). Applies to Instance /
+    /// Static / Class only; `#[new]` (→ `__init__`), getter, setter ignore it (invalid async in Python).
+    pub is_async: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

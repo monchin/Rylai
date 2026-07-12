@@ -1,0 +1,20 @@
+[package]
+name = "async_await_sample"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "async_await_sample"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.0", features = ["experimental-async"] }
+tokio = { version = "1", features = ["time"] }
+
+# Empty `[workspace]` table marks this crate as a standalone root so cargo does NOT auto-include it
+# into the Rylai root workspace (where it would be built by every `cargo build`/`cargo test`).
+# It stays out of the root `Cargo.toml` `[workspace].members` on purpose: the `experimental-async`
+# feature + async fn bodies pull in tokio runtime machinery that is irrelevant to Rylai's
+# pure-static-analysis job. Build it standalone when you actually want to run it:
+#   `cargo build --manifest-path examples/async_await_sample/Cargo.toml`
+[workspace]

@@ -96,6 +96,7 @@ Together, this makes Rylai easy to integrate into CI, docs, or local dev without
 
 - Parses `#[pymodule]`, `#[pyfunction]`, and `#[pyclass]` annotations directly from Rust source
 - Maps Rust types to Python types automatically (`i32` → `int`, `Vec<T>` → `list[T]`, `Option<T>` → `T | None`, etc.)
+- Async functions (`async fn` → `async def`)
 - Extracts doc comments and emits them as Python docstrings
 - Zero-config by default; optionally configured via `rylai.toml`
 
